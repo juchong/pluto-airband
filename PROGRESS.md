@@ -11,7 +11,7 @@ Authoritative spec: `pluto-airband-fpga.md`. Environment details: `DEV-SETUP.md`
 | 2. Mac dev env (Amaranth, cocotb/Icarus, Rust, libiio+dfu-util) | **done** |
 | 3. Flash baseline Maia to Pluto | not started |
 | 4. Channelizer feasibility (GATE) | exploring DDC building block |
-| 5. AM demod block | not started |
+| 5. AM demod block | envelope magnitude done; DC-block/audio-decim next |
 | 6. Single-channel end-to-end | not started |
 | 7. Multi-channel | not started |
 | 8. Pi streamer | not started |
@@ -84,9 +84,17 @@ the doc's older numbers, because current `maia-sdr` `main` requires them:
 > Resolved by the handoff doc (§2.4): Pluto RF capability — no hardware-capability
 > gating. Only feasibility gate is FPGA resource fit (§4.2).
 
+### AM envelope detector (§7 step 5, in progress)
+- `hdl/am_demod.py`: `EnvelopeMagnitude` Amaranth module — multiplier-free
+  alpha-max-beta-min `|z| ~= max(|I|,|Q|) + 3/8*min(|I|,|Q|)` (no DSP48, cheap
+  for many channels on Z-7010). 2-cycle pipeline.
+- **Validated:** HW output matches the integer model exactly; approximation
+  error vs true magnitude in [-2.77%, +6.80%] (the known alpha-max-beta-min
+  band); numpy demo recovers a 1 kHz AM tone after DC block.
+
 ## Next steps
-- Prototype the AM envelope detector on the DDC output (handoff §7 step 5):
-  magnitude (CORDIC vectoring or approximation) + DC-block + audio decimation.
+- Finish the AM chain: DC-block (high-pass to drop carrier) + audio decimation
+  to 8/16 ksps (reuse a CIC/FIR), wire DDC -> EnvelopeMagnitude -> audio.
 - Explore time-multiplexing the single DDC datapath across many channels (§4.2)
   to estimate Z-7010 resource fit (the feasibility GATE).
 - Provision / get SSH to the x86-64 build server; clean from-source bitstream

@@ -37,3 +37,18 @@ Expected (validated): Run A output settles to a constant complex DC value with
 
 This is the building block for the airband channelizer: per-channel
 `NCO tune → decimate → (next) AM envelope detect` (handoff doc §4, §7 steps 5–6).
+
+## `am_demod.py`
+
+`EnvelopeMagnitude` — AM envelope detector = approximate `|I + jQ|` via
+multiplier-free **alpha-max-beta-min** (`max + 3/8·min`; no DSP48, cheap per
+channel). 2-cycle pipeline. The script verifies the HW matches an exact integer
+model, bounds the approximation error (≈ −2.8%/+6.8%), and demonstrates AM-tone
+recovery (magnitude → DC block → audio); plot at `out/am_demod.png`.
+
+```bash
+python am_demod.py
+```
+
+Next in the AM chain: DC-block + audio decimation to 8/16 ksps, then wire
+`DDC → EnvelopeMagnitude → audio`.
