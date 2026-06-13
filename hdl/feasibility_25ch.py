@@ -123,7 +123,7 @@ def main():
     print(f"\n    {'window':>8} {'lanes':>6} {'DSP48E1':>16} "
           f"{'LUT':>16} {'BRAM36':>14}")
     feasible_windows = []
-    for w_mhz in (2, 4, 8, 19):
+    for w_mhz in (4, 8, 14, 19):           # 14 MHz = resolved §8.2 core window
         c = channelizer_cost(w_mhz * 1e6)
         dsp_ok = c["DSP48E1"] <= FREE["DSP48E1"]
         lut_ok = c["LUT"] <= FREE["LUT"]
@@ -144,6 +144,8 @@ def main():
     print(f"Feasible capture windows: "
           f"{', '.join(str(w)+' MHz' for w in feasible_windows)} "
           f"(even the full ~19 MHz airband fits, the tightest case).")
+    print("Resolved (§8.2, see capture_window.py): center 123.438 MHz, Fs ~14 MHz "
+          "-> ~6 lanes for the 21 core channels (133.65 MHz deferred).")
     print("\nRemaining caveats:")
     print("  * resolve §8.2 capture window so the 25 channels share one window")
     print("    with edge margin (narrower window => fewer lanes => more slack);")

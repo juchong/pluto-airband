@@ -100,9 +100,14 @@ the doc's older numbers, because current `maia-sdr` `main` requires them:
 
 ## Open decisions (from handoff §8 — still to resolve, do not guess)
 1. ~~Channel count target N~~ — **RESOLVED: N = 25** (drives feasibility + framing).
-2. Capture window center + width (all channels inside, with edge margin).
-   **Now the key gating parameter** (sets channelizer lane count / LUT-FF usage):
-   narrower window = fewer lanes = more slack; full ~19 MHz airband still fits.
+2. ~~Capture window center + width~~ — **RESOLVED (core list): center (LO)
+   123.438 MHz, Fs ≈ 14 MHz** (see `hdl/capture_window.py`). The 21 core channels
+   span 118.05–128.5 MHz; centering in the 122.975–123.9 guard gap puts the DC/LO
+   spur 463 kHz from the nearest channel and keeps every channel inside the central
+   ~80% (extreme ±5.39 MHz = 77% of the ±7 MHz half-band, ≥1.6 MHz edge guard).
+   Costs ~6 time-mux lanes (≤8 the Z-7010 fits). 133.65 MHz is a **nice-to-have**,
+   deferred (would force Fs≈20 MHz / 8 lanes / higher center). 3 of the final 25
+   channels are still pending; the edge guard absorbs further in-cluster additions.
 3. Audio rate: 8 ksps vs 16 ksps.
 4. Squelch/AGC placement: FPGA vs Pi (default: Pi first).
 5. Front-end filtering: airband BPF + broadcast-FM notch (hygiene).
@@ -173,10 +178,9 @@ the doc's older numbers, because current `maia-sdr` `main` requires them:
   re-confirm in Vivado once a lane is prototyped.
 
 ## Next steps
-- **Resolve §8.2 capture window** (open decision — *needs the operator's 25 target
-  frequencies*; do not guess). It sets lane count = ceil(25 * window / 62.5 MHz)
-  and the front-end decimation. Narrower clustered window = fewer lanes = more
-  slack; full ~19 MHz airband also fits.
+- §8.2 capture window **resolved** for the core list (center 123.438 MHz, Fs ≈ 14
+  MHz, ~6 lanes; `hdl/capture_window.py`). Re-run that script when the final 3
+  channels arrive to confirm they fall inside the window.
 - Extend the channelizer lane: add the shared front-end decimator and a per-lane
   cleanup/compensation FIR; then re-measure the lane in Vivado on the build server
   (real LUT/FF/DSP/BRAM, with per-channel state in BRAM).

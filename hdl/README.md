@@ -112,6 +112,24 @@ time-multiplexed channelizer fits the FREE budget (Z7010 − base) at every capt
 window — even the full ~19 MHz airband (~8 lanes / 24 DSP / 75% of free LUT /
 65% of free BRAM). Binding resources: BRAM36 then LUT. AM back-end costs zero DSP.
 
+## `capture_window.py`
+
+Resolves the §8.2 capture window from the operator's channel list. Picks the
+center (LO) frequency so the zero-IF **DC/LO-leakage spur** lands in a guard gap
+between channels, sizes the complex sample rate so every channel stays in the
+central ~80% of the band (clear of the filter skirts), and reports the resulting
+time-mux lane count. Re-run when the final channels arrive.
+
+```bash
+python capture_window.py
+```
+
+Result (21 core channels, 118.05–128.5 MHz): **center 123.438 MHz, Fs ≈ 14 MHz**
+(±7 MHz half-band; extreme channel ±5.39 MHz = 77%; ≥1.6 MHz edge guard; DC spur
+463 kHz from the nearest channel), costing ~6 of the ≤8 lanes the Z-7010 fits. The
+far-out 133.65 MHz is deferred (a nice-to-have that would force Fs≈20 MHz / 8
+lanes). Plot at `out/capture_window.png` (git-ignored).
+
 ## `channelizer_lane.py`
 
 Prototype of **one time-multiplexed channelizer lane** (handoff §7 step 7): a
