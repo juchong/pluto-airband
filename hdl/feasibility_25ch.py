@@ -42,6 +42,9 @@ DDC = {"LUT": 661, "FF": 1239, "DSP48E1": 11, "BRAM36": 4}
 BACKEND = {"LUT": 295, "FF": 281, "DSP48E1": 0, "BRAM36": 0}
 
 # Hard-block costs of the channelizer primitives (from the code / maia-hdl):
+#   NB: the TdmDdcLane prototype (channelizer_lane.py, synth_estimate.py) measures
+#   4 DSP48E1 for a straightforward complex mixer; maia-hdl's Cmult3x trims that to
+#   1 via a 3x clock. Either way the DSP budget holds (8 lanes * 4 = 32 < 62 free).
 MIXER_DSP = 1          # Cmult3x: 1 DSP48E1, reused via the 3x clock
 FIR_CLEANUP_DSP = 2    # one FIR2DSP compensation/cleanup filter per lane
 # (bulk decimation done by multiplier-free CIC: 0 DSP)

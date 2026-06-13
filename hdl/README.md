@@ -80,9 +80,10 @@ parameters; nothing here hard-codes the choice.
 
 ## `synth_estimate.py`
 
-Emits Verilog for maia-hdl's `DDC` and our `AMBackEnd` (`EnvelopeMagnitude` +
-`DCBlock` + `CICDecimator`) and runs Yosys `synth_xilinx -family xc7` to get hard
-7-series resource counts (LUT/FF/DSP48E1/BRAM). Requires `yosys` on PATH.
+Emits Verilog for maia-hdl's `DDC`, our `AMBackEnd` (`EnvelopeMagnitude` +
+`DCBlock` + `CICDecimator`), and the `TdmDdcLane` (at 8 and 25 channels) and runs
+Yosys `synth_xilinx -family xc7` to get hard 7-series resource counts
+(LUT/FF/DSP48E1/BRAM). Requires `yosys` on PATH.
 
 ```bash
 python synth_estimate.py
@@ -104,12 +105,40 @@ choices (§8.2).
 python feasibility_25ch.py
 ```
 
-Result: **GO**. 25 independent DDCs (275 DSP / ~100 BRAM) do not fit, but a
-time-multiplexed channelizer does — even the full ~19 MHz airband needs only
-~8 lanes / 24 DSP / ~52% LUT / 33% BRAM (before the ADI/Maia base platform); a
-narrower clustered window is far more comfortable. The AM back-end costs zero
-DSP. Binding resource is LUT/FF, set by lane count = ceil(25 * window / 62.5MHz).
+Result: **GO**, now confirmed against the **measured** Maia base platform (built
+from source on the x86 server; LUT 5416/17600, FF 6493/35200, BRAM 29/60, DSP
+18/80, timing met). 25 independent DDCs (275 DSP / ~100 BRAM) do not fit, but a
+time-multiplexed channelizer fits the FREE budget (Z7010 − base) at every capture
+window — even the full ~19 MHz airband (~8 lanes / 24 DSP / 75% of free LUT /
+65% of free BRAM). Binding resources: BRAM36 then LUT. AM back-end costs zero DSP.
 
-Next: x86 build-server bring-up (measure the base-platform PL usage; clean
-bitstream of unmodified Maia, handoff §7 step 1), then prototype the
-time-multiplexed channelizer lane.
+## `channelizer_lane.py`
+
+Prototype of **one time-multiplexed channelizer lane** (handoff §7 step 7): a
+single NCO + complex-mixer + CIC-decimator datapath shared across `n_channels`
+channels, with all per-channel state (NCO phase, CIC integrator/comb registers,
+decimation counter) in arrays indexed by a channel counter. One wideband IQ sample
+is broadcast to every channel and the lane sweeps the channels one-per-cycle — the
+concrete realization of the time-multiplexing the feasibility model assumed.
+
+```bash
+python channelizer_lane.py
+```
+
+Verified: the hardware is **bit-exact** to a Python reference model (same NCO ROM,
+fixed-point mixer, and integer CIC) across all channels; a 4-channel / 4-tone demo
+shows each channel tuning *its own* tone to baseband through the one shared
+datapath (I ≈ DC, Q ≈ 0, ripple < 1%), rejecting the others. Plot at
+`out/channelizer_lane.png` (git-ignored).
+
+Resources (`synth_estimate.py`, Yosys xc7): the shared complex mixer is **4
+DSP48E1** independent of channel count (maia-hdl's `Cmult3x` would trim this to
+~1); even at 4 DSP/lane the budget holds (8 lanes × 4 = 32 < 62 free DSP). FF/LUT
+grow with channel count because the prototype holds per-channel CIC/NCO state in
+registers — in the real design that state maps to **BRAM** (which the feasibility
+model already budgets). Not yet included: the shared front-end decimator and the
+per-lane cleanup/compensation FIR (CIC droop correction) — the next increment.
+
+Next: resolve the §8.2 capture window (needs the operator's 25-channel frequency
+list — it sets the lane count), then add the shared front-end + cleanup FIR and
+re-measure on the build server in Vivado.

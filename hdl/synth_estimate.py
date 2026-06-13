@@ -27,6 +27,7 @@ from maia_hdl.ddc import DDC
 
 from am_demod import EnvelopeMagnitude
 from am_audio import DCBlock, CICDecimator
+from channelizer_lane import TdmDdcLane
 
 OUT_DIR = pathlib.Path(__file__).parent / "out"
 
@@ -122,6 +123,13 @@ def main():
     duts = [
         ("ddc", "DDC", DDC("clk3x", in_width=12, nco_width=28)),
         ("am_backend", "AMBackEnd", AMBackEnd()),
+        # Time-multiplexed channelizer lane (NCO+mixer+CIC shared over N ch).
+        # Measured at two channel depths to separate the (≈constant) arithmetic
+        # datapath from the per-channel state that scales with the channel count.
+        ("lane_ch8", "TdmDdcLane",
+         TdmDdcLane(n_channels=8, decimation=16, stages=3)),
+        ("lane_ch25", "TdmDdcLane",
+         TdmDdcLane(n_channels=25, decimation=16, stages=3)),
     ]
 
     print(f"{'block':<14}{'LUT':>8}{'FF':>8}{'CARRY4':>8}"
@@ -158,6 +166,21 @@ def main():
         print(f"\nAM back-end per channel: DSP48E1 {b['DSP48E1']} "
               f"(multiplier-free), LUT {b['LUT']}, FF {b['FF']}, "
               f"BRAM {b['BRAM36']}.")
+    if "lane_ch8" in results and "lane_ch25" in results:
+        l8, l25 = results["lane_ch8"], results["lane_ch25"]
+        dlut = (l25["LUT"] - l8["LUT"]) / (25 - 8)
+        dff = (l25["FF"] - l8["FF"]) / (25 - 8)
+        print("\nTime-multiplexed channelizer lane (NCO ROM + complex mixer + "
+              "per-channel CIC):")
+        print(f"  @ 8 ch : DSP48E1 {l8['DSP48E1']}  LUT {l8['LUT']}  "
+              f"FF {l8['FF']}  BRAM {l8['BRAM36']}")
+        print(f"  @25 ch : DSP48E1 {l25['DSP48E1']}  LUT {l25['LUT']}  "
+              f"FF {l25['FF']}  BRAM {l25['BRAM36']}")
+        print(f"  => mixer DSP is fixed at {l8['DSP48E1']} (4 real mults; the "
+              f"real Maia Cmult3x trims this to ~1 via a 3x clock).")
+        print(f"  => per-channel state adds ~{dlut:.0f} LUT / ~{dff:.0f} FF per "
+              f"channel (NCO phase + CIC I/Q integrators+combs); maps to BRAM in "
+              f"the real design rather than the Yosys register-file estimate.")
 
 
 if __name__ == "__main__":

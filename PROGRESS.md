@@ -12,8 +12,8 @@ Authoritative spec: `pluto-airband-fpga.md`. Environment details: `DEV-SETUP.md`
 | 3. Flash baseline Maia to Pluto | not started |
 | 4. Channelizer feasibility (GATE) | **GO** (confirmed vs measured base; 25 ch fit, even full 19 MHz window) |
 | 5. AM demod block | **done** (envelope mag + DC-block + audio decimate, chain verified) |
-| 6. Single-channel end-to-end | not started |
-| 7. Multi-channel | not started |
+| 6. Single-channel end-to-end | blocked on hardware (needs a Pluto) |
+| 7. Multi-channel | **in progress** (one time-mux channelizer lane prototyped + verified) |
 | 8. Pi streamer | not started |
 | 9. Hardening | not started |
 
@@ -134,6 +134,26 @@ the doc's older numbers, because current `maia-sdr` `main` requires them:
 - Audio rate (8 vs 16 ksps) left open (§8.3): `audio_decim`/`cic_stages` are
   parameters; nothing hard-codes the choice.
 
+### Time-multiplexed channelizer lane (§7 step 7, in progress)
+- `hdl/channelizer_lane.py`: `TdmDdcLane` — one physical NCO + complex-mixer + CIC
+  datapath **shared across N channels**, with per-channel state (NCO phase, CIC
+  integrator/comb regs, decim counter) in channel-indexed arrays. One wideband IQ
+  sample is broadcast to all channels; the lane sweeps channels one-per-cycle.
+  This is the concrete realization of the time-multiplexing the feasibility GATE
+  assumed.
+- **Validated:** HW is **bit-exact** to a Python reference (shared sine ROM,
+  fixed-point complex mixer, integer CIC) across all channels; a 4-channel/4-tone
+  demo shows each channel tuning its own tone to baseband through the single
+  datapath (I≈DC, Q≈0, ripple <1%), rejecting the others. Plot
+  `hdl/out/channelizer_lane.png`.
+- **Resources** (`hdl/synth_estimate.py`, Yosys xc7): shared complex mixer = 4
+  DSP48E1 regardless of channel count (one shared multiplier; maia-hdl `Cmult3x`
+  trims to ~1). Even at 4 DSP/lane the budget holds (8 lanes×4 = 32 < 62 free DSP).
+  Per-channel CIC/NCO state shows up as FF/LUT in the prototype (register arrays);
+  in the real design it maps to **BRAM** — matching the model's BRAM-for-state.
+- Not yet built: shared front-end decimator (window → intermediate rate) and the
+  per-lane cleanup/compensation FIR (CIC passband-droop correction).
+
 ### Channelizer feasibility GATE (§4.2) — GO for N=25
 - `hdl/synth_estimate.py`: emits Verilog for the real maia-hdl `DDC` and our AM
   back-end, runs Yosys `synth_xilinx -family xc7`. **Measured:** full DDC = 11
@@ -153,6 +173,14 @@ the doc's older numbers, because current `maia-sdr` `main` requires them:
   re-confirm in Vivado once a lane is prototyped.
 
 ## Next steps
-- Resolve §8.2 capture window (now the gating parameter for lane count).
-- Prototype one time-multiplexed channelizer lane (shared CIC front-end + TDM
-  NCO/mixer + per-channel CIC/FIR) and synth-check DSP/LUT against the model.
+- **Resolve §8.2 capture window** (open decision — *needs the operator's 25 target
+  frequencies*; do not guess). It sets lane count = ceil(25 * window / 62.5 MHz)
+  and the front-end decimation. Narrower clustered window = fewer lanes = more
+  slack; full ~19 MHz airband also fits.
+- Extend the channelizer lane: add the shared front-end decimator and a per-lane
+  cleanup/compensation FIR; then re-measure the lane in Vivado on the build server
+  (real LUT/FF/DSP/BRAM, with per-channel state in BRAM).
+- Define §4.3 per-channel DMA framing (channel index + sample counter) once the
+  multi-channel datapath shape is fixed.
+- (Blocked on hardware) §7 step 3/6: flash baseline Maia (`build/pluto.dfu`) and
+  bring up one real channel end-to-end on a Pluto.
