@@ -11,7 +11,7 @@ Authoritative spec: `pluto-airband-fpga.md`. Environment details: `DEV-SETUP.md`
 | 2. Mac dev env (Amaranth, cocotb/Icarus, Rust, libiio+dfu-util) | **done** |
 | 3. Flash baseline Maia to Pluto | not started |
 | 4. Channelizer feasibility (GATE) | exploring DDC building block |
-| 5. AM demod block | envelope magnitude done; DC-block/audio-decim next |
+| 5. AM demod block | **done** (envelope mag + DC-block + audio decimate, chain verified) |
 | 6. Single-channel end-to-end | not started |
 | 7. Multi-channel | not started |
 | 8. Pi streamer | not started |
@@ -84,17 +84,30 @@ the doc's older numbers, because current `maia-sdr` `main` requires them:
 > Resolved by the handoff doc (§2.4): Pluto RF capability — no hardware-capability
 > gating. Only feasibility gate is FPGA resource fit (§4.2).
 
-### AM envelope detector (§7 step 5, in progress)
-- `hdl/am_demod.py`: `EnvelopeMagnitude` Amaranth module — multiplier-free
-  alpha-max-beta-min `|z| ~= max(|I|,|Q|) + 3/8*min(|I|,|Q|)` (no DSP48, cheap
-  for many channels on Z-7010). 2-cycle pipeline.
-- **Validated:** HW output matches the integer model exactly; approximation
-  error vs true magnitude in [-2.77%, +6.80%] (the known alpha-max-beta-min
-  band); numpy demo recovers a 1 kHz AM tone after DC block.
+### AM demod block (§7 step 5, done)
+- `hdl/am_demod.py`: `EnvelopeMagnitude` — multiplier-free alpha-max-beta-min
+  `|z| ~= max(|I|,|Q|) + 3/8*min(|I|,|Q|)` (no DSP48). 2-cycle pipeline.
+  **Validated:** exact match to integer model; approx error vs true magnitude in
+  [-2.77%, +6.80%]; numpy demo recovers a 1 kHz AM tone after DC block.
+- `hdl/am_audio.py`: AM back-end + full single-channel chain.
+  - `DCBlock` — one-pole high-pass (leaky-integrator DC estimate, subtract);
+    multiplier-free (1 shift + 2 adds). Strips the carrier-amplitude DC before
+    decimation so it doesn't inflate CIC word growth.
+  - `CICDecimator` — multiplier-free N-stage CIC decimator (no DSP48, no coeff
+    memory) to the audio rate; integrator/comb cascades evaluated combinationally
+    so HW matches the cumsum/diff model bit-exactly.
+  - `AMChannel` — wires `DDC -> EnvelopeMagnitude -> DCBlock -> CICDecimator`;
+    stateful blocks advance on validated strobes derived from `ddc.strobe_out`
+    (note: a wrapper exposing the DDC's multi-rate `common_edge` is required or
+    the decimator emits only one sample).
+  - **Validated:** DCBlock/CIC match exact integer models; DC block drives a
+    large input bias to ~0; end-to-end run tunes a frequency-offset AM tone to
+    baseband, demodulates, DC-blocks, and decimates to a clean audio tone at the
+    expected frequency (plot `hdl/out/am_audio.png`).
+- Audio rate (8 vs 16 ksps) left open (§8.3): `audio_decim`/`cic_stages` are
+  parameters; nothing hard-codes the choice.
 
 ## Next steps
-- Finish the AM chain: DC-block (high-pass to drop carrier) + audio decimation
-  to 8/16 ksps (reuse a CIC/FIR), wire DDC -> EnvelopeMagnitude -> audio.
 - Explore time-multiplexing the single DDC datapath across many channels (§4.2)
   to estimate Z-7010 resource fit (the feasibility GATE).
 - Provision / get SSH to the x86-64 build server; clean from-source bitstream

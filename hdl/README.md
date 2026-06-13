@@ -50,5 +50,33 @@ recovery (magnitude → DC block → audio); plot at `out/am_demod.png`.
 python am_demod.py
 ```
 
-Next in the AM chain: DC-block + audio decimation to 8/16 ksps, then wire
-`DDC → EnvelopeMagnitude → audio`.
+## `am_audio.py`
+
+The AM back-end and the full single-channel chain (handoff §7 step 5, completed):
+
+- `DCBlock` — one-pole high-pass (leaky-integrator DC estimate, then subtract)
+  that strips the carrier-amplitude DC term left by the envelope detector.
+  Multiplier-free (one arithmetic shift + two adds).
+- `CICDecimator` — multiplier-free CIC (cascaded integrator-comb) decimator that
+  low-pass filters and drops the magnitude stream to the audio rate (8/16 ksps).
+  No DSP48, no coefficient memory → cheap to replicate per channel on the Z-7010.
+- `AMChannel` — wires the whole single channel together:
+  `DDC (NCO mixer + FIR decimate) → EnvelopeMagnitude → DCBlock → CICDecimator`,
+  with the stateful blocks advanced by validated sample strobes derived from the
+  DDC output strobe.
+
+```bash
+python am_audio.py
+```
+
+Verified: `DCBlock` and `CICDecimator` match exact integer reference models; the
+DC block removes a large input bias to ≈0; and an end-to-end run feeds a
+frequency-offset AM tone through the chain, tunes the NCO, demodulates, and
+recovers a clean low-rate audio tone at the expected frequency. Plot at
+`out/am_audio.png` (git-ignored).
+
+Audio rate (8 vs 16 ksps) is open decision §8.3 — `audio_decim`/`cic_stages` are
+parameters; nothing here hard-codes the choice.
+
+Next: time-multiplex one DDC datapath across many channels to estimate Z-7010
+resource fit (the §4.2 feasibility gate), and the x86 build-server bring-up.
