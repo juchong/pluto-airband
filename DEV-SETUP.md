@@ -55,6 +55,7 @@ cd /Users/juanjchong/Documents/GitHub/pluto-airband
 source .venv/bin/activate                 # also sets AMARANTH_USE_YOSYS=builtin
 pip install --upgrade pip wheel
 pip install -r requirements-dev.lock.txt   # exact lock; or requirements-dev.txt for top-level pins
+pip install -e maia-sdr/maia-hdl           # use maia_hdl as a library (our hdl/ experiments import it)
 ```
 
 ### Critical: `AMARANTH_USE_YOSYS=builtin`

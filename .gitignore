@@ -20,6 +20,7 @@ dut.v
 *.cs16
 *.frm
 *.dfu
+hdl/out/
 
 # OS / editor cruft
 .DS_Store

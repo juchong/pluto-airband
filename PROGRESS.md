@@ -10,7 +10,7 @@ Authoritative spec: `pluto-airband-fpga.md`. Environment details: `DEV-SETUP.md`
 | 1. x86 build server bring-up (bitstream build of unmodified Maia) | not started |
 | 2. Mac dev env (Amaranth, cocotb/Icarus, Rust, libiio+dfu-util) | **done** |
 | 3. Flash baseline Maia to Pluto | not started |
-| 4. Channelizer feasibility (GATE) | not started |
+| 4. Channelizer feasibility (GATE) | exploring DDC building block |
 | 5. AM demod block | not started |
 | 6. Single-channel end-to-end | not started |
 | 7. Multi-channel | not started |
@@ -35,6 +35,19 @@ Authoritative spec: `pluto-airband-fpga.md`. Environment details: `DEV-SETUP.md`
 ### Repo
 - Local git repo pushed to remote `origin`:
   https://github.com/juchong/pluto-airband.git (`master`).
+
+### DDC exploration (toward §4.2 / §7 steps 5–6)
+- `maia_hdl` installed editable as a library; built our own sim harness in
+  `hdl/` (we don't modify upstream).
+- `hdl/ddc_tune_decimate.py`: drives maia-hdl's `DDC` (NCO mixer + 3-stage FIR
+  decimator, stages 2/3 bypassed). Designs/scales/packs stage-1 low-pass coeffs.
+  **Validated:** tuning the NCO to a complex tone produces a clean DC (baseband)
+  output after decimate-by-8 (~0% ripple); detuning into the stopband gives
+  ~63 dB rejection. Confirms understanding of the NCO, FIR coeff memory layout,
+  bypass paths, strobe pacing, and 1x/3x clocking.
+- Key learnings: DDC exposes no input backpressure (NCO advances only on valid
+  strobe_in); coeff memory is per-stage (stage1 @0, stage2 @256, stage3 @512);
+  output width 16; defaults in_width=12, nco_width=28, coeff_width=18.
 
 ## Decisions made
 
@@ -72,7 +85,10 @@ the doc's older numbers, because current `maia-sdr` `main` requires them:
 > gating. Only feasibility gate is FPGA resource fit (§4.2).
 
 ## Next steps
+- Prototype the AM envelope detector on the DDC output (handoff §7 step 5):
+  magnitude (CORDIC vectoring or approximation) + DC-block + audio decimation.
+- Explore time-multiplexing the single DDC datapath across many channels (§4.2)
+  to estimate Z-7010 resource fit (the feasibility GATE).
 - Provision / get SSH to the x86-64 build server; clean from-source bitstream
   build of unmodified Maia SDR (handoff §7 step 1).
-- Resolve the §8 open decisions (esp. channel count + capture window) to scope
-  the channelizer feasibility gate (§4.2).
+- Resolve the §8 open decisions (esp. channel count + capture window).

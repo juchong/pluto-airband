@@ -21,3 +21,7 @@ cocotb==2.0.1
 cocotb-bus==0.3.0
 numpy==1.26.4
 scipy==1.13.1
+matplotlib==3.11.0    # plotting for the hdl/ DDC experiments
+
+# maia_hdl itself is used as a library, installed editable from the pinned
+# clone (not a PyPI pin):  pip install -e maia-sdr/maia-hdl
