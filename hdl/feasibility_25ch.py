@@ -28,6 +28,13 @@ import math
 # XC7Z010 programmable-logic budget (DS190 / UG585).
 Z7010 = {"LUT": 17600, "FF": 35200, "DSP48E1": 80, "BRAM36": 60}
 
+# MEASURED base-platform PL usage: unmodified Maia SDR bitstream built from source
+# on the x86 build server (Vivado 2023.2, system_top_utilization_placed.rpt),
+# timing met (WNS +0.029 ns). This is the AD936x IF + DMA + Maia spectrometer that
+# we build on top of, so the channelizer budget is (Z7010 - BASE).  [handoff §7.1]
+BASE = {"LUT": 5416, "FF": 6493, "DSP48E1": 18, "BRAM36": 29}
+FREE = {k: Z7010[k] - BASE[k] for k in Z7010}
+
 # Measured per-block costs (Yosys synth_xilinx -family xc7); see synth_estimate.py.
 #   full DDC (NCO mixer Cmult3x=1 DSP + 3-stage FIR 4+2+4=10 DSP):
 DDC = {"LUT": 661, "FF": 1239, "DSP48E1": 11, "BRAM36": 4}
@@ -97,38 +104,48 @@ def main():
     print(f"  LUT     {_bar(naive['LUT'], Z7010['LUT'])}")
     print("  => INFEASIBLE (DSP ~3.4x over, BRAM ~1.7x over). Must share.")
 
+    print("\n[measured] Maia base platform (Vivado 2023.2, timing met):")
+    print(f"  LUT {_bar(BASE['LUT'], Z7010['LUT'])}")
+    print(f"  FF  {_bar(BASE['FF'], Z7010['FF'])}")
+    print(f"  DSP {_bar(BASE['DSP48E1'], Z7010['DSP48E1'])}")
+    print(f"  BRAM{_bar(BASE['BRAM36'], Z7010['BRAM36'])}")
+    print(f"  => FREE for the channelizer: LUT {FREE['LUT']}, FF {FREE['FF']}, "
+          f"DSP48E1 {FREE['DSP48E1']}, BRAM36 {FREE['BRAM36']} "
+          f"(BRAM is the binding resource)")
+
     print("\n[B] Time-multiplexed shared channelizer, by capture window (§8.2):")
     print("    (shared CIC front-end decimates the window; lanes = ceil(N*W/Fs);")
     print("     AM back-end is DSP-free and time-shared at audio rate)")
+    print("    checked against the FREE budget = Z7010 - measured Maia base")
     print(f"\n    {'window':>8} {'lanes':>6} {'DSP48E1':>16} "
           f"{'LUT':>16} {'BRAM36':>14}")
     feasible_windows = []
     for w_mhz in (2, 4, 8, 19):
         c = channelizer_cost(w_mhz * 1e6)
-        dsp_ok = c["DSP48E1"] <= Z7010["DSP48E1"]
-        lut_ok = c["LUT"] <= Z7010["LUT"]
-        bram_ok = c["BRAM36"] <= Z7010["BRAM36"]
+        dsp_ok = c["DSP48E1"] <= FREE["DSP48E1"]
+        lut_ok = c["LUT"] <= FREE["LUT"]
+        bram_ok = c["BRAM36"] <= FREE["BRAM36"]
         if dsp_ok and lut_ok and bram_ok:
             feasible_windows.append(w_mhz)
         print(f"    {w_mhz:>6} MHz {c['lanes']:>6} "
-              f"{_bar(c['DSP48E1'], Z7010['DSP48E1'])} "
-              f"{_bar(c['LUT'], Z7010['LUT'])} "
-              f"{_bar(c['BRAM36'], Z7010['BRAM36'])}")
+              f"{_bar(c['DSP48E1'], FREE['DSP48E1'])} "
+              f"{_bar(c['LUT'], FREE['LUT'])} "
+              f"{_bar(c['BRAM36'], FREE['BRAM36'])}")
 
     print("\n" + "=" * 70)
-    print("VERDICT: GO. 25 AM channels fit the Z-7010 with a time-multiplexed")
-    print("channelizer. The DSP budget is comfortable at every window (the AM")
-    print("back-end uses zero DSP); the binding resources are LUT/FF, driven by")
-    print("the lane count = ceil(25 * window / 62.5MHz).")
-    print(f"Feasible capture windows in this model: "
+    print("VERDICT: GO (confirmed against measured base). 25 AM channels fit the")
+    print("Z-7010 on top of the unmodified Maia platform with a time-multiplexed")
+    print("channelizer. The DSP budget is comfortable at every window (62 DSP free;")
+    print("the AM back-end uses zero DSP). Binding resources are BRAM36 (31 free)")
+    print("and LUT (12184 free), driven by lane count = ceil(25 * window / 62.5MHz).")
+    print(f"Feasible capture windows: "
           f"{', '.join(str(w)+' MHz' for w in feasible_windows)} "
-          f"(even the full ~19 MHz airband fits).")
-    print("\nKey caveats to confirm on the x86 build server (step 1):")
-    print("  * subtract the ADI/Maia base-platform PL usage (AD936x IF + DMA;")
-    print("    mostly LUT/BRAM, few DSP) from the budget above;")
+          f"(even the full ~19 MHz airband fits, the tightest case).")
+    print("\nRemaining caveats:")
     print("  * resolve §8.2 capture window so the 25 channels share one window")
     print("    with edge margin (narrower window => fewer lanes => more slack);")
-    print("  * LUT/FF here are Yosys estimates; re-confirm with Vivado.")
+    print("  * lane LUT/FF are Yosys-scale estimates; re-confirm the channelizer")
+    print("    itself in Vivado once a lane is prototyped (step: one channelizer lane).")
 
 
 if __name__ == "__main__":

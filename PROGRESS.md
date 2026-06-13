@@ -7,10 +7,10 @@ Authoritative spec: `pluto-airband-fpga.md`. Environment details: `DEV-SETUP.md`
 
 | Handoff §7 task | State |
 |---|---|
-| 1. x86 build server bring-up (bitstream build of unmodified Maia) | **in progress** (server provisioned; Vivado 2023.2 installed; build running) |
+| 1. x86 build server bring-up (bitstream build of unmodified Maia) | **done** (Vivado 2023.2; from-source bitstream built, timing met; base PL usage measured) |
 | 2. Mac dev env (Amaranth, cocotb/Icarus, Rust, libiio+dfu-util) | **done** |
 | 3. Flash baseline Maia to Pluto | not started |
-| 4. Channelizer feasibility (GATE) | **GO** (modeled; 25 ch fit via time-mux) |
+| 4. Channelizer feasibility (GATE) | **GO** (confirmed vs measured base; 25 ch fit, even full 19 MHz window) |
 | 5. AM demod block | **done** (envelope mag + DC-block + audio decimate, chain verified) |
 | 6. Single-channel end-to-end | not started |
 | 7. Multi-channel | not started |
@@ -31,6 +31,31 @@ Authoritative spec: `pluto-airband-fpga.md`. Environment details: `DEV-SETUP.md`
 - **libiio 0.25** (tag `b6028fd`) built from source → `~/.local` (plain dylib +
   tools, no sudo). `iio_info --version` OK, backends `xml ip usb`. Pinned in
   `DEV-SETUP.md`. (Add `~/.local/bin` to PATH for convenience.)
+
+### x86 build server + baseline bitstream (handoff §7 step 1)
+- Server provisioned (Ubuntu 22.04 x86-64, 32 vCPU). **Rootless Docker** — the
+  firmware build container must run as `DOCKER_USER=0:0` (host user maps to
+  container root); upstream's `$(id -u):$(id -g)` fails to write the bind mount.
+  Setup details in `DEV-SETUP.md`.
+- **Vivado/Vitis/Vitis_HLS 2023.2** installed to `/opt/Xilinx` (Zynq-7000 only),
+  bound to the `vivado2023_2` docker volume.
+- **From-source bitstream of unmodified Maia SDR built end-to-end** (kernel,
+  u-boot, buildroot rootfs, Vivado synth+impl→`system_top.bit`, firmware images
+  `pluto.frm`/`.dfu`/`.itb`). `HAVE_VIVADO=1` real build, not the XSA fallback.
+- **Measured base-platform PL usage** (`system_top_utilization_placed.rpt`,
+  timing met, WNS +0.029 ns) on the XC7Z010:
+
+  | Resource | Used | Total | % | Free |
+  |---|---|---|---|---|
+  | Slice LUTs | 5416 | 17600 | 30.8 | 12184 |
+  | Slice Registers (FF) | 6493 | 35200 | 18.5 | 28707 |
+  | Block RAM Tile (36k) | 29 | 60 | 48.3 | 31 |
+  | DSP48E1 | 18 | 80 | 22.5 | 62 |
+
+  Binding resource for the channelizer is **BRAM36 (31 free)**, then LUT
+  (12184 free); DSPs are abundant (62 free). Folded into `hdl/feasibility_25ch.py`
+  — 25 channels still fit on top of the base, even at the full ~19 MHz window
+  (≈65% of free BRAM, ≈75% of free LUT).
 
 ### Repo
 - Local git repo pushed to remote `origin`:
@@ -58,7 +83,7 @@ Authoritative spec: `pluto-airband-fpga.md`. Environment details: `DEV-SETUP.md`
 - **This Mac is the development box, not the build server.** Vivado is x86-64
   only; the Maia Docker images are `linux/amd64`-only (verified via GHCR API), so
   synthesis/bitstream/firmware runs on a separate x86-64 Linux host with Docker
-  (handoff §5.1). Not yet provisioned.
+  (handoff §5.1). Provisioned — see "x86 build server" above and `DEV-SETUP.md`.
 - **Repo:** workspace root is a git repo tracking only our artifacts
   (docs, requirements, future HDL/Pi code), pushed to
   `github.com/juchong/pluto-airband`.
@@ -119,15 +144,15 @@ the doc's older numbers, because current `maia-sdr` `main` requires them:
   - Naive 25× parallel DDCs = 275 DSP / ~100 BRAM → INFEASIBLE.
   - Time-multiplexed shared channelizer (shared CIC front-end + lanes =
     ceil(25*W/62.5MHz), DSP-free back-end shared at audio rate): **fits at every
-    window** — full ~19 MHz airband ≈ 8 lanes / 24 DSP / 52% LUT / 33% BRAM;
-    a clustered window (≤4–8 MHz) is far more comfortable (1–4 lanes).
-- Caveats to confirm on the build server: subtract ADI/Maia base-platform PL
-  usage; LUT/FF are Yosys (not Vivado) estimates; pick §8.2 capture window.
+    window**.
+- **Base-platform usage now measured** (build server step 1) and folded in: the
+  model checks the channelizer against the FREE budget (Z7010 − base). Still GO —
+  full ~19 MHz airband ≈ 8 lanes / 24 DSP / 75% of free LUT / 65% of free BRAM;
+  a clustered window (≤4–8 MHz) is far more comfortable (1–4 lanes). Binding
+  resources: BRAM36 then LUT. LUT/FF lane costs remain Yosys-scale estimates to
+  re-confirm in Vivado once a lane is prototyped.
 
 ## Next steps
-- x86-64 build server bring-up (handoff §7 step 1): clean from-source bitstream
-  of unmodified Maia SDR; **measure the base-platform PL usage** to subtract from
-  the feasibility budget.
 - Resolve §8.2 capture window (now the gating parameter for lane count).
 - Prototype one time-multiplexed channelizer lane (shared CIC front-end + TDM
   NCO/mixer + per-channel CIC/FIR) and synth-check DSP/LUT against the model.

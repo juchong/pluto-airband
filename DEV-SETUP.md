@@ -209,5 +209,8 @@ attached, `iio_info -s` prints "No IIO context found" (expected).
 ## Still TODO before hardware bring-up
 
 - Add `~/.local/bin` to your shell PATH (see above) for convenient access.
-- Stand up / get SSH access to the x86-64 build server and do a clean
-  from-source bitstream build of unmodified Maia SDR (handoff doc §7 step 1).
+- ~~Stand up the x86-64 build server and do a clean from-source bitstream build
+  of unmodified Maia SDR (handoff §7 step 1).~~ **Done** — server provisioned,
+  Vivado 2023.2 installed, bitstream built (timing met), base PL usage measured
+  (LUT 5416/17600, FF 6493/35200, BRAM 29/60, DSP 18/80). See `PROGRESS.md`.
+- Flash the baseline Maia image (`build/pluto.dfu`) to a Pluto (§7 step 3).
