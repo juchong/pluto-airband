@@ -1,0 +1,22 @@
+# Fully-resolved lock for the macOS (Apple Silicon) native dev env (Python 3.12).
+# Generated via `pip freeze` after validating the maia-hdl test suites.
+# Recreate exactly with:
+#   python3.12 -m venv .venv && source .venv/bin/activate
+#   pip install -r requirements-dev.lock.txt
+amaranth==0.5.8
+amaranth-yosys==0.40.0.0.post103
+cocotb==2.0.1
+cocotb-bus==0.3.0
+find_libpython==0.5.1
+importlib_resources==7.1.0
+Jinja2==3.1.6
+jschon==0.11.1
+MarkupSafe==3.0.3
+numpy==1.26.4
+packaging==26.2
+pyvcd==0.4.1
+rfc3986==2.0.0
+scapy==2.7.0
+scipy==1.13.1
+wasmtime==29.0.0
+wheel==0.47.0

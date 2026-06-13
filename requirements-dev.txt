@@ -1,0 +1,23 @@
+# Maia SDR — macOS (Apple Silicon) native development environment (top-level pins)
+#
+# Versions aligned with the upstream maia-sdr-devel container (tag 20260304):
+#   https://github.com/maia-sdr/maia-sdr-docker/blob/main/maia-sdr-devel/Dockerfile
+# (Amaranth 0.5.8; cocotb installed unpinned -> 2.x; numpy/scipy from Ubuntu 24.04 apt -> numpy 1.26.x.)
+#
+# Validated against maia-sdr `main` (maia-hdl 0.6.2) on Python 3.12:
+#   - `python -m unittest` in maia-hdl/        -> 51 tests OK
+#   - `make` in maia-hdl/test_cocotb/          -> all subdirs PASS
+#
+# IMPORTANT (reproducibility): always set
+#   export AMARANTH_USE_YOSYS=builtin
+# so Amaranth uses the bundled `amaranth-yosys` instead of a newer, incompatible
+# Homebrew yosys. The venv's activate script sets this automatically.
+#
+# For an exact, fully-resolved lock (incl. transitive deps) use requirements-dev.lock.txt.
+
+amaranth[builtin-yosys]==0.5.8
+amaranth-yosys==0.40.0.0.post103
+cocotb==2.0.1
+cocotb-bus==0.3.0
+numpy==1.26.4
+scipy==1.13.1
