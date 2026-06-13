@@ -5,6 +5,7 @@
 # We build *on top of* these and do not track or modify their trees.
 maia-sdr/
 plutosdr-fw/
+libiio/
 
 # Python caches
 __pycache__/

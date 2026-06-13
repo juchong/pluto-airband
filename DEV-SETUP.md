@@ -20,7 +20,7 @@ cocotb/Icarus simulations.
 | `dfu-util` | Homebrew | flash the Pluto over USB (later) |
 | Rust toolchain | rustup (`~/.cargo`) | edit / `cargo check` maia-httpd |
 | Python deps | `.venv` (see `requirements-dev.*`) | Amaranth, cocotb, numpy, scipy |
-| `libiio` / `iio_info` | **not yet installed** | talk to the Pluto over USB (needed before HW bring-up) |
+| `libiio` 0.25 / `iio_info` | built from source → `~/.local` | talk to the Pluto over USB |
 
 ### Upstream dependencies (read-only, pinned by SHA)
 
@@ -113,10 +113,49 @@ x86-64 Linux host (`pluto-airband-fpga.md` §5.1):
 > it is slow and unnecessary. The native env above is the inner loop; only ship
 > synthesis/bitstream to the x86 box.
 
+## libiio (host tools to talk to the Pluto)
+
+`libiio` is **not in Homebrew core**, and its macOS CMake build defaults to a
+`.framework` installed under `/Library/Frameworks` (needs root). We instead build
+a plain dylib + tools into `~/.local` (no sudo). Pinned to tag `v0.25`
+(`b6028fd`) — the last 0.x release, best-tested against the Pluto's `iiod`.
+
+Build deps (Homebrew): `libusb`, `libxml2`, `cmake`, `pkg-config`.
+
+```bash
+cd /Users/juanjchong/Documents/GitHub/pluto-airband
+git clone --depth 1 --branch v0.25 https://github.com/analogdevicesinc/libiio.git
+export PKG_CONFIG_PATH="/opt/homebrew/opt/libxml2/lib/pkgconfig:/opt/homebrew/lib/pkgconfig"
+# NOTE: Homebrew cmake is shadowed by MacPorts here; call it explicitly.
+/opt/homebrew/bin/cmake -S libiio -B libiio/build \
+  -DCMAKE_INSTALL_PREFIX="$HOME/.local" \
+  -DOSX_FRAMEWORK=OFF \
+  -DWITH_USB_BACKEND=ON -DWITH_NETWORK_BACKEND=ON \
+  -DWITH_SERIAL_BACKEND=OFF -DWITH_LOCAL_BACKEND=OFF -DHAVE_DNS_SD=OFF \
+  -DCMAKE_MACOSX_RPATH=OFF -DCMAKE_INSTALL_NAME_DIR="$HOME/.local/lib"
+/opt/homebrew/bin/cmake --build libiio/build -j4
+/opt/homebrew/bin/cmake --install libiio/build
+```
+
+`-DCMAKE_MACOSX_RPATH=OFF -DCMAKE_INSTALL_NAME_DIR=...` is required: libiio bakes
+an rpath (`@executable_path/../..`) suited to its framework layout, which is wrong
+for a `bin`+`lib` prefix. Building with an absolute install name avoids it.
+
+Installs to `~/.local`: `bin/iio_{info,readdev,writedev,attr,reg,genxml}`,
+`lib/libiio.0.25.dylib`, `include/iio.h`, `lib/pkgconfig/libiio.pc`.
+
+Put it on PATH (add to `~/.zshrc`):
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+export PKG_CONFIG_PATH="$HOME/.local/lib/pkgconfig:$PKG_CONFIG_PATH"
+```
+
+Verify: `iio_info --version` → `0.25 ... backends: xml ip usb`. With no Pluto
+attached, `iio_info -s` prints "No IIO context found" (expected).
+
 ## Still TODO before hardware bring-up
 
-- Install `libiio` (not in Homebrew core): build from
-  `analogdevicesinc/libiio`, or install ADI's macOS `.pkg`. Needed for
-  `iio_info` / reading audio from the Pluto over USB.
+- Add `~/.local/bin` to your shell PATH (see above) for convenient access.
 - Stand up / get SSH access to the x86-64 build server and do a clean
   from-source bitstream build of unmodified Maia SDR (handoff doc §7 step 1).

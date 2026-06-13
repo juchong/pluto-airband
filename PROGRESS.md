@@ -8,7 +8,7 @@ Authoritative spec: `pluto-airband-fpga.md`. Environment details: `DEV-SETUP.md`
 | Handoff §7 task | State |
 |---|---|
 | 1. x86 build server bring-up (bitstream build of unmodified Maia) | not started |
-| 2. Mac dev env (Amaranth, cocotb/Icarus, Rust, libiio+dfu-util) | **done** (libiio pending) |
+| 2. Mac dev env (Amaranth, cocotb/Icarus, Rust, libiio+dfu-util) | **done** |
 | 3. Flash baseline Maia to Pluto | not started |
 | 4. Channelizer feasibility (GATE) | not started |
 | 5. AM demod block | not started |
@@ -28,6 +28,13 @@ Authoritative spec: `pluto-airband-fpga.md`. Environment details: `DEV-SETUP.md`
   `plutosdr-fw`. `XilinxUnisimLibrary` submodule initialized; `adi-hdl` not.
 - **Validated:** `python -m unittest` in `maia-hdl/` → 51 tests OK; full
   `maia-hdl/test_cocotb/` suite → all PASS.
+- **libiio 0.25** (tag `b6028fd`) built from source → `~/.local` (plain dylib +
+  tools, no sudo). `iio_info --version` OK, backends `xml ip usb`. Pinned in
+  `DEV-SETUP.md`. (Add `~/.local/bin` to PATH for convenience.)
+
+### Repo
+- Local git repo pushed to remote `origin`:
+  https://github.com/juchong/pluto-airband.git (`master`).
 
 ## Decisions made
 
@@ -39,8 +46,9 @@ Authoritative spec: `pluto-airband-fpga.md`. Environment details: `DEV-SETUP.md`
   only; the Maia Docker images are `linux/amd64`-only (verified via GHCR API), so
   synthesis/bitstream/firmware runs on a separate x86-64 Linux host with Docker
   (handoff §5.1). Not yet provisioned.
-- **Repo:** workspace root is a local git repo tracking only our artifacts
-  (docs, requirements, future HDL/Pi code). No remote yet.
+- **Repo:** workspace root is a git repo tracking only our artifacts
+  (docs, requirements, future HDL/Pi code), pushed to
+  `github.com/juchong/pluto-airband`.
 
 ### Toolchain version alignment (why our pins differ from the handoff doc)
 Pins follow the upstream `maia-sdr-devel` container (tag `20260304`) rather than
@@ -64,6 +72,7 @@ the doc's older numbers, because current `maia-sdr` `main` requires them:
 > gating. Only feasibility gate is FPGA resource fit (§4.2).
 
 ## Next steps
-- Install `libiio` (not in Homebrew core) for `iio_info` + USB audio reads.
 - Provision / get SSH to the x86-64 build server; clean from-source bitstream
   build of unmodified Maia SDR (handoff §7 step 1).
+- Resolve the §8 open decisions (esp. channel count + capture window) to scope
+  the channelizer feasibility gate (§4.2).
