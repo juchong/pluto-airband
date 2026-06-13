@@ -7,7 +7,7 @@ Authoritative spec: `pluto-airband-fpga.md`. Environment details: `DEV-SETUP.md`
 
 | Handoff §7 task | State |
 |---|---|
-| 1. x86 build server bring-up (bitstream build of unmodified Maia) | not started |
+| 1. x86 build server bring-up (bitstream build of unmodified Maia) | **in progress** (server provisioned; Vivado 2023.2 installed; build running) |
 | 2. Mac dev env (Amaranth, cocotb/Icarus, Rust, libiio+dfu-util) | **done** |
 | 3. Flash baseline Maia to Pluto | not started |
 | 4. Channelizer feasibility (GATE) | **GO** (modeled; 25 ch fit via time-mux) |

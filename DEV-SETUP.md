@@ -100,19 +100,70 @@ that upstream CI uses), tag `20260304`
 
 The Maia Docker images are **`linux/amd64`-only** (verified via the GHCR registry
 API — no `arm64` / multi-arch variant exists). They wrap **Vivado 2023.2, which is
-x86-64-only**, so they cannot be native on Apple Silicon. Run them on a separate
-x86-64 Linux host (`pluto-airband-fpga.md` §5.1):
+x86-64-only**, so they cannot be native on Apple Silicon. They run on a separate
+x86-64 Linux host (`pluto-airband-fpga.md` §5.1).
 
 - `ghcr.io/maia-sdr/maia-sdr-devel` — Yosys/Icarus/Amaranth/Rust + everything to
-  run Vivado 2023.2 (Vivado installed manually into a Docker volume at
-  `/opt/Xilinx`). Used for: Amaranth→Verilog→Vivado IP, synth+impl→bitstream,
-  firmware assembly.
+  run Vivado 2023.2 (Vivado supplied via a Docker volume at `/opt/Xilinx`). Used
+  for: Amaranth→Verilog→Vivado IP, synth+impl→bitstream, firmware assembly.
 - `ghcr.io/maia-sdr/cross-armv7-unknown-linux-gnueabihf-maia-sdr` — `cross` image
   to build `maia-httpd` against the Pluto's buildroot toolchain.
 
 > Do **not** run these images on this Mac under x86 emulation for routine work —
 > it is slow and unnecessary. The native env above is the inner loop; only ship
 > synthesis/bitstream to the x86 box.
+
+### Provisioned server
+
+- Host `xilinx-builder` — Ubuntu 22.04.5, x86-64, 32 vCPU, 31 GiB RAM, ~294 GB
+  disk. SSH as `administrator` (key-based auth set up from the Mac).
+- **Rootless Docker** (Docker root dir under `~/.local/share/docker`). This is the
+  single biggest gotcha: host `administrator` (uid 1000) maps to **container
+  root**, so the firmware build container must run as **`DOCKER_USER=0:0`** (not
+  `$(id -u):$(id -g)` as upstream docs assume) to own the bind-mounted source.
+- Source at `~/pluto-build/plutosdr-fw` — `plutosdr-fw` v0.8.2 (`7d4cfda`) cloned
+  recursively (`maia-sdr`, `buildroot`, `linux`, `u-boot-xlnx`, `IQEngine` + nested
+  `adi-hdl`). `plutosdr-fw` pins `maia-sdr` at `c96c496` — same SHA as the Mac dev
+  pin, so HDL versions are consistent.
+
+### Vivado / Vitis 2023.2
+
+Required for the from-source bitstream (`plutosdr-fw` falls back to downloading a
+prebuilt `system_top.xsa` if absent). Installed from the AMD offline Single-File
+Download `FPGAs_AdaptiveSoCs_Unified_2023.2_1013_2256.tar.gz` (≈112 GB).
+
+- Installed **Vitis** edition (superset: lays down `Vivado/2023.2`, `Vitis/2023.2`,
+  `Vitis_HLS/2023.2` — all three are sourced by `build-docker.sh`), **Zynq-7000
+  device family only** (the Pluto is an XC7Z010) to keep the install ~lean.
+- Target dir `/opt/Xilinx` → gives the `.settings64-*.sh` files the build sources.
+- Batch install: `xsetup --agree XilinxEULA,3rdPartyEULA --batch Install
+  --config ~/.Xilinx/install_config.txt` (config from `xsetup -b ConfigGen`, with
+  `Destination=/opt/Xilinx` and all `Modules` set to 0 except `Zynq-7000:1`).
+- No license needed: the XC7Z010 is in the free WebPACK/Standard device set.
+
+### Vivado Docker volume
+
+`plutosdr-fw/compose.yml` mounts an **external** named volume `vivado2023_2` at
+`/opt/Xilinx`. Rather than copy ~70 GB into a volume, bind the named volume to the
+host install (compose.yml stays unmodified):
+
+```bash
+docker volume rm vivado2023_2 2>/dev/null
+docker volume create --driver local \
+  --opt type=none --opt device=/opt/Xilinx --opt o=bind vivado2023_2
+```
+
+### Run the firmware + bitstream build
+
+```bash
+cd ~/pluto-build/plutosdr-fw
+DOCKER_USER="0:0" TARGET=pluto docker compose run --rm build
+```
+
+This runs `build-docker.sh` in the devel image (sources Vivado/Vitis/Vitis_HLS,
+runs `make` under an `Xvfb` display for `xsct`). With Vivado present it does the
+full from-source bitstream (`HAVE_VIVADO=1`). Artifacts land in
+`plutosdr-fw/build/` (`.frm`/`.dfu`, `boot.frm`, `system_top.xsa`, etc.).
 
 ## libiio (host tools to talk to the Pluto)
 
