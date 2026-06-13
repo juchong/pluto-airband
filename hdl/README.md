@@ -78,5 +78,38 @@ recovers a clean low-rate audio tone at the expected frequency. Plot at
 Audio rate (8 vs 16 ksps) is open decision §8.3 — `audio_decim`/`cic_stages` are
 parameters; nothing here hard-codes the choice.
 
-Next: time-multiplex one DDC datapath across many channels to estimate Z-7010
-resource fit (the §4.2 feasibility gate), and the x86 build-server bring-up.
+## `synth_estimate.py`
+
+Emits Verilog for maia-hdl's `DDC` and our `AMBackEnd` (`EnvelopeMagnitude` +
+`DCBlock` + `CICDecimator`) and runs Yosys `synth_xilinx -family xc7` to get hard
+7-series resource counts (LUT/FF/DSP48E1/BRAM). Requires `yosys` on PATH.
+
+```bash
+python synth_estimate.py
+```
+
+Measured: a full DDC = **11 DSP48E1** (Cmult3x mixer 1 + 3-stage FIR 4+2+4=10),
+~661 LUT, ~1239 FF, ~4 BRAM36. The AM back-end is **0 DSP48E1** (multiplier-free),
+~295 LUT, ~281 FF per channel. DSP/BRAM map 1:1 and are trustworthy; LUT/FF are
+Yosys estimates to be re-confirmed with Vivado.
+
+## `feasibility_25ch.py`
+
+The §4.2 resource-fit **GATE** for the 25-channel target. Uses the measured
+per-block costs above plus a time-multiplexing throughput model to size a shared
+channelizer and compare against the Z-7010 budget for several capture-window
+choices (§8.2).
+
+```bash
+python feasibility_25ch.py
+```
+
+Result: **GO**. 25 independent DDCs (275 DSP / ~100 BRAM) do not fit, but a
+time-multiplexed channelizer does — even the full ~19 MHz airband needs only
+~8 lanes / 24 DSP / ~52% LUT / 33% BRAM (before the ADI/Maia base platform); a
+narrower clustered window is far more comfortable. The AM back-end costs zero
+DSP. Binding resource is LUT/FF, set by lane count = ceil(25 * window / 62.5MHz).
+
+Next: x86 build-server bring-up (measure the base-platform PL usage; clean
+bitstream of unmodified Maia, handoff §7 step 1), then prototype the
+time-multiplexed channelizer lane.

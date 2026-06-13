@@ -10,7 +10,7 @@ Authoritative spec: `pluto-airband-fpga.md`. Environment details: `DEV-SETUP.md`
 | 1. x86 build server bring-up (bitstream build of unmodified Maia) | not started |
 | 2. Mac dev env (Amaranth, cocotb/Icarus, Rust, libiio+dfu-util) | **done** |
 | 3. Flash baseline Maia to Pluto | not started |
-| 4. Channelizer feasibility (GATE) | exploring DDC building block |
+| 4. Channelizer feasibility (GATE) | **GO** (modeled; 25 ch fit via time-mux) |
 | 5. AM demod block | **done** (envelope mag + DC-block + audio decimate, chain verified) |
 | 6. Single-channel end-to-end | not started |
 | 7. Multi-channel | not started |
@@ -74,8 +74,10 @@ the doc's older numbers, because current `maia-sdr` `main` requires them:
   newer/incompatible Homebrew `yosys`. Set automatically by the venv `activate`.
 
 ## Open decisions (from handoff §8 — still to resolve, do not guess)
-1. Channel count target N (drives feasibility + framing).
+1. ~~Channel count target N~~ — **RESOLVED: N = 25** (drives feasibility + framing).
 2. Capture window center + width (all channels inside, with edge margin).
+   **Now the key gating parameter** (sets channelizer lane count / LUT-FF usage):
+   narrower window = fewer lanes = more slack; full ~19 MHz airband still fits.
 3. Audio rate: 8 ksps vs 16 ksps.
 4. Squelch/AGC placement: FPGA vs Pi (default: Pi first).
 5. Front-end filtering: airband BPF + broadcast-FM notch (hygiene).
@@ -107,9 +109,25 @@ the doc's older numbers, because current `maia-sdr` `main` requires them:
 - Audio rate (8 vs 16 ksps) left open (§8.3): `audio_decim`/`cic_stages` are
   parameters; nothing hard-codes the choice.
 
+### Channelizer feasibility GATE (§4.2) — GO for N=25
+- `hdl/synth_estimate.py`: emits Verilog for the real maia-hdl `DDC` and our AM
+  back-end, runs Yosys `synth_xilinx -family xc7`. **Measured:** full DDC = 11
+  DSP48E1 (Cmult3x mixer 1 + 3-stage FIR 4+2+4=10), ~661 LUT, ~1239 FF, ~4 BRAM36;
+  AM back-end = **0 DSP** (multiplier-free), ~295 LUT, ~281 FF/ch.
+- `hdl/feasibility_25ch.py`: time-multiplexing resource model vs the XC7Z010
+  budget (17.6k LUT / 35.2k FF / 80 DSP48E1 / 60 BRAM36).
+  - Naive 25× parallel DDCs = 275 DSP / ~100 BRAM → INFEASIBLE.
+  - Time-multiplexed shared channelizer (shared CIC front-end + lanes =
+    ceil(25*W/62.5MHz), DSP-free back-end shared at audio rate): **fits at every
+    window** — full ~19 MHz airband ≈ 8 lanes / 24 DSP / 52% LUT / 33% BRAM;
+    a clustered window (≤4–8 MHz) is far more comfortable (1–4 lanes).
+- Caveats to confirm on the build server: subtract ADI/Maia base-platform PL
+  usage; LUT/FF are Yosys (not Vivado) estimates; pick §8.2 capture window.
+
 ## Next steps
-- Explore time-multiplexing the single DDC datapath across many channels (§4.2)
-  to estimate Z-7010 resource fit (the feasibility GATE).
-- Provision / get SSH to the x86-64 build server; clean from-source bitstream
-  build of unmodified Maia SDR (handoff §7 step 1).
-- Resolve the §8 open decisions (esp. channel count + capture window).
+- x86-64 build server bring-up (handoff §7 step 1): clean from-source bitstream
+  of unmodified Maia SDR; **measure the base-platform PL usage** to subtract from
+  the feasibility budget.
+- Resolve §8.2 capture window (now the gating parameter for lane count).
+- Prototype one time-multiplexed channelizer lane (shared CIC front-end + TDM
+  NCO/mixer + per-channel CIC/FIR) and synth-check DSP/LUT against the model.
