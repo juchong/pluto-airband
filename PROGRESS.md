@@ -10,7 +10,7 @@ Authoritative spec: `pluto-airband-fpga.md`. Environment details: `DEV-SETUP.md`
 | 1. x86 build server bring-up (bitstream build of unmodified Maia) | **done** (Vivado 2023.2; from-source bitstream built, timing met; base PL usage measured) |
 | 2. Mac dev env (Amaranth, cocotb/Icarus, Rust, libiio+dfu-util) | **done** |
 | 3. Flash baseline Maia to Pluto | not started |
-| 4. Channelizer feasibility (GATE) | **GO** (confirmed vs measured base; 25 ch fit, even full 19 MHz window) |
+| 4. Channelizer feasibility (GATE) | **GO** (confirmed vs measured base; 22 ch = 21 core + 1 deferred, fit) |
 | 5. AM demod block | **done** (envelope mag + DC-block + audio decimate, chain verified) |
 | 6. Single-channel end-to-end | blocked on hardware (needs a Pluto) |
 | 7. Multi-channel | **in progress** (one time-mux channelizer lane prototyped + verified) |
@@ -54,8 +54,8 @@ Authoritative spec: `pluto-airband-fpga.md`. Environment details: `DEV-SETUP.md`
 
   Binding resource for the channelizer is **BRAM36 (31 free)**, then LUT
   (12184 free); DSPs are abundant (62 free). Folded into `hdl/feasibility_25ch.py`
-  — 25 channels still fit on top of the base, even at the full ~19 MHz window
-  (≈65% of free BRAM, ≈75% of free LUT).
+  — all 22 channels still fit on top of the base, even at the full ~19 MHz window
+  (≈58% of free BRAM, ≈69% of free LUT).
 
 ### Repo
 - Local git repo pushed to remote `origin`:
@@ -99,15 +99,16 @@ the doc's older numbers, because current `maia-sdr` `main` requires them:
   newer/incompatible Homebrew `yosys`. Set automatically by the venv `activate`.
 
 ## Open decisions (from handoff §8 — still to resolve, do not guess)
-1. ~~Channel count target N~~ — **RESOLVED: N = 25** (drives feasibility + framing).
+1. ~~Channel count target N~~ — **RESOLVED: N = 22** (final list: 21 need-to-have
+   core channels + 1 deferred nice-to-have outlier at 133.65 MHz).
 2. ~~Capture window center + width~~ — **RESOLVED (core list): center (LO)
    123.438 MHz, Fs ≈ 14 MHz** (see `hdl/capture_window.py`). The 21 core channels
    span 118.05–128.5 MHz; centering in the 122.975–123.9 guard gap puts the DC/LO
    spur 463 kHz from the nearest channel and keeps every channel inside the central
    ~80% (extreme ±5.39 MHz = 77% of the ±7 MHz half-band, ≥1.6 MHz edge guard).
-   Costs ~6 time-mux lanes (≤8 the Z-7010 fits). 133.65 MHz is a **nice-to-have**,
-   deferred (would force Fs≈20 MHz / 8 lanes / higher center). 3 of the final 25
-   channels are still pending; the edge guard absorbs further in-cluster additions.
+   Costs ~5 time-mux lanes (≤8 the Z-7010 fits). 133.65 MHz is a **nice-to-have**,
+   deferred (would force Fs≈20 MHz / 8 lanes / center 125.75 MHz); it can be added
+   later as a separate decision without disturbing the core.
 3. Audio rate: 8 ksps vs 16 ksps.
 4. Squelch/AGC placement: FPGA vs Pi (default: Pi first).
 5. Front-end filtering: airband BPF + broadcast-FM notch (hygiene).
@@ -159,28 +160,27 @@ the doc's older numbers, because current `maia-sdr` `main` requires them:
 - Not yet built: shared front-end decimator (window → intermediate rate) and the
   per-lane cleanup/compensation FIR (CIC passband-droop correction).
 
-### Channelizer feasibility GATE (§4.2) — GO for N=25
+### Channelizer feasibility GATE (§4.2) — GO for N=22
 - `hdl/synth_estimate.py`: emits Verilog for the real maia-hdl `DDC` and our AM
   back-end, runs Yosys `synth_xilinx -family xc7`. **Measured:** full DDC = 11
   DSP48E1 (Cmult3x mixer 1 + 3-stage FIR 4+2+4=10), ~661 LUT, ~1239 FF, ~4 BRAM36;
   AM back-end = **0 DSP** (multiplier-free), ~295 LUT, ~281 FF/ch.
 - `hdl/feasibility_25ch.py`: time-multiplexing resource model vs the XC7Z010
   budget (17.6k LUT / 35.2k FF / 80 DSP48E1 / 60 BRAM36).
-  - Naive 25× parallel DDCs = 275 DSP / ~100 BRAM → INFEASIBLE.
+  - Naive 22× parallel DDCs = 242 DSP / ~88 BRAM → INFEASIBLE.
   - Time-multiplexed shared channelizer (shared CIC front-end + lanes =
-    ceil(25*W/62.5MHz), DSP-free back-end shared at audio rate): **fits at every
+    ceil(N*W/62.5MHz), DSP-free back-end shared at audio rate): **fits at every
     window**.
 - **Base-platform usage now measured** (build server step 1) and folded in: the
   model checks the channelizer against the FREE budget (Z7010 − base). Still GO —
-  full ~19 MHz airband ≈ 8 lanes / 24 DSP / 75% of free LUT / 65% of free BRAM;
-  a clustered window (≤4–8 MHz) is far more comfortable (1–4 lanes). Binding
+  full ~19 MHz airband ≈ 7 lanes / 21 DSP / 69% of free LUT / 58% of free BRAM;
+  the resolved 14 MHz core window ≈ 5 lanes (56% LUT / 45% BRAM). Binding
   resources: BRAM36 then LUT. LUT/FF lane costs remain Yosys-scale estimates to
-  re-confirm in Vivado once a lane is prototyped.
+  re-confirm in Vivado once a full lane is built.
 
 ## Next steps
-- §8.2 capture window **resolved** for the core list (center 123.438 MHz, Fs ≈ 14
-  MHz, ~6 lanes; `hdl/capture_window.py`). Re-run that script when the final 3
-  channels arrive to confirm they fall inside the window.
+- §8.2 capture window **resolved** (final list): center 123.438 MHz, Fs ≈ 14 MHz,
+  ~5 lanes for the 21 core channels (`hdl/capture_window.py`); 133.65 MHz deferred.
 - Extend the channelizer lane: add the shared front-end decimator and a per-lane
   cleanup/compensation FIR; then re-measure the lane in Vivado on the build server
   (real LUT/FF/DSP/BRAM, with per-channel state in BRAM).

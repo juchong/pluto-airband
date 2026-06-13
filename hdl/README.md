@@ -81,7 +81,7 @@ parameters; nothing here hard-codes the choice.
 ## `synth_estimate.py`
 
 Emits Verilog for maia-hdl's `DDC`, our `AMBackEnd` (`EnvelopeMagnitude` +
-`DCBlock` + `CICDecimator`), and the `TdmDdcLane` (at 8 and 25 channels) and runs
+`DCBlock` + `CICDecimator`), and the `TdmDdcLane` (at 8 and 21 channels) and runs
 Yosys `synth_xilinx -family xc7` to get hard 7-series resource counts
 (LUT/FF/DSP48E1/BRAM). Requires `yosys` on PATH.
 
@@ -96,10 +96,11 @@ Yosys estimates to be re-confirmed with Vivado.
 
 ## `feasibility_25ch.py`
 
-The §4.2 resource-fit **GATE** for the 25-channel target. Uses the measured
-per-block costs above plus a time-multiplexing throughput model to size a shared
-channelizer and compare against the Z-7010 budget for several capture-window
-choices (§8.2).
+The §4.2 resource-fit **GATE** for the final channel set (22 = 21 core + 1
+deferred). Uses the measured per-block costs above plus a time-multiplexing
+throughput model to size a shared channelizer and compare against the Z-7010
+budget for several capture-window choices (§8.2). (Filename is historical — the
+planning target was 25.)
 
 ```bash
 python feasibility_25ch.py
@@ -107,10 +108,11 @@ python feasibility_25ch.py
 
 Result: **GO**, now confirmed against the **measured** Maia base platform (built
 from source on the x86 server; LUT 5416/17600, FF 6493/35200, BRAM 29/60, DSP
-18/80, timing met). 25 independent DDCs (275 DSP / ~100 BRAM) do not fit, but a
+18/80, timing met). 22 independent DDCs (242 DSP / ~88 BRAM) do not fit, but a
 time-multiplexed channelizer fits the FREE budget (Z7010 − base) at every capture
-window — even the full ~19 MHz airband (~8 lanes / 24 DSP / 75% of free LUT /
-65% of free BRAM). Binding resources: BRAM36 then LUT. AM back-end costs zero DSP.
+window — even the full ~19 MHz airband (~7 lanes / 21 DSP / 69% of free LUT /
+58% of free BRAM); the resolved 14 MHz core window is ~5 lanes (56% LUT / 45%
+BRAM). Binding resources: BRAM36 then LUT. AM back-end costs zero DSP.
 
 ## `capture_window.py`
 
@@ -118,7 +120,7 @@ Resolves the §8.2 capture window from the operator's channel list. Picks the
 center (LO) frequency so the zero-IF **DC/LO-leakage spur** lands in a guard gap
 between channels, sizes the complex sample rate so every channel stays in the
 central ~80% of the band (clear of the filter skirts), and reports the resulting
-time-mux lane count. Re-run when the final channels arrive.
+time-mux lane count. Re-run if the channel list changes.
 
 ```bash
 python capture_window.py
@@ -126,9 +128,9 @@ python capture_window.py
 
 Result (21 core channels, 118.05–128.5 MHz): **center 123.438 MHz, Fs ≈ 14 MHz**
 (±7 MHz half-band; extreme channel ±5.39 MHz = 77%; ≥1.6 MHz edge guard; DC spur
-463 kHz from the nearest channel), costing ~6 of the ≤8 lanes the Z-7010 fits. The
+463 kHz from the nearest channel), costing ~5 of the ≤8 lanes the Z-7010 fits. The
 far-out 133.65 MHz is deferred (a nice-to-have that would force Fs≈20 MHz / 8
-lanes). Plot at `out/capture_window.png` (git-ignored).
+lanes / center 125.75 MHz). Plot at `out/capture_window.png` (git-ignored).
 
 ## `channelizer_lane.py`
 
@@ -157,6 +159,6 @@ registers — in the real design that state maps to **BRAM** (which the feasibil
 model already budgets). Not yet included: the shared front-end decimator and the
 per-lane cleanup/compensation FIR (CIC droop correction) — the next increment.
 
-Next: resolve the §8.2 capture window (needs the operator's 25-channel frequency
-list — it sets the lane count), then add the shared front-end + cleanup FIR and
-re-measure on the build server in Vivado.
+Next: add the shared front-end decimator + per-lane cleanup FIR (the §8.2 capture
+window is resolved — center 123.438 MHz, Fs ≈ 14 MHz, ~5 lanes), then re-measure
+on the build server in Vivado.

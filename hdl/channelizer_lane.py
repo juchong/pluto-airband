@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Time-multiplexed channelizer lane prototype (handoff §4.2 / §7 step 7).
 
-The feasibility study (``feasibility_25ch.py``) showed that 25 AM channels fit the
+The feasibility study (``feasibility_25ch.py``) showed that the AM channels fit the
 Z-7010 only if the per-channel datapaths are **time-multiplexed**: the PL runs at
 62.5 MHz while each channel needs only ~tens of ksps, so one physical datapath can
 serve many channels by iterating over them between input samples (§4.2).

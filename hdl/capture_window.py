@@ -26,8 +26,8 @@ import pathlib
 
 OUT_DIR = pathlib.Path(__file__).parent / "out"
 
-# Target channels (MHz). 3 of the final 25 are still pending (2026-06-13); the
-# margins below are sized to absorb a few more in-cluster additions.
+# Target channels (MHz) -- FINAL list (2026-06-13). 21 "need to have" core
+# channels plus one deferred far-out outlier (133.65, see below).
 CORE_CHANNELS_MHZ = sorted([
     118.050, 119.2, 119.9, 120.1, 120.4, 120.95, 121.5, 121.6, 121.7,
     122.275, 122.95, 122.975, 123.9, 124.7, 125.6, 125.9, 126.25, 126.5,
@@ -37,7 +37,7 @@ CORE_CHANNELS_MHZ = sorted([
 # supporting it is a separate, later decision (§8.2 note).
 OUTLIER_MHZ = [133.65]
 
-N_TARGET = 25                 # full channel-count target (handoff §8.1, resolved)
+N_CORE = len(CORE_CHANNELS_MHZ)   # 21 need-to-have channels (final list)
 F_PL = 62.5e6                 # PL "sync" clock (handoff §4.2)
 
 # A channel must stay within this fraction of the half-band (|offset| < frac*W/2)
@@ -79,7 +79,7 @@ def required_width_mhz(channels_mhz, center_mhz, usable=USABLE_FRACTION):
     return 2.0 * max_off / usable
 
 
-def lanes_for(width_mhz, n=N_TARGET):
+def lanes_for(width_mhz, n=N_CORE):
     return max(1, math.ceil(n * (width_mhz * 1e6) / F_PL))
 
 
@@ -99,7 +99,7 @@ def _report(title, channels):
     max_off = max(abs(f - center) for f in ch)
     edge_margin = half - max_off
     dc_clear_khz = min(abs(f - center) for f in ch) * 1e3
-    lanes = lanes_for(fs)
+    lanes = lanes_for(fs, len(ch))
 
     print(f"\n=== {title} ===")
     print(f"  channels            : {len(ch)}  ({ch[0]:.3f} .. {ch[-1]:.3f} MHz, "
@@ -113,7 +113,7 @@ def _report(title, channels):
     print(f"  extreme channel off : +/-{max_off:.3f} MHz "
           f"({100*max_off/half:.0f}% of half-band)")
     print(f"  edge guard          : {edge_margin:.3f} MHz to each band edge")
-    print(f"  time-mux lanes (N=25): {lanes}  (of <=8 that the Z-7010 fits)")
+    print(f"  time-mux lanes (N={len(ch)}): {lanes}  (of <=8 that the Z-7010 fits)")
     return center, fs, lanes
 
 
@@ -141,9 +141,8 @@ def main():
           f"spur sits in a channel gap. Costs {lanes} time-mux lanes (<= the 8 the "
           f"Z-7010 fits).")
     print("  The 133.65 MHz channel is excluded (it would push Fs to ~20 MHz and")
-    print("  shift the center up, spending lanes/edge-margin on one nice-to-have).")
-    print("  3 of the final 25 channels are still pending; the edge guard above")
-    print("  absorbs further in-cluster (118-128.5 MHz) additions without a change.")
+    print("  shift the center up, spending lanes/edge-margin on one nice-to-have);")
+    print("  it can be added later as a separate decision without disturbing the core.")
 
     _save_plot(center, fs)
 

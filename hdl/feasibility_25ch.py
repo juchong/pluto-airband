@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
-"""Z-7010 feasibility model for a 25-channel airband AM channelizer (§4.2 GATE).
+"""Z-7010 feasibility model for the airband AM channelizer (§4.2 GATE).
 
-This is the resource/timing feasibility GATE from the handoff doc: does a
-25-channel AM receiver fit in the Pluto's XC7Z010 programmable logic?
+(Filename is historical: the planning target was N=25; the final channel list is
+22 -- 21 "need to have" core channels plus one deferred outlier. We keep N=22 here
+as the conservative upper bound.)
+
+This is the resource/timing feasibility GATE from the handoff doc: does the
+multichannel AM receiver fit in the Pluto's XC7Z010 programmable logic?
 
 It combines:
   * the Z-7010 PL budget (DS190 / UG585),
@@ -20,6 +24,9 @@ top of the ADI/Maia base platform (which itself consumes PL — also to be
 measured on the build server, step 1).
 
 Run:  python hdl/feasibility_25ch.py
+
+Capture window (center/Fs, lane count) is resolved separately in
+``capture_window.py`` (§8.2): core list -> Fs ~14 MHz / ~5 lanes.
 """
 from __future__ import annotations
 
@@ -49,7 +56,7 @@ MIXER_DSP = 1          # Cmult3x: 1 DSP48E1, reused via the 3x clock
 FIR_CLEANUP_DSP = 2    # one FIR2DSP compensation/cleanup filter per lane
 # (bulk decimation done by multiplier-free CIC: 0 DSP)
 
-N = 25                 # channel-count target
+N = 22                 # final channel count (21 core + 1 deferred outlier)
 F_S = 62.5e6           # PL "sync" clock (handoff §4.2)
 AUDIO_HZ = 16_000      # 16 ksps (open decision §8.3; 8 ksps only relaxes this)
 
@@ -90,7 +97,7 @@ def _bar(used, total):
 
 def main():
     print("=" * 70)
-    print("Z-7010 feasibility: 25-channel airband AM channelizer (handoff §4.2)")
+    print(f"Z-7010 feasibility: {N}-channel airband AM channelizer (handoff §4.2)")
     print("=" * 70)
 
     print("\nMeasured per-block cost (Yosys synth_xilinx -family xc7):")
@@ -100,12 +107,13 @@ def main():
           f"LUT {BACKEND['LUT']:>4}  FF {BACKEND['FF']:>4}  BRAM "
           f"{BACKEND['BRAM36']}  (multiplier-free)")
 
-    print("\n[A] Naive: 25 independent full DDCs (no sharing)")
+    print(f"\n[A] Naive: {N} independent full DDCs (no sharing)")
     naive = {k: N * DDC[k] for k in DDC}
     print(f"  DSP48E1 {_bar(naive['DSP48E1'], Z7010['DSP48E1'])}")
     print(f"  BRAM36  {_bar(naive['BRAM36'], Z7010['BRAM36'])}")
     print(f"  LUT     {_bar(naive['LUT'], Z7010['LUT'])}")
-    print("  => INFEASIBLE (DSP ~3.4x over, BRAM ~1.7x over). Must share.")
+    print(f"  => INFEASIBLE (DSP {naive['DSP48E1']/Z7010['DSP48E1']:.1f}x over, "
+          f"BRAM {naive['BRAM36']/Z7010['BRAM36']:.1f}x over). Must share.")
 
     print("\n[measured] Maia base platform (Vivado 2023.2, timing met):")
     print(f"  LUT {_bar(BASE['LUT'], Z7010['LUT'])}")
@@ -136,21 +144,19 @@ def main():
               f"{_bar(c['BRAM36'], FREE['BRAM36'])}")
 
     print("\n" + "=" * 70)
-    print("VERDICT: GO (confirmed against measured base). 25 AM channels fit the")
+    print(f"VERDICT: GO (confirmed against measured base). {N} AM channels fit the")
     print("Z-7010 on top of the unmodified Maia platform with a time-multiplexed")
     print("channelizer. The DSP budget is comfortable at every window (62 DSP free;")
     print("the AM back-end uses zero DSP). Binding resources are BRAM36 (31 free)")
-    print("and LUT (12184 free), driven by lane count = ceil(25 * window / 62.5MHz).")
+    print("and LUT (12184 free), driven by lane count = ceil(N * window / 62.5MHz).")
     print(f"Feasible capture windows: "
           f"{', '.join(str(w)+' MHz' for w in feasible_windows)} "
           f"(even the full ~19 MHz airband fits, the tightest case).")
     print("Resolved (§8.2, see capture_window.py): center 123.438 MHz, Fs ~14 MHz "
-          "-> ~6 lanes for the 21 core channels (133.65 MHz deferred).")
+          "-> ~5 lanes for the 21 core channels (133.65 MHz deferred).")
     print("\nRemaining caveats:")
-    print("  * resolve §8.2 capture window so the 25 channels share one window")
-    print("    with edge margin (narrower window => fewer lanes => more slack);")
     print("  * lane LUT/FF are Yosys-scale estimates; re-confirm the channelizer")
-    print("    itself in Vivado once a lane is prototyped (step: one channelizer lane).")
+    print("    itself in Vivado once a full lane (front-end + cleanup FIR) is built.")
 
 
 if __name__ == "__main__":
