@@ -41,6 +41,7 @@ import pathlib
 
 import numpy as np
 from amaranth import Array, Cat, Const, Elaboratable, Module, Signal, signed
+from amaranth.lib.memory import Memory
 from amaranth.sim import Simulator
 
 from ddc_tune_decimate import SYNC_PERIOD
@@ -279,6 +280,206 @@ class TdmDdcLane(Elaboratable):
         return m
 
 
+class TdmDdcLaneBRAM(TdmDdcLane):
+    """BRAM-backed, fully pipelined TDM DDC lane: identical *values* to
+    :class:`TdmDdcLane` (same ``model``), but the per-channel state lives in
+    ``amaranth.lib.memory.Memory`` (block/distributed RAM, not fan-out flip-flops)
+    and the datapath is split into a four-stage pipeline so it closes timing at the
+    62.5 MHz PL clock.
+
+    The single-cycle parent computes ROM mix + complex multiply + a 6-deep
+    integrator/comb adder cascade in one clock -- a ~19 ns critical path that misses
+    62.5 MHz. Here each channel flows through:
+
+        READ : present read address = chan (memories registered, 1-cycle latency).
+        MIX  : sin/cos ROM + complex downconvert multiply; write back NCO phase
+               and the decimation counter.
+        INTEG: 3-stage integrator cascade; write back integrators.
+        COMB : 3-stage comb cascade; on a decimation strobe write back the combs
+               and emit the channel's output.
+
+    One channel enters per clock, so throughput is unchanged (one channel/cycle).
+    Each channel appears once per input-sample sweep, and a channel is only revisited
+    on the next input sample (>= many cycles later because the PL clock far exceeds
+    the per-channel rate), so the read-then-write-back-3-cycles-later pipeline never
+    hazards on its own state. Bit-exact to the parent (extra latency only; verified).
+    """
+
+    def elaborate(self, platform):
+        m = Module()
+        C, S = self.n_channels, self.stages
+        aw = self.acc_w
+
+        # Shared sine ROM (small, read combinationally by the phase MSBs).
+        rom = Array(Const(v, signed(self.lut_width))
+                    for v in sine_rom(self.lut_addr_bits, self.lut_width))
+
+        # ---- per-channel state in RAM (one R + one W port each) ----
+        def make(shape):
+            return Memory(shape=shape, depth=C, init=[0] * C)
+
+        phase_m = make(self.nco_width)
+        freq_m = make(signed(self.nco_width))
+        dec_m = make(range(self.decimation))
+        ii_m = [make(signed(aw)) for _ in range(S)]
+        iq_m = [make(signed(aw)) for _ in range(S)]
+        ci_m = [make(signed(aw)) for _ in range(S)]
+        cq_m = [make(signed(aw)) for _ in range(S)]
+        all_m = [phase_m, freq_m, dec_m] + ii_m + iq_m + ci_m + cq_m
+        for idx, mem in enumerate(all_m):
+            m.submodules[f"mem{idx}"] = mem
+
+        phase_rp, freq_rp, dec_rp = (phase_m.read_port(), freq_m.read_port(),
+                                     dec_m.read_port())
+        ii_rp = [mem.read_port() for mem in ii_m]
+        iq_rp = [mem.read_port() for mem in iq_m]
+        ci_rp = [mem.read_port() for mem in ci_m]
+        cq_rp = [mem.read_port() for mem in cq_m]
+
+        phase_wp, dec_wp = phase_m.write_port(), dec_m.write_port()
+        ii_wp = [mem.write_port() for mem in ii_m]
+        iq_wp = [mem.write_port() for mem in iq_m]
+        ci_wp = [mem.write_port() for mem in ci_m]
+        cq_wp = [mem.write_port() for mem in cq_m]
+        freq_wp = freq_m.write_port()        # config only
+
+        m.d.comb += [freq_wp.addr.eq(self.freq_waddr),
+                     freq_wp.data.eq(self.freq_wdata),
+                     freq_wp.en.eq(self.freq_wren)]
+
+        # ---- sweep control: a channel index + valid flag flow down the pipe ----
+        xi = Signal(signed(self.in_width))
+        xq = Signal(signed(self.in_width))
+        chan_r = Signal(range(C))
+        proc_r = Signal()                    # READ stage active
+        chan_x = Signal(range(C))            # MIX stage
+        proc_x = Signal()
+        chan_g = Signal(range(C))            # INTEG stage
+        proc_g = Signal()
+        chan_c = Signal(range(C))            # COMB stage
+        proc_c = Signal()
+
+        m.d.sync += [chan_x.eq(chan_r), proc_x.eq(proc_r),
+                     chan_g.eq(chan_x), proc_g.eq(proc_x),
+                     chan_c.eq(chan_g), proc_c.eq(proc_g)]
+        m.d.comb += self.busy.eq(proc_r | proc_x | proc_g | proc_c)
+        m.d.sync += self.out_valid.eq(0)
+
+        with m.If(~self.busy & self.in_valid):
+            m.d.sync += [xi.eq(self.re_in), xq.eq(self.im_in),
+                         chan_r.eq(0), proc_r.eq(1)]
+        with m.Elif(proc_r):
+            with m.If(chan_r == C - 1):
+                m.d.sync += proc_r.eq(0)
+            with m.Else():
+                m.d.sync += chan_r.eq(chan_r + 1)
+
+        for rp in [phase_rp, freq_rp, dec_rp, *ii_rp, *iq_rp, *ci_rp, *cq_rp]:
+            m.d.comb += [rp.addr.eq(chan_r), rp.en.eq(1)]
+
+        # ===== MIX stage: read data is valid for chan_x =====
+        quarter = 1 << (self.lut_addr_bits - 2)
+        sin_addr = Signal(self.lut_addr_bits)
+        cos_addr = Signal(self.lut_addr_bits)
+        m.d.comb += [sin_addr.eq(phase_rp.data[self.nco_width - self.lut_addr_bits:]),
+                     cos_addr.eq(sin_addr + quarter)]
+        sin_v = Signal(signed(self.lut_width))
+        cos_v = Signal(signed(self.lut_width))
+        m.d.comb += [sin_v.eq(rom[sin_addr]), cos_v.eq(rom[cos_addr])]
+
+        prod_i = Signal(signed(self.in_width + self.lut_width + 1))
+        prod_q = Signal(signed(self.in_width + self.lut_width + 1))
+        m.d.comb += [prod_i.eq(xi * cos_v + xq * sin_v),
+                     prod_q.eq(xq * cos_v - xi * sin_v)]
+
+        # registered MIX outputs + integrator state carried to INTEG
+        mix_i = Signal(signed(self.mix_width))
+        mix_q = Signal(signed(self.mix_width))
+        ii_x = [Signal(signed(aw), name=f"ii_x{st}") for st in range(S)]
+        iq_x = [Signal(signed(aw), name=f"iq_x{st}") for st in range(S)]
+        # comb state must reach COMB (two more cycles): register twice
+        ci_x = [Signal(signed(aw), name=f"ci_x{st}") for st in range(S)]
+        cq_x = [Signal(signed(aw), name=f"cq_x{st}") for st in range(S)]
+        dec_stb_x = Signal()
+        m.d.comb += dec_stb_x.eq(proc_x & (dec_rp.data == self.decimation - 1))
+
+        m.d.sync += [mix_i.eq(prod_i >> self.mix_shift),
+                     mix_q.eq(prod_q >> self.mix_shift)]
+        for st in range(S):
+            m.d.sync += [ii_x[st].eq(ii_rp[st].data), iq_x[st].eq(iq_rp[st].data),
+                         ci_x[st].eq(ci_rp[st].data), cq_x[st].eq(cq_rp[st].data)]
+
+        # MIX write-backs: NCO phase advance + decimation counter
+        m.d.comb += [
+            phase_wp.addr.eq(chan_x),
+            phase_wp.data.eq(phase_rp.data + freq_rp.data),
+            phase_wp.en.eq(proc_x),
+            dec_wp.addr.eq(chan_x),
+            dec_wp.data.eq(dec_rp.data + 1),
+            dec_wp.en.eq(proc_x),
+        ]
+        with m.If(dec_stb_x):
+            m.d.comb += dec_wp.data.eq(0)
+
+        # ===== INTEG stage: 3-stage integrator cascade for chan_g =====
+        new_ii, new_iq = [], []
+        chain_i, chain_q = mix_i, mix_q
+        for st in range(S):
+            ni = Signal(signed(aw), name=f"new_ii{st}")
+            nq = Signal(signed(aw), name=f"new_iq{st}")
+            m.d.comb += [ni.eq(ii_x[st] + chain_i), nq.eq(iq_x[st] + chain_q)]
+            new_ii.append(ni)
+            new_iq.append(nq)
+            chain_i, chain_q = ni, nq
+
+        for st in range(S):
+            m.d.comb += [
+                ii_wp[st].addr.eq(chan_g), ii_wp[st].data.eq(new_ii[st]),
+                ii_wp[st].en.eq(proc_g),
+                iq_wp[st].addr.eq(chan_g), iq_wp[st].data.eq(new_iq[st]),
+                iq_wp[st].en.eq(proc_g),
+            ]
+
+        # registered INTEG outputs + comb state carried to COMB
+        cin_in_i = Signal(signed(aw))        # newest integrator output -> comb input
+        cin_in_q = Signal(signed(aw))
+        ci_g = [Signal(signed(aw), name=f"ci_g{st}") for st in range(S)]
+        cq_g = [Signal(signed(aw), name=f"cq_g{st}") for st in range(S)]
+        dec_stb_g = Signal()                 # strobe aligned to INTEG stage
+        m.d.sync += [cin_in_i.eq(chain_i), cin_in_q.eq(chain_q),
+                     dec_stb_g.eq(dec_stb_x)]
+        for st in range(S):
+            m.d.sync += [ci_g[st].eq(ci_x[st]), cq_g[st].eq(cq_x[st])]
+
+        # ===== COMB stage: 3-stage comb cascade for chan_c =====
+        comb_out_i, comb_out_q = cin_in_i, cin_in_q
+        cin_i, cin_q = [], []
+        for st in range(S):
+            di = Signal(signed(aw), name=f"comb_di{st}")
+            dq = Signal(signed(aw), name=f"comb_dq{st}")
+            m.d.comb += [di.eq(comb_out_i - ci_g[st]), dq.eq(comb_out_q - cq_g[st])]
+            cin_i.append(comb_out_i)
+            cin_q.append(comb_out_q)
+            comb_out_i, comb_out_q = di, dq
+
+        # strobe aligned to COMB stage (one more register: dec_stb_x already folds
+        # in proc_x, which flows down the pipe, so dec_stb_c implies a valid channel)
+        dec_stb_c = Signal()
+        m.d.sync += dec_stb_c.eq(dec_stb_g)
+        for st in range(S):
+            m.d.comb += [
+                ci_wp[st].addr.eq(chan_c), ci_wp[st].data.eq(cin_i[st]),
+                ci_wp[st].en.eq(dec_stb_c),
+                cq_wp[st].addr.eq(chan_c), cq_wp[st].data.eq(cin_q[st]),
+                cq_wp[st].en.eq(dec_stb_c),
+            ]
+        with m.If(dec_stb_c):
+            m.d.sync += [self.out_valid.eq(1), self.out_chan.eq(chan_c),
+                         self.out_re.eq(comb_out_i), self.out_im.eq(comb_out_q)]
+
+        return m
+
+
 # ---------------------------------------------------------------------------
 # Verification
 # ---------------------------------------------------------------------------
@@ -321,6 +522,73 @@ def _run_lane(dut: TdmDdcLane, samples, freqs):
     sim.run()
     return {c: (np.array(i, np.int64), np.array(q, np.int64))
             for c, (i, q) in out.items()}
+
+
+def _run_lane_paced(dut: TdmDdcLane, samples, freqs, gap: int):
+    """Drive the lane feeding one input every ``gap`` cycles (>= the per-sample
+    channel sweep + pipeline drain), collecting every ``out_valid`` strobe. Works
+    for both the register lane and the pipelined BRAM lane."""
+    out = {c: ([], []) for c in range(dut.n_channels)}
+
+    async def bench(ctx):
+        ctx.set(dut.freq_wren, 1)
+        for c, f in enumerate(freqs):
+            ctx.set(dut.freq_waddr, c)
+            ctx.set(dut.freq_wdata, int(f))
+            await ctx.tick()
+        ctx.set(dut.freq_wren, 0)
+        await ctx.tick()
+
+        async def step():
+            if ctx.get(dut.out_valid):
+                cc = ctx.get(dut.out_chan)
+                out[cc][0].append(ctx.get(dut.out_re))
+                out[cc][1].append(ctx.get(dut.out_im))
+            await ctx.tick()
+
+        for (re, im) in samples:
+            ctx.set(dut.re_in, int(re))
+            ctx.set(dut.im_in, int(im))
+            ctx.set(dut.in_valid, 1)
+            await step()
+            ctx.set(dut.in_valid, 0)
+            for _ in range(gap - 1):
+                await step()
+        for _ in range(gap + 4):       # drain the pipeline tail
+            await step()
+
+    sim = Simulator(dut)
+    sim.add_clock(SYNC_PERIOD)
+    sim.add_testbench(bench)
+    sim.run()
+    return {c: (np.array(i, np.int64), np.array(q, np.int64))
+            for c, (i, q) in out.items()}
+
+
+def _verify_bram_bitexact():
+    """The BRAM-backed lane must be bit-exact vs the same reference model used for
+    the register lane (state moved FF->BRAM, datapath unchanged)."""
+    params = dict(n_channels=5, decimation=8, in_width=12, nco_width=24,
+                  lut_addr_bits=10, lut_width=12, stages=3)
+    dut = TdmDdcLaneBRAM(**params)
+    rng = np.random.default_rng(11)
+    n = 600
+    lim = 2 ** (dut.in_width - 1) - 1
+    samples = rng.integers(-lim, lim, size=(n, 2)).astype(np.int64)
+    fr = [int(round(f * 2 ** dut.nco_width))
+          for f in (0.05, -0.1, 0.2, 0.0, -0.17)]
+
+    hw = _run_lane_paced(dut, samples, fr, gap=dut.n_channels + 6)
+    ref = dut.model([tuple(s) for s in samples], fr)
+    nout = 0
+    for c in range(dut.n_channels):
+        for k in (0, 1):
+            g, e = hw[c][k], ref[c][k]
+            kk = min(len(g), len(e))
+            assert kk > 0, f"no output for channel {c}"
+            np.testing.assert_array_equal(g[:kk], e[:kk])
+            nout = max(nout, kk)
+    return dut.n_channels, dut.acc_w, nout
 
 
 def _verify_bitexact():
@@ -377,6 +645,11 @@ def main():
     print(f"[bit-exact] TDM lane HW == reference model: PASS  "
           f"({C} channels share one datapath, {nout} decimated samples/ch, "
           f"acc width {acc_w} b)")
+
+    Cb, accb, noutb = _verify_bram_bitexact()
+    print(f"[bit-exact] BRAM-backed lane HW == reference model: PASS  "
+          f"({Cb} ch, per-channel state in block RAM, 4-stage pipeline, "
+          f"{noutb} samples/ch)")
 
     tones, stats, hw = _demo_tuning()
     print("\n[tuning] each channel tunes its own tone to baseband (CIC selectivity):")

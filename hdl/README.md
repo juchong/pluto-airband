@@ -158,11 +158,13 @@ datapath (I ≈ DC, Q ≈ 0, ripple < 1%), rejecting the others. Plot at
 
 Resources (`synth_estimate.py`, Yosys xc7): the shared complex mixer is **4
 DSP48E1** independent of channel count (maia-hdl's `Cmult3x` would trim this to
-~1); even at 4 DSP/lane the budget holds (8 lanes × 4 = 32 < 62 free DSP). FF/LUT
-grow with channel count because the prototype holds per-channel CIC/NCO state in
-registers — in the real design that state maps to **BRAM** (which the feasibility
-model already budgets). The shared front-end decimator and per-lane cleanup FIR are
-built and verified separately in `channelizer_chain.py` (below).
+~1); even at 4 DSP/lane the budget holds (8 lanes × 4 = 32 < 62 free DSP). The
+register-based `TdmDdcLane` holds per-channel CIC/NCO state in flip-flops; the file
+also provides **`TdmDdcLaneBRAM`** — same behaviour (bit-exact, same model) but the
+per-channel state lives in `amaranth.lib.memory.Memory` (block/distributed RAM) and
+the datapath is **pipelined READ→MIX→INTEG→COMB** so it closes 62.5 MHz. This is the
+lane used by the integrated `channelizer_core.py`. The shared front-end decimator and
+per-lane cleanup FIR are built and verified separately in `channelizer_chain.py`.
 
 ## `channelizer_chain.py`
 
@@ -192,7 +194,9 @@ are cheap on the device):
   FIR. Optional in the baseline (the AD936x can deliver the working rate directly).
 - `TdmFirEngine` — the **folded** cleanup FIR: one multiply-accumulate iterated over
   taps serves all channels (per-channel delay lines indexed by channel). **Bit-exact**
-  to the per-channel parallel FIR; Yosys = 2 DSP.
+  to the per-channel parallel FIR; Yosys = 2 DSP. `TdmFirEngineBRAM` is the same engine
+  with the per-channel delay lines as a **circular buffer in block RAM** (no FF shift
+  register) — bit-exact, and what keeps the integrated core's FF count low.
 
 ```bash
 python channelizer_chain.py
@@ -205,6 +209,38 @@ direct FIRs are fully parallel (1 mult/tap) — Yosys/Vivado show that upper bou
 **Vivado 2023.2 OOC cross-check** (build server, `xc7z010clg225-1`; see
 `../DEV-SETUP.md` for the recipe): the 21-channel `TdmDdcLane` synthesizes to **4
 DSP, 3374 LUT (19%), 7760 FF (22%), 0 BRAM**, closely matching the Yosys estimate and
-confirming the lane fit; per-channel state lands in FFs here (a Memory-backed lane
-moves it to BRAM). Remaining: integrate front end + lanes + folded cleanup FIR into
-one top with Memory-backed state and run a full Vivado place.
+confirming the lane fit; per-channel state lands in FFs here (the Memory-backed lane
+in `channelizer_core.py` moves it to BRAM).
+
+## `channelizer_core.py`
+
+Integrated channelizer (handoff §7 step 8): **`ChannelizerCore`** wires the verified
+blocks into one top — `TdmDdcLaneBRAM` → burst-absorbing `SyncFIFO` → folded complex
+cleanup FIR (`TdmFirEngineBRAM` ×2, I and Q in lockstep). All channels share one
+decimation cadence, so each CIC boundary emits a burst of N outputs; the FIFO buffers
+it and the cleanup FIR drains at the low channel rate.
+
+```bash
+python channelizer_core.py        # bit-exact + end-to-end selectivity
+python emit_core_verilog.py       # -> out/channelizer_core.v (for Vivado)
+```
+
+Verified **bit-exact**: HW == (lane model → per-channel cleanup-FIR model); the
+end-to-end demo tunes each channel to a clean baseband (<0.1 % ripple) and rejects
+neighbours.
+
+**Vivado 2023.2 synth + place + route** (`ooc_place.tcl`, `xc7z010clg225-1`, 62.5 MHz)
+of one deployment lane (5 ch, dec-64 CIC, complex 119-tap cleanup):
+
+| Resource | Used | % | 
+|---|---|---|
+| Slice LUTs | 1309 | 7.4 % |
+| Slice Registers | 1577 | 4.5 % |
+| Block RAM Tile | 3 | 5.0 % |
+| DSP48E1 | 8 | 10 % |
+
+**Timing MET: WNS +3.07 ns, 0 failing endpoints**, route clean. (Pre-BRAM/pre-pipeline
+this overflowed FFs at 38 980 and missed timing at −3.28 ns; BRAM-backed state +
+the 4-stage lane pipeline fixed both.) ~5 lanes cover the 21 core channels with
+large margin. Remaining: replicate lanes + wire the shared front end, then a
+top-level place alongside the Maia base platform.

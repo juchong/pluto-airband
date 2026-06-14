@@ -195,8 +195,24 @@ run Vivado **directly on the host** (no Docker) against Amaranth-generated Veril
 
   Launch detached (`setsid ... </dev/null &`) so the run survives the SSH session.
 
-**Confirmed (2026-06-14):** 21-ch `TdmDdcLane` = 4 DSP48E1, 3374 LUT, 7760 FF, 0
-BRAM (matches Yosys); parallel `MultiStageDecimator` = 58 DSP / 212 LUT / 1055 FF.
+  For a full **synth + place + route + timing** run (the integrated core), use
+  `ooc_place.tcl` instead, which also creates a clock and reports timing:
+
+  ```bash
+  vivado -mode batch -nojournal -source ooc_place.tcl \
+         -tclargs channelizer_core.v channelizer_core 16.0   # 16 ns = 62.5 MHz
+  # reports -> channelizer_core_routed_util.rpt, channelizer_core_timing.rpt
+  ```
+
+  Generate the Verilog on the Mac first with `python hdl/emit_core_verilog.py` and
+  `scp out/channelizer_core.v` to `/mnt/vivado-share/ooc/`.
+
+**Confirmed (2026-06-14):**
+- 21-ch `TdmDdcLane` (synth OOC) = 4 DSP48E1, 3374 LUT, 7760 FF, 0 BRAM (matches
+  Yosys); parallel `MultiStageDecimator` = 58 DSP / 212 LUT / 1055 FF.
+- Integrated **`ChannelizerCore`** (5 ch, BRAM-backed lane + folded complex 119-tap
+  cleanup), **place + route, 62.5 MHz**: 1309 LUT (7.4%), 1577 FF (4.5%), 3 BRAM
+  tiles, 8 DSP48E1 — **timing MET, WNS +3.07 ns, 0 failing endpoints**.
 
 ## libiio (host tools to talk to the Pluto)
 

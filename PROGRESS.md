@@ -13,7 +13,7 @@ Authoritative spec: `pluto-airband-fpga.md`. Environment details: `DEV-SETUP.md`
 | 4. Channelizer feasibility (GATE) | **GO** (confirmed vs measured base; 22 ch = 21 core + 1 deferred, fit) |
 | 5. AM demod block | **done** (envelope mag + DC-block + audio decimate, chain verified) |
 | 6. Single-channel end-to-end | blocked on hardware (needs a Pluto) |
-| 7. Multi-channel | **in progress** (one time-mux channelizer lane prototyped + verified) |
+| 7. Multi-channel | **in progress** (integrated channelizer core placed+routed, meets 62.5 MHz; lane replication + top-level integration remain) |
 | 8. Pi streamer | not started |
 | 9. Hardening | not started |
 
@@ -199,6 +199,39 @@ the doc's older numbers, because current `maia-sdr` `main` requires them:
   - `MultiStageDecimator` (parallel build): 58 DSP / 212 LUT / 1055 FF — the
     parallel structural cost (1 mult/nonzero-tap); the folded MAC version is ~14 DSP.
 
+### Integrated channelizer core + Vivado place (§7 step 8)
+- `hdl/channelizer_core.py`: `ChannelizerCore` unifies the verified blocks into one
+  top — **BRAM-backed TDM DDC lane → burst-absorbing FIFO → folded complex cleanup
+  FIR** (I+Q `TdmFirEngineBRAM` in lockstep). All channels share one decimation
+  cadence, so each CIC boundary emits a burst of N outputs; the `SyncFIFO` buffers it
+  and the cleanup FIR drains at its own (low) rate. **Bit-exact**: HW == lane model →
+  per-channel FIR model. End-to-end demo: each tuned tone → clean baseband (<0.1 %
+  ripple), neighbours rejected.
+- **Memory-backed per-channel state** (the §7-step-8 goal):
+  - `TdmDdcLaneBRAM` (`channelizer_lane.py`): per-channel NCO/CIC state moved from a
+    fan-out register file into `amaranth.lib.memory.Memory`, and the datapath
+    **pipelined READ→MIX→INTEG→COMB** (one channel/clock) so it closes 62.5 MHz.
+  - `TdmFirEngineBRAM` (`channelizer_chain.py`): cleanup-FIR delay lines as a
+    per-channel **circular buffer in block RAM** (no FF shift register). Both are
+    bit-exact to their register-based parents.
+- **Vivado 2023.2 synth + place + route** of `ChannelizerCore` (one deployment lane:
+  5 ch, dec-64 CIC, complex 119-tap cleanup), `xc7z010clg225-1`, 62.5 MHz (16 ns):
+
+  | Resource | Used | % of XC7Z010 | vs free (Z7010−base) |
+  |---|---|---|---|
+  | Slice LUTs | 1309 | 7.4 % | 11 % of 12184 free |
+  | Slice Registers (FF) | 1577 | 4.5 % | 5.5 % of 28707 free |
+  | Block RAM Tile | 3 | 5.0 % | ~10 % of 31 free |
+  | DSP48E1 | 8 | 10 % | 13 % of 62 free |
+
+  **Timing MET: WNS +3.07 ns, 0 failing endpoints** at 62.5 MHz (route done, 0
+  errors). The first place attempt (single-cycle compute) failed FF over-utilization
+  (38 980 FF — FIR delay lines mapped to fabric) and timing (WNS −3.28 ns, the 6-deep
+  CIC adder cascade); moving the delay lines to BRAM dropped FF to ~0.9 k and
+  pipelining the lane closed timing (+3.07 ns) for +650 FF. ~5 such lanes cover the
+  21 core channels and still leave large margin. Flow + reports: `hdl/ooc_place.tcl`,
+  `DEV-SETUP.md`.
+
 ### Channelizer feasibility GATE (§4.2) — GO for N=22
 - `hdl/synth_estimate.py`: emits Verilog for the real maia-hdl `DDC` and our AM
   back-end, runs Yosys `synth_xilinx -family xc7`. **Measured:** full DDC = 11
@@ -221,12 +254,14 @@ the doc's older numbers, because current `maia-sdr` `main` requires them:
 - §8.2 capture window **resolved** (final list): center 123.438 MHz, Fs ≈ 14 MHz,
   ~5 lanes for the 21 core channels (`hdl/capture_window.py`); 133.65 MHz deferred.
 - §7 step 7 building blocks **complete + verified** (lane, front end, multistage
-  front end, folded cleanup FIR), with the 21-ch lane **Vivado-confirmed** (4 DSP /
-  3374 LUT / 7760 FF / 0 BRAM, xc7z010clg225-1). Remaining for a full channelizer:
-  integrate front end + lanes + folded cleanup FIR into one top with **Memory-backed**
-  per-channel state (so it maps to BRAM, not FFs), and run Vivado place to confirm the
-  combined fit + timing.
-- Define §4.3 per-channel DMA framing (channel index + sample counter) once the
-  multi-channel datapath shape is fixed.
+  front end, folded cleanup FIR), 21-ch lane **Vivado-confirmed**.
+- §7 step 8 integration **done**: `ChannelizerCore` (BRAM lane + folded complex
+  cleanup FIR) is bit-exact, **placed + routed**, fits with large margin, and **meets
+  62.5 MHz** (WNS +3.07 ns) — see the integrated-core section above. Remaining for the
+  full receiver: instantiate ~5 lanes for the 21 channels + wire the shared front end
+  (or take the AD936x working rate directly), then a top-level place with the Maia
+  base platform.
+- Define §4.3 per-channel DMA framing (channel index + sample counter) — now unblocked
+  (the multi-channel datapath shape is fixed by `ChannelizerCore`).
 - (Blocked on hardware) §7 step 3/6: flash baseline Maia (`build/pluto.dfu`) and
   bring up one real channel end-to-end on a Pluto.

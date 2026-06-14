@@ -31,7 +31,8 @@ import pathlib
 
 import numpy as np
 import scipy.signal
-from amaranth import Array, Cat, Const, Elaboratable, Module, Signal, signed
+from amaranth import Array, Cat, Const, Elaboratable, Module, Mux, Signal, signed
+from amaranth.lib.memory import Memory
 from amaranth.sim import Simulator
 
 from am_audio import CICDecimator
@@ -273,6 +274,80 @@ class TdmFirEngine(Elaboratable):
                     m.d.sync += mem[base].eq(xreg)
                     m.d.sync += acc.eq(acc + crom[0] * xreg)
                     m.next = "EMIT"
+            with m.State("EMIT"):
+                m.d.sync += [self.out.eq(acc >> self.out_shift),
+                             self.out_chan.eq(chan), self.out_valid.eq(1),
+                             self.busy.eq(0)]
+                m.next = "IDLE"
+        return m
+
+
+class TdmFirEngineBRAM(TdmFirEngine):
+    """BRAM-backed folded FIR: identical behaviour/interface to :class:`TdmFirEngine`
+    (same ``model``), but the per-channel delay lines live in block RAM instead of a
+    flat :class:`Array` of registers.
+
+    The parent keeps ``n_channels * ntaps`` words as fabric flip-flops and shifts the
+    whole line each sample -- fine for a tiny FIR, but the 119-tap cleanup over a few
+    channels alone overflows the Z-7010's 35 k FFs (Vivado will not infer RAM from the
+    shift pattern). This version stores each channel's history as a **circular buffer**
+    in a single ``Memory`` (one R + one W port -> simple-dual-port BRAM) with a
+    per-channel write pointer, so no data is shifted: each sample does one write plus
+    ``ntaps`` reads. Bit-exact to the register version (verified against the shared
+    ``model``).
+    """
+
+    def elaborate(self, platform):
+        m = Module()
+        nt, n = self.ntaps, self.n
+        mem = Memory(shape=signed(self.iw), depth=n * nt, init=[0] * (n * nt))
+        m.submodules.mem = mem
+        rp = mem.read_port()
+        wp = mem.write_port()
+        crom = Array(Const(c, signed(self.cw)) for c in self.coeffs)
+        wptr = Array(Signal(range(nt), name=f"wptr{c}") for c in range(n))
+
+        chan = Signal.like(self.in_chan)
+        xreg = Signal(signed(self.iw))
+        p = Signal(range(nt))                 # write position for this channel
+        base = Signal(range(max(2, n * nt)))
+        acc = Signal(signed(self.acc_w))
+        ii = Signal(range(nt + 1))            # tap currently being read-issued
+        ad = Signal(range(nt + 1))            # tap currently being accumulated
+        ad_v = Signal()                       # an accumulate is valid this cycle
+
+        m.d.comb += base.eq(chan * nt)
+        # read address for tap ``ii``: history position (p - ii) mod nt
+        pos = Signal(range(nt))
+        with m.If(p >= ii):
+            m.d.comb += pos.eq(p - ii)
+        with m.Else():
+            m.d.comb += pos.eq(p + nt - ii)
+        m.d.comb += [rp.addr.eq(base + pos), rp.en.eq(1)]
+
+        with m.FSM():
+            with m.State("IDLE"):
+                m.d.sync += self.out_valid.eq(0)
+                with m.If(self.in_valid & ~self.busy):
+                    m.d.sync += [chan.eq(self.in_chan), xreg.eq(self.x_in),
+                                 p.eq(wptr[self.in_chan]), acc.eq(0),
+                                 self.busy.eq(1), ii.eq(nt - 1), ad_v.eq(0)]
+                    m.next = "RUN"
+            with m.State("RUN"):
+                # accumulate the tap whose read was issued last cycle
+                with m.If(ad_v):
+                    m.d.sync += acc.eq(acc + crom[ad] * rp.data)
+                with m.If(ii >= 1):
+                    m.d.sync += [ad.eq(ii), ad_v.eq(1), ii.eq(ii - 1)]
+                with m.Else():
+                    m.d.sync += ad_v.eq(0)
+                    m.next = "FINISH"
+            with m.State("FINISH"):
+                # tap 0 is the freshest sample (still in xreg, not yet in RAM)
+                m.d.sync += acc.eq(acc + crom[0] * xreg)
+                m.d.comb += [wp.addr.eq(base + p), wp.data.eq(xreg), wp.en.eq(1)]
+                m.d.sync += wptr[chan].eq(Mux(p == nt - 1, 0, p + 1))
+                m.next = "EMIT"
             with m.State("EMIT"):
                 m.d.sync += [self.out.eq(acc >> self.out_shift),
                              self.out_chan.eq(chan), self.out_valid.eq(1),
@@ -616,18 +691,7 @@ def _multistage_front_end():
     return exact, pass_db, stop_db, stages, folded
 
 
-def _verify_tdm_fir():
-    """Folded TDM FIR engine == per-channel parallel FIR (bit-exact)."""
-    coeffs, out_shift = design_lowpass(9, 0.3, coeff_width=12)
-    n_ch = 4
-    eng = TdmFirEngine(coeffs, n_ch, in_width=12, out_shift=out_shift)
-    rng = np.random.default_rng(3)
-    n = 120
-    chans = rng.integers(0, n_ch, size=n)
-    lim = 2 ** 11 - 1
-    xs = rng.integers(-lim, lim, size=n).astype(np.int64)
-    samples = list(zip(chans.tolist(), xs.tolist()))
-
+def _run_tdm_fir(eng, samples, coeffs, out_shift):
     got = []
 
     async def bench(ctx):
@@ -637,7 +701,6 @@ def _verify_tdm_fir():
             ctx.set(eng.in_valid, 1)
             await ctx.tick()
             ctx.set(eng.in_valid, 0)
-            # wait for this sample's output
             while True:
                 await ctx.tick()
                 if ctx.get(eng.out_valid):
@@ -648,10 +711,26 @@ def _verify_tdm_fir():
     sim.add_clock(SYNC_PERIOD)
     sim.add_testbench(bench)
     sim.run()
+    exp = TdmFirEngine.model(samples, coeffs, eng.n, out_shift)
+    return all(g[0] == e[0] and g[1] == e[1] for g, e in zip(got, exp)), len(got)
 
-    exp = TdmFirEngine.model(samples, coeffs, n_ch, out_shift)
-    ok = all(g[0] == e[0] and g[1] == e[1] for g, e in zip(got, exp))
-    return ok, len(got), eng.ntaps, n_ch
+
+def _verify_tdm_fir():
+    """Folded TDM FIR engines (register + BRAM) == per-channel parallel FIR."""
+    coeffs, out_shift = design_lowpass(9, 0.3, coeff_width=12)
+    n_ch = 4
+    rng = np.random.default_rng(3)
+    n = 120
+    chans = rng.integers(0, n_ch, size=n)
+    lim = 2 ** 11 - 1
+    xs = rng.integers(-lim, lim, size=n).astype(np.int64)
+    samples = list(zip(chans.tolist(), xs.tolist()))
+
+    eng = TdmFirEngine(coeffs, n_ch, in_width=12, out_shift=out_shift)
+    ok_ff, n_out = _run_tdm_fir(eng, samples, coeffs, out_shift)
+    eng_b = TdmFirEngineBRAM(coeffs, n_ch, in_width=12, out_shift=out_shift)
+    ok_bram, _ = _run_tdm_fir(eng_b, samples, coeffs, out_shift)
+    return ok_ff and ok_bram, n_out, eng.ntaps, n_ch
 
 
 def main():
@@ -706,9 +785,10 @@ def main():
     print(f"\n[TdmFirEngine] folded cleanup FIR ({ntaps} taps, {n_ch} channels, "
           f"one MAC):")
     print(f"  HW == per-channel parallel FIR: {'PASS' if ok else 'FAIL'} "
-          f"({n_out} interleaved outputs)")
+          f"({n_out} interleaved outputs; register + BRAM delay-line variants)")
     assert ok, "folded TDM FIR not bit-exact to per-channel reference"
-    print("  => one multiply-accumulate, iterated over taps, serves all channels.")
+    print("  => one multiply-accumulate, iterated over taps, serves all channels; "
+          "BRAM variant keeps per-channel delay lines in block RAM.")
 
     print("\nPASS: shared front-end decimator + per-channel CIC droop compensation "
           "verified (bit-exact FIR; flat window; flat channel passband + rejection); "
