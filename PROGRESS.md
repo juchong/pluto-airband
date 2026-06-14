@@ -278,20 +278,52 @@ the doc's older numbers, because current `maia-sdr` `main` requires them:
   config is overflow-free + bit-exact; an over-budget config correctly overflows
   (detector now covers the lane→FIR FIFO, collector FIFOs, and framer FIFO).
 
+### maia-hdl splice — DONE (HDL level, elaborates + SVD + ports verified)
+Work is on the `pluto-airband` branch of the **fork** (`maia-sdr` origin →
+`github.com/juchong/maia-sdr`, upstream renamed `upstream`). Edits are a thin,
+documented integration shim:
+- **Vendored DSP**: `hdl/*.py` copied verbatim into `maia-hdl/maia_hdl/airband/`
+  (9 modules); `maia_sdr.py` adds that dir to `sys.path` and imports
+  `ReceiverTop` by flat name, so the verified sources drop in unchanged. (The
+  Verilog-gen step therefore needs **numpy + scipy** in the build env — see
+  build step.)
+- **`MaiaSDR.__init__`**: instantiates `ReceiverTop` at the deployment config
+  (21 ch, chans_per_lane=4, lane_decim=128, 63-tap cleanup FIR → 6 lanes,
+  audio_decim=7, 24-bit samples). The cleanup-FIR coeffs are **precomputed**
+  (`design_cic_compensation(128,3,63,0.22,0.46)`, out_shift=17) and embedded as
+  a constant so the build needs no scipy at construction time. Also instantiates
+  `m_axi_airband` `DmaStreamWrite(width=64)` and a new `airband` register bank.
+- **`airband` register bank** (sync domain, own `RegisterCDC`, mapped at byte
+  `0x40`; `axi4_awidth` 4→5, decode on `address[4]` — fully backward-compatible,
+  existing control/recorder/sdr offsets and decode unchanged):
+  `airband_control` {dma_start[Wpulse], dma_stop[Wpulse], enable[RW],
+  overflow[R sticky]}, `airband_freq_addr` {freq_waddr}, `airband_freq`
+  {freq_wren[Wpulse], freq_wdata[24]}, `airband_dma_next_address` {next_address}.
+- **`elaborate`**: wires post-CDC RX IQ (`rxiq_cdc.re_out/im_out`, gated by
+  `enable` on `strobe_out`) into the receiver; routes NCO writes; streams framed
+  audio into the airband DMA; latches a sticky overflow; exposes `next_address`.
+- **`system_bd.tcl`**: `m_axi_airband` → **HP0** (free; HP1=spectrometer,
+  HP2=recorder), HP0 ACLK = `clk_out1` (sync, 62.5 MHz), with a full-DDR address
+  segment. `config.py` adds `airband_address_range = (0x1f00_0000, 0x2000_0000)`
+  (top-of-DDR ring; **must be reconciled with the reserved-memory devicetree +
+  maia-kmod before hardware use**).
+- **Verified**: `python -m maia_hdl.maia_sdr --config default` elaborates clean
+  (96.9k-line Verilog), `m_axi_airband_*` AXI3 ports emitted, SVD exposes the 4
+  airband registers, `test/test_register.py` passes. `ReceiverTop` itself stays
+  bit-exact (verified separately).
+
 ## Next steps
 - §8.2 capture window **resolved**: center 123.438 MHz, Fs ≈ 14 MHz, **6 lanes**
   (chans_per_lane=4) for the 21 core channels (`hdl/capture_window.py`,
   `hdl/realtime_budget.py`); 133.65 MHz deferred.
-- §7 steps 5/7/8 datapath **complete + verified**: lane, front end, folded cleanup
-  FIR, integrated `ChannelizerCore` (placed+routed, 62.5 MHz met), folded TDM AM
-  back-end, audio framer, and the assembled `ReceiverTop` are all bit-exact.
-- **Next (needs a decision): splice `ReceiverTop` into the Maia base platform.**
-  This is the first step that edits the pinned `maia-hdl` clone — instantiate the
-  receiver in `MaiaSDR`, add per-channel NCO control registers (SVD → maia-pac →
-  maia-httpd), and add an AXI3-HP DMA port in `system_bd.tcl` for the framed audio.
-  Reconcile with §7 "don't fork Maia / engage upstream early": keep all DSP in
-  `hdl/` (done) and confine maia-hdl edits to a thin, documented integration shim.
-- Then: full-design bitstream on the build server (whole-design timing + resources),
-  firmware image + flash, and a PS-side libiio reader for the framed audio (§5.4).
+- **Build full-design bitstream on the server** (`projects/pluto`, `default`
+  config): generate `maia_sdr.v` (build env needs numpy + scipy now), package IP,
+  run `system_bd.tcl`, place+route → whole-design **timing (62.5 MHz) + resource**
+  numbers for the Z-7010. Watch DSP48 (6 lanes × mixer/FIR) and BRAM headroom.
+- **maia-pac**: regenerate from the new SVD so userspace gets the `airband`
+  register accessors; then a PS-side reader for the framed 64-bit audio ring.
+- Firmware image + flash; bring one real channel up end-to-end on a Pluto.
+- (Blocked on hardware) §7 step 3/6: flash baseline Maia (`build/pluto.dfu`) and
+  bring up one real channel end-to-end on a Pluto.
 - (Blocked on hardware) §7 step 3/6: flash baseline Maia (`build/pluto.dfu`) and
   bring up one real channel end-to-end on a Pluto.
