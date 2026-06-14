@@ -53,8 +53,17 @@ BACKEND = {"LUT": 295, "FF": 281, "DSP48E1": 0, "BRAM36": 0}
 #   4 DSP48E1 for a straightforward complex mixer; maia-hdl's Cmult3x trims that to
 #   1 via a 3x clock. Either way the DSP budget holds (8 lanes * 4 = 32 < 62 free).
 MIXER_DSP = 1          # Cmult3x: 1 DSP48E1, reused via the 3x clock
-FIR_CLEANUP_DSP = 2    # one FIR2DSP compensation/cleanup filter per lane
+FIR_CLEANUP_DSP = 2    # one folded MAC engine for the per-lane CIC droop-comp +
+# selectivity FIR. Prototyped/verified in channelizer_chain.py: at the channel
+# rate (~50 kHz) a 119-tap complex FIR folds to ~0.2 DSP/channel, so one engine
+# per lane (FIR_CLEANUP_DSP=2 with headroom) covers the lane's channels.
 # (bulk decimation done by multiplier-free CIC: 0 DSP)
+
+# Shared front-end decimator (ONE per receiver, amortized over all channels).
+# channelizer_chain.py shows a single long FIR is ~43 DSP (too costly); a
+# multistage HBF/CIC+FIR complex decimator does the same job for a handful of
+# DSP. Budgeted conservatively as a one-time cost.
+FRONTEND = {"DSP48E1": 12, "LUT": 1500, "FF": 1500, "BRAM36": 2}
 
 N = 22                 # final channel count (21 core + 1 deferred outlier)
 F_S = 62.5e6           # PL "sync" clock (handoff §4.2)
@@ -78,12 +87,14 @@ def lanes_needed(window_hz: float) -> int:
 
 def channelizer_cost(window_hz: float) -> dict:
     lanes = lanes_needed(window_hz)
-    dsp = lanes * (MIXER_DSP + FIR_CLEANUP_DSP)
+    # per-lane datapath (mixer + cleanup FIR) + one shared front-end decimator.
+    dsp = lanes * (MIXER_DSP + FIR_CLEANUP_DSP) + FRONTEND["DSP48E1"]
     # AM back-end runs at audio rate (N*16k << F_S): one shared back-end lane.
     backend_lanes = max(1, math.ceil(N * AUDIO_HZ / F_S))
-    lut = lanes * LANE_LUT + backend_lanes * BACKEND["LUT"] + 2500   # +control
-    ff = lanes * LANE_FF + backend_lanes * BACKEND["FF"] + 2500
-    bram = lanes * 2 + 4        # coeff + per-channel sample state (rough)
+    lut = (lanes * LANE_LUT + backend_lanes * BACKEND["LUT"]
+           + FRONTEND["LUT"] + 2500)                                # +control
+    ff = lanes * LANE_FF + backend_lanes * BACKEND["FF"] + FRONTEND["FF"] + 2500
+    bram = lanes * 2 + 4 + FRONTEND["BRAM36"]   # coeff + per-channel state (rough)
     return {"window_MHz": window_hz / 1e6, "lanes": lanes,
             "DSP48E1": dsp, "LUT": lut, "FF": ff, "BRAM36": bram,
             "backend_lanes": backend_lanes}
@@ -125,7 +136,8 @@ def main():
           f"(BRAM is the binding resource)")
 
     print("\n[B] Time-multiplexed shared channelizer, by capture window (§8.2):")
-    print("    (shared CIC front-end decimates the window; lanes = ceil(N*W/Fs);")
+    print("    (shared flat front-end decimator + per-lane datapath; "
+          "lanes = ceil(N*W/Fs);")
     print("     AM back-end is DSP-free and time-shared at audio rate)")
     print("    checked against the FREE budget = Z7010 - measured Maia base")
     print(f"\n    {'window':>8} {'lanes':>6} {'DSP48E1':>16} "
@@ -154,9 +166,14 @@ def main():
           f"(even the full ~19 MHz airband fits, the tightest case).")
     print("Resolved (§8.2, see capture_window.py): center 123.438 MHz, Fs ~14 MHz "
           "-> ~5 lanes for the 21 core channels (133.65 MHz deferred).")
-    print("\nRemaining caveats:")
-    print("  * lane LUT/FF are Yosys-scale estimates; re-confirm the channelizer")
-    print("    itself in Vivado once a full lane (front-end + cleanup FIR) is built.")
+    print("\nStatus / caveats:")
+    print("  * front-end decimator + per-channel CIC droop-comp/selectivity FIR are")
+    print("    now prototyped and verified (channelizer_chain.py): flat capture")
+    print("    window, flat channel passband, >40 dB adjacent-channel rejection.")
+    print("  * the shared front-end must be a MULTISTAGE decimator (a single long FIR")
+    print("    is ~43 DSP); budgeted here at 12 DSP one-time. Build + measure next.")
+    print("  * lane LUT/FF are Yosys-scale estimates; re-confirm the full channelizer")
+    print("    in Vivado on the build server.")
 
 
 if __name__ == "__main__":

@@ -157,8 +157,28 @@ the doc's older numbers, because current `maia-sdr` `main` requires them:
   trims to ~1). Even at 4 DSP/lane the budget holds (8 lanes×4 = 32 < 62 free DSP).
   Per-channel CIC/NCO state shows up as FF/LUT in the prototype (register arrays);
   in the real design it maps to **BRAM** — matching the model's BRAM-for-state.
-- Not yet built: shared front-end decimator (window → intermediate rate) and the
-  per-lane cleanup/compensation FIR (CIC passband-droop correction).
+### Channelizer front-end + cleanup FIR (§7 step 7, prototyped + verified)
+- `hdl/channelizer_chain.py`: the two filtering stages the lane prototype deferred,
+  built on one generic integer block `FIRStage` (direct-form decimating FIR).
+  - `FIRStage` — **bit-exact** to its Python model at decimation 1 and 4.
+  - `FrontEndDecimator` — **shared** complex FIR low-pass decimator (one per
+    receiver). The AD936x is run oversampled and this one block decimates the whole
+    capture to the working rate with a *flat* passband (a CIC would droop the band
+    edges / outer channels). **Validated:** 0.01 dB ripple across the channel
+    region, 57 dB rejection beyond the window.
+  - `CompensationFIR` (a `FIRStage`) — per-channel FIR that inverts the per-channel
+    CIC passband droop *and* provides the sharp channel selectivity the CIC's gentle
+    roll-off cannot. **Validated:** CIC droop 2.17 dB → 0.39 dB flat, 88 dB
+    adjacent-channel rejection (plot `hdl/out/channelizer_chain.png`).
+  - **End-to-end HW** (front-end → NCO mix → per-channel CIC → comp FIR): an
+    on-channel tone passes; one channel-spacing away is rejected by **48 dB**.
+- **Resources** (`hdl/synth_estimate.py`): the prototype FIRs are fully unrolled
+  (1 mult/tap) so Yosys shows the upper bound (front-end 190 DSP, comp 71 DSP). The
+  real blocks **fold** taps onto a MAC engine: the single long front-end FIR is
+  ~43 DSP at 14 MHz → must be a **multistage** HBF/CIC+FIR decimator (a handful of
+  DSP, shared once); the channel selectivity FIR at ~50 kHz is ~0.2 DSP/channel →
+  ~4 DSP covers all 21 on one engine. Folded into `feasibility_25ch.py` (front-end
+  12 DSP one-time + per-lane cleanup FIR); still GO.
 
 ### Channelizer feasibility GATE (§4.2) — GO for N=22
 - `hdl/synth_estimate.py`: emits Verilog for the real maia-hdl `DDC` and our AM
@@ -168,7 +188,7 @@ the doc's older numbers, because current `maia-sdr` `main` requires them:
 - `hdl/feasibility_25ch.py`: time-multiplexing resource model vs the XC7Z010
   budget (17.6k LUT / 35.2k FF / 80 DSP48E1 / 60 BRAM36).
   - Naive 22× parallel DDCs = 242 DSP / ~88 BRAM → INFEASIBLE.
-  - Time-multiplexed shared channelizer (shared CIC front-end + lanes =
+  - Time-multiplexed shared channelizer (shared flat front-end decimator + lanes =
     ceil(N*W/62.5MHz), DSP-free back-end shared at audio rate): **fits at every
     window**.
 - **Base-platform usage now measured** (build server step 1) and folded in: the
@@ -181,9 +201,12 @@ the doc's older numbers, because current `maia-sdr` `main` requires them:
 ## Next steps
 - §8.2 capture window **resolved** (final list): center 123.438 MHz, Fs ≈ 14 MHz,
   ~5 lanes for the 21 core channels (`hdl/capture_window.py`); 133.65 MHz deferred.
-- Extend the channelizer lane: add the shared front-end decimator and a per-lane
-  cleanup/compensation FIR; then re-measure the lane in Vivado on the build server
-  (real LUT/FF/DSP/BRAM, with per-channel state in BRAM).
+- Front-end decimator + per-channel cleanup/compensation FIR **prototyped + verified**
+  (`hdl/channelizer_chain.py`). Remaining: realize the shared front-end as a
+  **multistage** (HBF/CIC+FIR) decimator (the single long FIR is ~43 DSP), fold the
+  selectivity FIR onto a per-lane MAC engine, then re-measure the full channelizer
+  (front-end + lane + cleanup FIR) in **Vivado** on the build server with per-channel
+  state in BRAM.
 - Define §4.3 per-channel DMA framing (channel index + sample counter) once the
   multi-channel datapath shape is fixed.
 - (Blocked on hardware) §7 step 3/6: flash baseline Maia (`build/pluto.dfu`) and

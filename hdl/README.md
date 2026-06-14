@@ -81,7 +81,8 @@ parameters; nothing here hard-codes the choice.
 ## `synth_estimate.py`
 
 Emits Verilog for maia-hdl's `DDC`, our `AMBackEnd` (`EnvelopeMagnitude` +
-`DCBlock` + `CICDecimator`), and the `TdmDdcLane` (at 8 and 21 channels) and runs
+`DCBlock` + `CICDecimator`), the `TdmDdcLane` (at 8 and 21 channels), and the
+channelizer-chain filters (`FrontEndDecimator`, `CompensationFIR`), then runs
 Yosys `synth_xilinx -family xc7` to get hard 7-series resource counts
 (LUT/FF/DSP48E1/BRAM). Requires `yosys` on PATH.
 
@@ -91,7 +92,11 @@ python synth_estimate.py
 
 Measured: a full DDC = **11 DSP48E1** (Cmult3x mixer 1 + 3-stage FIR 4+2+4=10),
 ~661 LUT, ~1239 FF, ~4 BRAM36. The AM back-end is **0 DSP48E1** (multiplier-free),
-~295 LUT, ~281 FF per channel. DSP/BRAM map 1:1 and are trustworthy; LUT/FF are
+~295 LUT, ~281 FF per channel. The channelizer-chain FIRs are printed both as the
+**unrolled** Yosys upper bound (1 mult/tap) and as the **folded** MAC-engine cost:
+the shared front-end as a single long FIR is ~43 DSP at 14 MHz (→ use a multistage
+decimator), while the channel selectivity FIR at ~50 kHz folds to ~0.2 DSP/channel
+(~4 DSP for all 21 on one engine). DSP/BRAM map 1:1 and are trustworthy; LUT/FF are
 Yosys estimates to be re-confirmed with Vivado.
 
 ## `feasibility_25ch.py`
@@ -156,9 +161,38 @@ DSP48E1** independent of channel count (maia-hdl's `Cmult3x` would trim this to
 ~1); even at 4 DSP/lane the budget holds (8 lanes × 4 = 32 < 62 free DSP). FF/LUT
 grow with channel count because the prototype holds per-channel CIC/NCO state in
 registers — in the real design that state maps to **BRAM** (which the feasibility
-model already budgets). Not yet included: the shared front-end decimator and the
-per-lane cleanup/compensation FIR (CIC droop correction) — the next increment.
+model already budgets). The shared front-end decimator and per-lane cleanup FIR are
+built and verified separately in `channelizer_chain.py` (below).
 
-Next: add the shared front-end decimator + per-lane cleanup FIR (the §8.2 capture
-window is resolved — center 123.438 MHz, Fs ≈ 14 MHz, ~5 lanes), then re-measure
-on the build server in Vivado.
+## `channelizer_chain.py`
+
+The two filtering stages the lane prototype deferred (handoff §4.2 / §7 step 7),
+built on one generic integer block, `FIRStage` (direct-form decimating FIR, verified
+**bit-exact** to its model at decimation 1 and 4):
+
+- `FrontEndDecimator` — a **shared** complex FIR low-pass decimator (one per
+  receiver, amortized over all channels). The AD936x is run oversampled and this one
+  block decimates the whole capture to the working rate (~the §8.2 window) with a
+  *flat* passband — a CIC here would droop the band edges and starve the outer
+  channels. **Verified:** 0.01 dB passband ripple across the channel region, 57 dB
+  rejection beyond the window.
+- `CompensationFIR` (a `FIRStage`) — a per-channel FIR that both inverts the CIC
+  passband droop *and* provides the sharp channel selectivity the CIC's gentle
+  roll-off cannot. **Verified:** CIC droop 2.17 dB → 0.39 dB flat with 88 dB
+  adjacent-channel rejection.
+- **End-to-end HW** (front-end → NCO mix → per-channel CIC → comp FIR): an
+  on-channel tone passes; a tone one channel-spacing away is rejected by 48 dB.
+
+```bash
+python channelizer_chain.py
+```
+
+Plot at `out/channelizer_chain.png` (git-ignored). Realization note: the prototype
+FIRs are fully parallel (1 mult/tap). The real design **folds** taps onto a MAC
+engine; a single long front-end FIR is ~43 DSP, so the shared front-end should be a
+**multistage** HBF/CIC+FIR decimator (a handful of DSP, paid once), and the
+selectivity FIR runs at the low channel rate (~0.2 DSP/channel). Both are folded
+into `feasibility_25ch.py` (still GO).
+
+Next: realize the multistage front-end, fold the selectivity FIR onto a per-lane MAC
+engine, then re-measure the full channelizer in Vivado on the build server.

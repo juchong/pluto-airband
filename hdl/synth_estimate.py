@@ -28,6 +28,8 @@ from maia_hdl.ddc import DDC
 from am_demod import EnvelopeMagnitude
 from am_audio import DCBlock, CICDecimator
 from channelizer_lane import TdmDdcLane
+from channelizer_chain import (FIRStage, FrontEndDecimator, design_lowpass,
+                               design_cic_compensation)
 
 OUT_DIR = pathlib.Path(__file__).parent / "out"
 
@@ -114,6 +116,13 @@ def _parse(stat: str) -> dict:
 # Z-7010 (XC7Z010) programmable-logic budget.
 Z7010 = {"LUT": 17600, "FF": 35200, "DSP48E1": 80, "BRAM36": 60}
 
+# Channelizer-chain filter realizations (must match channelizer_chain.py).
+FE_DECIM = 4
+FE_COEFFS, FE_SHIFT = design_lowpass(95, 0.95 / FE_DECIM, coeff_width=16)
+COMP_NTAPS = 119
+COMP_COEFFS, COMP_SHIFT = design_cic_compensation(8, 5, COMP_NTAPS, 0.35, 0.60,
+                                                  coeff_width=16)
+
 
 def main():
     OUT_DIR.mkdir(exist_ok=True)
@@ -130,6 +139,14 @@ def main():
          TdmDdcLane(n_channels=8, decimation=16, stages=3)),
         ("lane_ch21", "TdmDdcLane",
          TdmDdcLane(n_channels=21, decimation=16, stages=3)),
+        # Shared front-end decimator (one per receiver) and per-channel CIC droop-
+        # compensation FIR. Written fully-parallel here (1 multiplier/tap), so these
+        # are an UNROLLED upper bound; the real blocks fold the taps onto a small MAC
+        # engine -- see the folded MAC-rate note below.
+        ("frontend", "FrontEndDecimator",
+         FrontEndDecimator(FE_COEFFS, FE_DECIM, 12, FE_SHIFT)),
+        ("compfir", "FIRStage",
+         FIRStage(COMP_COEFFS, 1, 24, COMP_SHIFT)),
     ]
 
     print(f"{'block':<14}{'LUT':>8}{'FF':>8}{'CARRY4':>8}"
@@ -157,7 +174,7 @@ def main():
         print("\nPer full DDC (NCO mixer + 3-stage FIR decimator):")
         print(f"  DSP48E1 {d['DSP48E1']}  (Cmult3x=1 + FIR4DSP/2DSP/4DSP=10)")
         print(f"  BRAM36  {d['BRAM36']}   LUT {d['LUT']}   FF {d['FF']}")
-        n = 25
+        n = 22
         print(f"\nNaive {n}x parallel full DDCs would need "
               f"~{n * d['DSP48E1']} DSP48E1 and ~{n * d['BRAM36']} BRAM "
               f"-> exceeds 80 DSP / 60 BRAM by far. Time-multiplexing required.")
@@ -181,6 +198,33 @@ def main():
         print(f"  => per-channel state adds ~{dlut:.0f} LUT / ~{dff:.0f} FF per "
               f"channel (NCO phase + CIC I/Q integrators+combs); maps to BRAM in "
               f"the real design rather than the Yosys register-file estimate.")
+
+    if "frontend" in results and "compfir" in results:
+        fe, cf = results["frontend"], results["compfir"]
+        f_clk = 62.5e6                  # PL sync clock (handoff §4.2)
+        fs_work = 14e6                  # working rate after front-end (§8.2 window)
+        n_ch = 21
+        # Folded MAC rate = taps * output_rate; each DSP does f_clk MACs/s.
+        fe_out = fs_work
+        fe_dsp = 2 * len(FE_COEFFS) * fe_out / f_clk             # x2 = complex
+        # The channel-defining (selectivity + droop) FIR runs near the channel rate
+        # (~2x the 25 kHz channel spacing), NOT the demo's R_ch=8 CIC rate which was
+        # kept high only for fast simulation. At the real rate it is nearly free.
+        chan_rate = 50e3
+        comp_dsp_per_ch = 2 * COMP_NTAPS * chan_rate / f_clk     # x2 = complex
+        print("\nChannelizer filtering blocks (UNROLLED Yosys upper bound; the real "
+              "blocks fold taps onto a MAC engine):")
+        print(f"  front-end decimator (shared, {len(FE_COEFFS)}-tap complex): "
+              f"DSP48E1 {fe['DSP48E1']}  LUT {fe['LUT']}  FF {fe['FF']}")
+        print(f"  comp FIR ({COMP_NTAPS}-tap, fully unrolled): "
+              f"DSP48E1 {cf['DSP48E1']}  LUT {cf['LUT']}  FF {cf['FF']}")
+        print("  --- folded (time-multiplexed MAC) cost @ 62.5 MHz PL clock ---")
+        print(f"  front-end (single long FIR @ {fe_out/1e6:.0f} MHz): ~{fe_dsp:.0f} "
+              f"DSP48E1 -- too costly; use a multistage HBF/CIC+FIR decimator "
+              f"(brings it to a handful). Cost is paid ONCE (shared).")
+        print(f"  channel FIR @ ~{chan_rate/1e3:.0f} kHz: ~{comp_dsp_per_ch:.2f} "
+              f"DSP48E1/channel -> ~{comp_dsp_per_ch*n_ch:.1f} DSP for all {n_ch} "
+              f"channels on one folded MAC engine.")
 
 
 if __name__ == "__main__":
