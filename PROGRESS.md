@@ -250,18 +250,35 @@ the doc's older numbers, because current `maia-sdr` `main` requires them:
   resources: BRAM36 then LUT. The 21-ch lane LUT/FF are now **Vivado-confirmed** (OOC,
   see above); the full integrated channelizer is the remaining Vivado place step.
 
+### Full receiver datapath assembled (§7 step 5 + 7, verified)
+- `hdl/am_backend_tdm.py`: **`TdmAmBackend`** — the AM demod (`|I+jQ|` →
+  one-pole DC block → CIC audio decimate) **folded over channels**, per-channel
+  DC-block/CIC state in `amaranth.lib.memory`. **Bit-exact** to the per-channel
+  `EnvelopeMagnitude → DCBlock → CICDecimator` models; DSP-free; recovers a real
+  AM tone. (§8.3 audio rate stays a parameter — `audio_decim`/`cic_stages`.)
+- `hdl/audio_framer.py`: **`AudioFramer`** — §4.3 framing **resolved**: each audio
+  sample → fixed 8-byte record `{seq[24] | chan[8] | sample[32]}`, drained over an
+  AXI4-Stream (`stream_data/valid/ready`) that matches `maia_hdl.dma.DmaStreamWrite`
+  (`width=64`). Per-channel sequence counter for demux + drop detection. Verified.
+- `hdl/receiver_top.py`: **`ReceiverTop`** — wideband IQ → N `ChannelizerCore`
+  lanes (balanced, e.g. 21 → `[5,4,4,4,4]`) → round-robin collector → `TdmAmBackend`
+  → `AudioFramer` → DMA stream, with a flat per-channel NCO register interface.
+  **Bit-exact** end-to-end (framed audio == lane→FIR→AM models, per-channel seq
+  monotonic); 6 ch/3 lanes simulated, 21 ch/5 lanes elaborates.
+
 ## Next steps
-- §8.2 capture window **resolved** (final list): center 123.438 MHz, Fs ≈ 14 MHz,
-  ~5 lanes for the 21 core channels (`hdl/capture_window.py`); 133.65 MHz deferred.
-- §7 step 7 building blocks **complete + verified** (lane, front end, multistage
-  front end, folded cleanup FIR), 21-ch lane **Vivado-confirmed**.
-- §7 step 8 integration **done**: `ChannelizerCore` (BRAM lane + folded complex
-  cleanup FIR) is bit-exact, **placed + routed**, fits with large margin, and **meets
-  62.5 MHz** (WNS +3.07 ns) — see the integrated-core section above. Remaining for the
-  full receiver: instantiate ~5 lanes for the 21 channels + wire the shared front end
-  (or take the AD936x working rate directly), then a top-level place with the Maia
-  base platform.
-- Define §4.3 per-channel DMA framing (channel index + sample counter) — now unblocked
-  (the multi-channel datapath shape is fixed by `ChannelizerCore`).
+- §8.2 capture window **resolved**: center 123.438 MHz, Fs ≈ 14 MHz, ~5 lanes for
+  the 21 core channels (`hdl/capture_window.py`); 133.65 MHz deferred.
+- §7 steps 5/7/8 datapath **complete + verified**: lane, front end, folded cleanup
+  FIR, integrated `ChannelizerCore` (placed+routed, 62.5 MHz met), folded TDM AM
+  back-end, audio framer, and the assembled `ReceiverTop` are all bit-exact.
+- **Next (needs a decision): splice `ReceiverTop` into the Maia base platform.**
+  This is the first step that edits the pinned `maia-hdl` clone — instantiate the
+  receiver in `MaiaSDR`, add per-channel NCO control registers (SVD → maia-pac →
+  maia-httpd), and add an AXI3-HP DMA port in `system_bd.tcl` for the framed audio.
+  Reconcile with §7 "don't fork Maia / engage upstream early": keep all DSP in
+  `hdl/` (done) and confine maia-hdl edits to a thin, documented integration shim.
+- Then: full-design bitstream on the build server (whole-design timing + resources),
+  firmware image + flash, and a PS-side libiio reader for the framed audio (§5.4).
 - (Blocked on hardware) §7 step 3/6: flash baseline Maia (`build/pluto.dfu`) and
   bring up one real channel end-to-end on a Pluto.

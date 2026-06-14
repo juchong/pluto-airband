@@ -242,5 +242,48 @@ of one deployment lane (5 ch, dec-64 CIC, complex 119-tap cleanup):
 **Timing MET: WNS +3.07 ns, 0 failing endpoints**, route clean. (Pre-BRAM/pre-pipeline
 this overflowed FFs at 38 980 and missed timing at −3.28 ns; BRAM-backed state +
 the 4-stage lane pipeline fixed both.) ~5 lanes cover the 21 core channels with
-large margin. Remaining: replicate lanes + wire the shared front end, then a
-top-level place alongside the Maia base platform.
+large margin.
+
+## `am_backend_tdm.py`
+
+**`TdmAmBackend`** — the AM demodulator, folded over channels (handoff §7 step 5).
+`am_audio.AMChannel` demodulates one channel; this iterates the same datapath
+(`|I+jQ|` alpha-max-beta-min → one-pole DC block → CIC audio decimator) over all
+channels, holding each channel's DC-block and CIC state in `amaranth.lib.memory`
+(BRAM/distributed RAM). The envelope is memoryless (shared combinational logic).
+A short sequential FSM processes one channel in ~4 cycles; `busy` gates the
+caller. **Bit-exact** to the per-channel `EnvelopeMagnitude → DCBlock →
+CICDecimator` models, and recovers a real AM tone. DSP-free.
+
+```bash
+python am_backend_tdm.py
+```
+
+## `audio_framer.py`
+
+**`AudioFramer`** — packs each per-channel audio strobe into a fixed 8-byte
+record and exposes an AXI4-Stream (`stream_data`/`valid`/`ready`) that plugs
+straight into `maia_hdl.dma.DmaStreamWrite` (`width=64`). Record layout (§4.3):
+`bits[31:0]` signed sample, `bits[39:32]` channel index, `bits[63:40]` per-channel
+sequence counter (so userspace can demux and detect drops). Verified: sample +
+channel + monotonic per-channel sequence preserved through the staging FIFO.
+
+## `receiver_top.py`
+
+**`ReceiverTop`** — the complete receiver datapath (handoff §7 step 7):
+wideband IQ → N `ChannelizerCore` lanes (same stream broadcast) → round-robin
+collector → `TdmAmBackend` → `AudioFramer` → DMA stream. Channels are balanced
+across `ceil(N/chans_per_lane)` lanes (e.g. 21 → `[5,4,4,4,4]`); one lane sweeps
+all its channels per input sample, so the lane count is set by `Fpl/Fs`. Per-channel
+NCO tuning words are written through a flat register interface
+(`freq_wren`/`freq_waddr`=global channel/`freq_wdata`), routed to the owning lane.
+
+```bash
+python receiver_top.py            # end-to-end bit-exact (6 ch / 3 lanes)
+```
+
+Verified **bit-exact** end-to-end: framed per-channel audio == (lane model →
+cleanup-FIR model → AM model), per-channel sequence monotonic. The deployment
+21-channel / 5-lane config elaborates (`base_w` 42 b, AM `acc_w` 56 b, audio = top
+24 b). Remaining: splice into the Maia base platform (DMA HP port + control
+registers) and a full-design place.
