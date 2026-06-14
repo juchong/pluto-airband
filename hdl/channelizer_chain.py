@@ -31,7 +31,7 @@ import pathlib
 
 import numpy as np
 import scipy.signal
-from amaranth import Cat, Elaboratable, Module, Signal, signed
+from amaranth import Array, Cat, Const, Elaboratable, Module, Signal, signed
 from amaranth.sim import Simulator
 
 from am_audio import CICDecimator
@@ -146,6 +146,141 @@ class FrontEndDecimator(Elaboratable):
         return m
 
 
+class MultiStageDecimator(Elaboratable):
+    """Cascade of complex FIRStage decimators (the realistic shared front-end).
+
+    A single long FIR at the working rate is ~43 DSP; a cascade of halfband
+    decimate-by-2 stages does the same job far cheaper because each later stage
+    runs at a lower rate and halfband filters null ~half their taps. ``stages`` is
+    a list of dicts {coeffs, decim, out_shift}; each is built for I and Q.
+    """
+
+    def __init__(self, stages, in_width: int = 12):
+        self.stages_spec = stages
+        self.in_width = in_width
+        self.i_chain, self.q_chain = [], []
+        w = in_width
+        for st in stages:
+            fi = FIRStage(st["coeffs"], st["decim"], w, st["out_shift"])
+            fq = FIRStage(st["coeffs"], st["decim"], w, st["out_shift"])
+            self.i_chain.append(fi)
+            self.q_chain.append(fq)
+            w = fi.ow
+        self.clken = Signal()
+        self.re_in = Signal(signed(in_width))
+        self.im_in = Signal(signed(in_width))
+        self.strobe_out = Signal()
+        self.re_out = self.i_chain[-1].y_out
+        self.im_out = self.q_chain[-1].y_out
+
+    @staticmethod
+    def model(re, im, stages):
+        for st in stages:
+            re = FIRStage.model(re, st["coeffs"], st["decim"], st["out_shift"])
+            im = FIRStage.model(im, st["coeffs"], st["decim"], st["out_shift"])
+        return re, im
+
+    def elaborate(self, platform):
+        m = Module()
+        for idx, (fi, fq) in enumerate(zip(self.i_chain, self.q_chain)):
+            m.submodules[f"i{idx}"] = fi
+            m.submodules[f"q{idx}"] = fq
+        m.d.comb += [
+            self.i_chain[0].clken.eq(self.clken), self.i_chain[0].x_in.eq(self.re_in),
+            self.q_chain[0].clken.eq(self.clken), self.q_chain[0].x_in.eq(self.im_in),
+        ]
+        for idx in range(1, len(self.i_chain)):
+            pi, ci = self.i_chain[idx - 1], self.i_chain[idx]
+            pq, cq = self.q_chain[idx - 1], self.q_chain[idx]
+            m.d.comb += [
+                ci.clken.eq(pi.strobe_out), ci.x_in.eq(pi.y_out),
+                cq.clken.eq(pq.strobe_out), cq.x_in.eq(pq.y_out),
+            ]
+        m.d.comb += self.strobe_out.eq(self.i_chain[-1].strobe_out)
+        return m
+
+
+class TdmFirEngine(Elaboratable):
+    """Folded (time-multiplexed) FIR: one MAC serves N channels' cleanup filters.
+
+    The per-channel selectivity/droop-comp FIR runs at the low channel rate, so a
+    single multiply-accumulate iterated over the taps covers many channels. Each
+    channel keeps its own ``ntaps`` delay line; presenting (in_chan, x_in) with
+    ``in_valid`` runs an ``ntaps``-cycle pass and emits ``out`` for that channel.
+    """
+
+    def __init__(self, coeffs, n_channels: int, in_width: int, out_shift: int):
+        self.coeffs = [int(c) for c in coeffs]
+        self.ntaps = len(self.coeffs)
+        self.n = n_channels
+        self.iw = in_width
+        self.out_shift = out_shift
+        self.cw = max((abs(c).bit_length() for c in self.coeffs), default=1) + 1
+        self.acc_w = in_width + self.cw + math.ceil(math.log2(self.ntaps)) + 2
+        self.ow = self.acc_w - out_shift + 1
+
+        self.in_valid = Signal()
+        self.in_chan = Signal(range(max(2, n_channels)))
+        self.x_in = Signal(signed(in_width))
+        self.busy = Signal()
+        self.out_valid = Signal()
+        self.out_chan = Signal(range(max(2, n_channels)))
+        self.out = Signal(signed(self.ow), reset_less=True)
+
+    @staticmethod
+    def model(samples, coeffs, n_channels, out_shift):
+        """samples: list of (chan, x). Returns list of (chan, y), one per input."""
+        h = [int(c) for c in coeffs]
+        nt = len(h)
+        hist = [[0] * nt for _ in range(n_channels)]
+        out = []
+        for ch, x in samples:
+            line = hist[ch]
+            line.insert(0, int(x))
+            del line[-1]
+            acc = sum(h[k] * line[k] for k in range(nt))
+            out.append((ch, acc >> out_shift))
+        return out
+
+    def elaborate(self, platform):
+        m = Module()
+        nt = self.ntaps
+        mem = Array(Signal(signed(self.iw), name=f"d{i}")
+                    for i in range(self.n * nt))
+        crom = Array(Const(c, signed(self.cw)) for c in self.coeffs)
+
+        cnt = Signal(range(nt))
+        chan = Signal.like(self.in_chan)
+        xreg = Signal(signed(self.iw))
+        acc = Signal(signed(self.acc_w))
+        base = Signal(range(max(2, self.n * nt)))
+
+        m.d.comb += base.eq(chan * nt)
+        with m.FSM():
+            with m.State("IDLE"):
+                m.d.sync += self.out_valid.eq(0)
+                with m.If(self.in_valid & ~self.busy):
+                    m.d.sync += [chan.eq(self.in_chan), xreg.eq(self.x_in),
+                                 cnt.eq(nt - 1), acc.eq(0), self.busy.eq(1)]
+                    m.next = "RUN"
+            with m.State("RUN"):
+                with m.If(cnt != 0):
+                    val = mem[base + cnt - 1]
+                    m.d.sync += mem[base + cnt].eq(val)
+                    m.d.sync += acc.eq(acc + crom[cnt] * val)
+                    m.d.sync += cnt.eq(cnt - 1)
+                with m.Else():
+                    m.d.sync += mem[base].eq(xreg)
+                    m.d.sync += acc.eq(acc + crom[0] * xreg)
+                    m.next = "EMIT"
+            with m.State("EMIT"):
+                m.d.sync += [self.out.eq(acc >> self.out_shift),
+                             self.out_chan.eq(chan), self.out_valid.eq(1),
+                             self.busy.eq(0)]
+                m.next = "IDLE"
+        return m
+
+
 # ---------------------------------------------------------------------------
 # Coefficient design
 # ---------------------------------------------------------------------------
@@ -157,6 +292,40 @@ def design_lowpass(ntaps: int, cutoff: float, coeff_width: int = 16):
     h_int = np.round(h * scale).astype(int)
     out_shift = max(0, int(round(math.log2(abs(int(np.sum(h_int)))))))
     return h_int, out_shift
+
+
+def design_halfband(ntaps: int, coeff_width: int = 16):
+    """Halfband decimate-by-2 low-pass (cutoff = quarter sample rate).
+
+    Every other tap (bar the centre) is forced to zero, so only ~half the taps
+    cost a multiply -- the key saving of a multistage decimator. Returns
+    (int taps, out_shift, n_nonzero_taps)."""
+    assert ntaps % 2 == 1, "halfband length must be odd"
+    h = scipy.signal.firwin(ntaps, 0.5)
+    c = ntaps // 2
+    for n in range(ntaps):
+        if n != c and (n - c) % 2 == 0:
+            h[n] = 0.0
+    h = h / h.sum()                                      # restore unity DC gain
+    scale = (2 ** (coeff_width - 1) - 1) / np.max(np.abs(h))
+    h_int = np.round(h * scale).astype(int)
+    out_shift = max(0, int(round(math.log2(abs(int(np.sum(h_int)))))))
+    return h_int, out_shift, int(np.count_nonzero(h_int))
+
+
+def front_end_stages():
+    """Two-stage halfband decimate-by-4 front end (the cheap multistage option).
+
+    Each stage is a halfband decimate-by-2: stage 1 at the high (oversampled) rate
+    is short and nulls ~half its taps; stage 2 runs at half the rate. Returns a list
+    of {coeffs, decim, out_shift, nnz} usable by MultiStageDecimator and the folded
+    cost model."""
+    h1, s1, nnz1 = design_halfband(11)
+    h2, s2, nnz2 = design_halfband(31)
+    return [
+        {"coeffs": h1, "decim": 2, "out_shift": s1, "nnz": nnz1},
+        {"coeffs": h2, "decim": 2, "out_shift": s2, "nnz": nnz2},
+    ]
 
 
 def cic_response(fo, R, S):
@@ -377,6 +546,114 @@ def _end_to_end_chain():
     return on, adj, rej_db
 
 
+def _run_cplx(dut, re, im):
+    """Drive a complex clken/re_in/im_in -> strobe_out/re_out/im_out module."""
+    got_re, got_im = [], []
+
+    async def bench(ctx):
+        ctx.set(dut.clken, 1)
+        for r, i in zip(re, im):
+            ctx.set(dut.re_in, int(r))
+            ctx.set(dut.im_in, int(i))
+            await ctx.tick()
+            if ctx.get(dut.strobe_out):
+                got_re.append(ctx.get(dut.re_out))
+                got_im.append(ctx.get(dut.im_out))
+        for _ in range(8):
+            await ctx.tick()
+            if ctx.get(dut.strobe_out):
+                got_re.append(ctx.get(dut.re_out))
+                got_im.append(ctx.get(dut.im_out))
+
+    sim = Simulator(dut)
+    sim.add_clock(SYNC_PERIOD)
+    sim.add_testbench(bench)
+    sim.run()
+    k = min(len(got_re), len(got_im))
+    return np.array(got_re[:k]) + 1j * np.array(got_im[:k])
+
+
+def _multistage_front_end():
+    """Multistage (halfband cascade) front end: bit-exact, flat window, cheap."""
+    stages = front_end_stages()
+    R_fe = 4
+
+    # 1) bit-exact: random complex input, HW cascade == cascaded model
+    rng = np.random.default_rng(7)
+    n = 2000
+    lim = 2 ** 11 - 1
+    re = rng.integers(-lim, lim, size=n).astype(np.int64)
+    im = rng.integers(-lim, lim, size=n).astype(np.int64)
+    dut = MultiStageDecimator(stages, in_width=12)
+    got = _run_cplx(dut, re, im)
+    mre, mim = MultiStageDecimator.model(re, im, stages)
+    kk = min(len(got), len(mre))
+    exact = np.array_equal(got[:kk].real.astype(np.int64), mre[:kk]) and \
+        np.array_equal(got[:kk].imag.astype(np.int64), mim[:kk])
+
+    # 2) flatness/rejection: sweep complex tones through the HW cascade
+    def amp_at(f):
+        nn = np.arange(2400)
+        iq = 1500 * np.exp(1j * 2 * np.pi * f * nn)
+        z = _run_cplx(MultiStageDecimator(stages, 12),
+                      np.round(iq.real), np.round(iq.imag))
+        return np.sqrt(np.mean(np.abs(z[len(z) // 3:]) ** 2))
+
+    edge = 0.5 / R_fe                              # final no-alias edge (cyc/sample)
+    f_pass = [0.0, edge * 0.4, edge * 0.7]         # channel region (central ~77%)
+    f_stop = [edge * 1.3, 0.30]                    # alias region
+    ref = amp_at(f_pass[0])
+    pass_db = [20 * np.log10(amp_at(f) / ref + 1e-12) for f in f_pass]
+    stop_db = [20 * np.log10(amp_at(f) / ref + 1e-12) for f in f_stop]
+
+    # folded DSP cost: only nonzero halfband taps cost a multiply.
+    f_clk, fs_adc = 62.5e6, 56e6                   # ~oversampled capture (4x 14 MHz)
+    rate = fs_adc
+    folded = 0.0
+    for st in stages:
+        rate /= st["decim"]                        # stage output rate
+        folded += 2 * st["nnz"] * rate / f_clk     # x2 = complex
+    return exact, pass_db, stop_db, stages, folded
+
+
+def _verify_tdm_fir():
+    """Folded TDM FIR engine == per-channel parallel FIR (bit-exact)."""
+    coeffs, out_shift = design_lowpass(9, 0.3, coeff_width=12)
+    n_ch = 4
+    eng = TdmFirEngine(coeffs, n_ch, in_width=12, out_shift=out_shift)
+    rng = np.random.default_rng(3)
+    n = 120
+    chans = rng.integers(0, n_ch, size=n)
+    lim = 2 ** 11 - 1
+    xs = rng.integers(-lim, lim, size=n).astype(np.int64)
+    samples = list(zip(chans.tolist(), xs.tolist()))
+
+    got = []
+
+    async def bench(ctx):
+        for ch, x in samples:
+            ctx.set(eng.in_chan, int(ch))
+            ctx.set(eng.x_in, int(x))
+            ctx.set(eng.in_valid, 1)
+            await ctx.tick()
+            ctx.set(eng.in_valid, 0)
+            # wait for this sample's output
+            while True:
+                await ctx.tick()
+                if ctx.get(eng.out_valid):
+                    got.append((ctx.get(eng.out_chan), ctx.get(eng.out)))
+                    break
+
+    sim = Simulator(eng)
+    sim.add_clock(SYNC_PERIOD)
+    sim.add_testbench(bench)
+    sim.run()
+
+    exp = TdmFirEngine.model(samples, coeffs, n_ch, out_shift)
+    ok = all(g[0] == e[0] and g[1] == e[1] for g, e in zip(got, exp))
+    return ok, len(got), eng.ntaps, n_ch
+
+
 def main():
     res = _verify_firstage()
     for decim, k in res:
@@ -410,8 +687,32 @@ def main():
     assert rej > 40, "end-to-end channel does not reject the adjacent channel"
     print("  => a tone on the channel passes; one channel-spacing away is rejected.")
 
+    exact, ms_pass, ms_stop, stages, folded = _multistage_front_end()
+    print("\n[MultiStageDecimator] halfband decimate-by-4 front end (the cheap option "
+          "if we oversample; the AD936x can also deliver the working rate directly):")
+    taps = "+".join(str(len(s["coeffs"])) for s in stages)
+    nnz = "+".join(str(s["nnz"]) for s in stages)
+    print(f"  stages: {taps} taps ({nnz} nonzero after halfband nulling)")
+    print(f"  HW == cascaded model: {'PASS' if exact else 'FAIL'}")
+    print(f"  channel-region ripple : {max(ms_pass) - min(ms_pass):.2f} dB")
+    print(f"  out-of-window rejection: {-max(ms_stop):.1f} dB")
+    print(f"  folded DSP48E1 (complex, @62.5 MHz): ~{folded:.0f}  "
+          f"(vs ~43 for one long FIR)")
+    assert exact, "multistage front end not bit-exact"
+    assert max(ms_pass) - min(ms_pass) < 1.0, "multistage window not flat"
+    assert max(ms_stop) < -40, "multistage does not reject out-of-window"
+
+    ok, n_out, ntaps, n_ch = _verify_tdm_fir()
+    print(f"\n[TdmFirEngine] folded cleanup FIR ({ntaps} taps, {n_ch} channels, "
+          f"one MAC):")
+    print(f"  HW == per-channel parallel FIR: {'PASS' if ok else 'FAIL'} "
+          f"({n_out} interleaved outputs)")
+    assert ok, "folded TDM FIR not bit-exact to per-channel reference"
+    print("  => one multiply-accumulate, iterated over taps, serves all channels.")
+
     print("\nPASS: shared front-end decimator + per-channel CIC droop compensation "
-          "verified (bit-exact FIR; flat window; flat channel passband + rejection).")
+          "verified (bit-exact FIR; flat window; flat channel passband + rejection); "
+          "multistage front end + folded TDM cleanup FIR verified.")
     _save_plot(plotdata)
 
 

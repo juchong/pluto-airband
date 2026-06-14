@@ -28,8 +28,9 @@ from maia_hdl.ddc import DDC
 from am_demod import EnvelopeMagnitude
 from am_audio import DCBlock, CICDecimator
 from channelizer_lane import TdmDdcLane
-from channelizer_chain import (FIRStage, FrontEndDecimator, design_lowpass,
-                               design_cic_compensation)
+from channelizer_chain import (FIRStage, FrontEndDecimator, MultiStageDecimator,
+                               TdmFirEngine, design_lowpass,
+                               design_cic_compensation, front_end_stages)
 
 OUT_DIR = pathlib.Path(__file__).parent / "out"
 
@@ -122,6 +123,7 @@ FE_COEFFS, FE_SHIFT = design_lowpass(95, 0.95 / FE_DECIM, coeff_width=16)
 COMP_NTAPS = 119
 COMP_COEFFS, COMP_SHIFT = design_cic_compensation(8, 5, COMP_NTAPS, 0.35, 0.60,
                                                   coeff_width=16)
+FE_STAGES = front_end_stages()
 
 
 def main():
@@ -147,6 +149,13 @@ def main():
          FrontEndDecimator(FE_COEFFS, FE_DECIM, 12, FE_SHIFT)),
         ("compfir", "FIRStage",
          FIRStage(COMP_COEFFS, 1, 24, COMP_SHIFT)),
+        # The realistic realizations: a multistage (halfband cascade) front end and
+        # a folded one-MAC cleanup FIR shared across channels.
+        ("frontend_ms", "MultiStageDecimator",
+         MultiStageDecimator(FE_STAGES, in_width=12)),
+        ("compfir_tdm", "TdmFirEngine",
+         TdmFirEngine(COMP_COEFFS, n_channels=5, in_width=24,
+                      out_shift=COMP_SHIFT)),
     ]
 
     print(f"{'block':<14}{'LUT':>8}{'FF':>8}{'CARRY4':>8}"
@@ -225,6 +234,22 @@ def main():
         print(f"  channel FIR @ ~{chan_rate/1e3:.0f} kHz: ~{comp_dsp_per_ch:.2f} "
               f"DSP48E1/channel -> ~{comp_dsp_per_ch*n_ch:.1f} DSP for all {n_ch} "
               f"channels on one folded MAC engine.")
+
+    if "frontend_ms" in results and "compfir_tdm" in results:
+        ms, td = results["frontend_ms"], results["compfir_tdm"]
+        f_clk, fs_adc = 62.5e6, 56e6
+        rate, ms_dsp = fs_adc, 0.0
+        for st in FE_STAGES:
+            rate /= st["decim"]
+            ms_dsp += 2 * st["nnz"] * rate / f_clk
+        print("\nRealistic realizations (verified in channelizer_chain.py):")
+        print(f"  multistage front end ({'+'.join(str(s['nnz']) for s in FE_STAGES)} "
+              f"nonzero taps): DSP48E1 {ms['DSP48E1']}  LUT {ms['LUT']}  FF {ms['FF']}"
+              f"  -> folded ~{ms_dsp:.0f} DSP (vs ~43 for one long FIR); paid ONCE.")
+        print(f"  folded TDM cleanup FIR (1 MAC, {COMP_NTAPS}-tap, 5 ch): "
+              f"DSP48E1 {td['DSP48E1']}  LUT {td['LUT']}  FF {td['FF']}  BRAM "
+              f"{td['BRAM36']} (Yosys keeps per-channel delay lines in LUTRAM/FF; "
+              f"maps to BRAM on the device).")
 
 
 if __name__ == "__main__":

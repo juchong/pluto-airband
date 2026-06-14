@@ -165,6 +165,39 @@ runs `make` under an `Xvfb` display for `xsct`). With Vivado present it does the
 full from-source bitstream (`HAVE_VIVADO=1`). Artifacts land in
 `plutosdr-fw/build/` (`.frm`/`.dfu`, `boot.frm`, `system_top.xsa`, etc.).
 
+### Out-of-context (OOC) module synthesis — real utilization vs Yosys
+
+For quick real LUT/FF/DSP/BRAM on the **actual Pluto part** without a full build,
+run Vivado **directly on the host** (no Docker) against Amaranth-generated Verilog
+(`hdl/synth_estimate.py` emits these to `hdl/out/*.v`). Two host quirks to know:
+
+- **Missing `libtinfo.so.5`** — Vivado 2023.2 needs the libtinfo5/ncurses5 ABI but
+  Ubuntu 22.04 ships v6. Batch mode fails (`librdi_commontasks.so: libtinfo.so.5`)
+  even though `vivado -version` works. Vivado's loader resets `LD_LIBRARY_PATH`, so
+  a per-run shim doesn't take; add system compat symlinks once (reversible):
+
+  ```bash
+  sudo ln -sf /usr/lib/x86_64-linux-gnu/libtinfo.so.6 /usr/lib/x86_64-linux-gnu/libtinfo.so.5
+  sudo ln -sf /usr/lib/x86_64-linux-gnu/libncurses.so.6 /usr/lib/x86_64-linux-gnu/libncurses.so.5
+  sudo ldconfig
+  ```
+
+- **Root disk is full** (`/dev/vda2` at 100%; the from-source build artifacts fill
+  it). Run OOC work on the SMB share `/mnt/vivado-share` and point `HOME`/`TMPDIR`
+  there so Vivado's `.Xilinx`/logs/scratch don't hit the full root fs:
+
+  ```bash
+  cd /mnt/vivado-share/ooc && export HOME=$PWD/home TMPDIR=$PWD/home
+  source /opt/Xilinx/Vivado/2023.2/settings64.sh
+  vivado -mode batch -nojournal -source ooc_synth.tcl -tclargs <module>.v <TopName>
+  # report -> <TopName>_ooc_util.rpt ; ooc_synth.tcl is in hdl/
+  ```
+
+  Launch detached (`setsid ... </dev/null &`) so the run survives the SSH session.
+
+**Confirmed (2026-06-14):** 21-ch `TdmDdcLane` = 4 DSP48E1, 3374 LUT, 7760 FF, 0
+BRAM (matches Yosys); parallel `MultiStageDecimator` = 58 DSP / 212 LUT / 1055 FF.
+
 ## libiio (host tools to talk to the Pluto)
 
 `libiio` is **not in Homebrew core**, and its macOS CMake build defaults to a

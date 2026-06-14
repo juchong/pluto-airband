@@ -178,7 +178,26 @@ the doc's older numbers, because current `maia-sdr` `main` requires them:
   ~43 DSP at 14 MHz → must be a **multistage** HBF/CIC+FIR decimator (a handful of
   DSP, shared once); the channel selectivity FIR at ~50 kHz is ~0.2 DSP/channel →
   ~4 DSP covers all 21 on one engine. Folded into `feasibility_25ch.py` (front-end
-  12 DSP one-time + per-lane cleanup FIR); still GO.
+  optional, per-lane cleanup FIR); still GO.
+- **Multistage front end + folded cleanup FIR built and verified** (extends
+  `channelizer_chain.py`):
+  - `MultiStageDecimator` — two halfband decimate-by-2 stages (11+31 taps, 7+17
+    nonzero). **Bit-exact** to the cascaded model; 0.08 dB channel-region ripple,
+    53 dB out-of-window rejection. Folds to **~14 DSP** (vs ~43 for one long FIR).
+    NB it is **optional**: the AD936x decimates internally (HB1/2/3 + prog. FIR) to
+    the requested rate, so the baseline captures at the working rate with no PL
+    front end; this block is the oversampling-fallback realization.
+  - `TdmFirEngine` — folded one-MAC cleanup FIR: a single multiply-accumulate
+    iterated over taps serves all channels (per-channel delay lines indexed by
+    channel). **Bit-exact** to the per-channel parallel FIR. Yosys: **2 DSP**.
+- **Vivado 2023.2 OOC cross-check** (build server, `xc7z010clg225-1`, the real
+  Pluto part — see `DEV-SETUP.md`):
+  - `TdmDdcLane` (21 ch): **4 DSP, 3374 LUT (19%), 7760 FF (22%), 0 BRAM** — closely
+    matches Yosys (4 DSP / 3583 LUT / 7708 FF), de-risking the LUT/FF estimates. The
+    per-channel state lands in FFs (register file); a Memory-backed lane moves it to
+    BRAM.
+  - `MultiStageDecimator` (parallel build): 58 DSP / 212 LUT / 1055 FF — the
+    parallel structural cost (1 mult/nonzero-tap); the folded MAC version is ~14 DSP.
 
 ### Channelizer feasibility GATE (§4.2) — GO for N=22
 - `hdl/synth_estimate.py`: emits Verilog for the real maia-hdl `DDC` and our AM
@@ -195,18 +214,18 @@ the doc's older numbers, because current `maia-sdr` `main` requires them:
   model checks the channelizer against the FREE budget (Z7010 − base). Still GO —
   full ~19 MHz airband ≈ 7 lanes / 21 DSP / 69% of free LUT / 58% of free BRAM;
   the resolved 14 MHz core window ≈ 5 lanes (56% LUT / 45% BRAM). Binding
-  resources: BRAM36 then LUT. LUT/FF lane costs remain Yosys-scale estimates to
-  re-confirm in Vivado once a full lane is built.
+  resources: BRAM36 then LUT. The 21-ch lane LUT/FF are now **Vivado-confirmed** (OOC,
+  see above); the full integrated channelizer is the remaining Vivado place step.
 
 ## Next steps
 - §8.2 capture window **resolved** (final list): center 123.438 MHz, Fs ≈ 14 MHz,
   ~5 lanes for the 21 core channels (`hdl/capture_window.py`); 133.65 MHz deferred.
-- Front-end decimator + per-channel cleanup/compensation FIR **prototyped + verified**
-  (`hdl/channelizer_chain.py`). Remaining: realize the shared front-end as a
-  **multistage** (HBF/CIC+FIR) decimator (the single long FIR is ~43 DSP), fold the
-  selectivity FIR onto a per-lane MAC engine, then re-measure the full channelizer
-  (front-end + lane + cleanup FIR) in **Vivado** on the build server with per-channel
-  state in BRAM.
+- §7 step 7 building blocks **complete + verified** (lane, front end, multistage
+  front end, folded cleanup FIR), with the 21-ch lane **Vivado-confirmed** (4 DSP /
+  3374 LUT / 7760 FF / 0 BRAM, xc7z010clg225-1). Remaining for a full channelizer:
+  integrate front end + lanes + folded cleanup FIR into one top with **Memory-backed**
+  per-channel state (so it maps to BRAM, not FFs), and run Vivado place to confirm the
+  combined fit + timing.
 - Define §4.3 per-channel DMA framing (channel index + sample counter) once the
   multi-channel datapath shape is fixed.
 - (Blocked on hardware) §7 step 3/6: flash baseline Maia (`build/pluto.dfu`) and

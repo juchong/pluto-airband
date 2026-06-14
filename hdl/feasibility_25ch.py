@@ -59,11 +59,12 @@ FIR_CLEANUP_DSP = 2    # one folded MAC engine for the per-lane CIC droop-comp +
 # per lane (FIR_CLEANUP_DSP=2 with headroom) covers the lane's channels.
 # (bulk decimation done by multiplier-free CIC: 0 DSP)
 
-# Shared front-end decimator (ONE per receiver, amortized over all channels).
-# channelizer_chain.py shows a single long FIR is ~43 DSP (too costly); a
-# multistage HBF/CIC+FIR complex decimator does the same job for a handful of
-# DSP. Budgeted conservatively as a one-time cost.
-FRONTEND = {"DSP48E1": 12, "LUT": 1500, "FF": 1500, "BRAM36": 2}
+# Shared front-end decimator (ONE per receiver). OPTIONAL: the AD936x already
+# decimates internally (HB1/2/3 + programmable FIR) to the requested rate, so the
+# baseline captures at the working rate and needs NO PL front end. This budgets the
+# *oversampling fallback*: channelizer_chain.py's verified two-stage halfband
+# MultiStageDecimator folds to ~14 DSP (vs ~43 for one long FIR), paid once.
+FRONTEND = {"DSP48E1": 14, "LUT": 1144, "FF": 1175, "BRAM36": 2}
 
 N = 22                 # final channel count (21 core + 1 deferred outlier)
 F_S = 62.5e6           # PL "sync" clock (handoff §4.2)
@@ -167,13 +168,17 @@ def main():
     print("Resolved (§8.2, see capture_window.py): center 123.438 MHz, Fs ~14 MHz "
           "-> ~5 lanes for the 21 core channels (133.65 MHz deferred).")
     print("\nStatus / caveats:")
-    print("  * front-end decimator + per-channel CIC droop-comp/selectivity FIR are")
-    print("    now prototyped and verified (channelizer_chain.py): flat capture")
-    print("    window, flat channel passband, >40 dB adjacent-channel rejection.")
-    print("  * the shared front-end must be a MULTISTAGE decimator (a single long FIR")
-    print("    is ~43 DSP); budgeted here at 12 DSP one-time. Build + measure next.")
-    print("  * lane LUT/FF are Yosys-scale estimates; re-confirm the full channelizer")
-    print("    in Vivado on the build server.")
+    print("  * front end + per-channel CIC droop-comp/selectivity FIR + multistage")
+    print("    front end + folded one-MAC TDM cleanup FIR are all built and verified")
+    print("    (channelizer_chain.py): flat window, flat channel passband, >40 dB")
+    print("    adjacent rejection; the cleanup FIR folds to ~2 DSP/engine.")
+    print(f"  * front end is OPTIONAL ({FRONTEND['DSP48E1']} DSP budgeted): the AD936x")
+    print("    can deliver the working rate directly; this covers the oversampling")
+    print("    fallback (verified halfband cascade, ~14 folded / ~58 parallel DSP).")
+    print("  * Vivado 2023.2 OOC (xc7z010clg225-1) CONFIRMS the lane: 21-ch TdmDdcLane")
+    print("    = 4 DSP, 3374 LUT (19%), 7760 FF (22%), 0 BRAM -- matches Yosys. The")
+    print("    per-channel state lands in FFs here; a Memory-backed lane moves it to")
+    print("    BRAM. Final step: integrate front end + lane + folded FIR and re-place.")
 
 
 if __name__ == "__main__":

@@ -183,16 +183,28 @@ built on one generic integer block, `FIRStage` (direct-form decimating FIR, veri
 - **End-to-end HW** (front-end → NCO mix → per-channel CIC → comp FIR): an
   on-channel tone passes; a tone one channel-spacing away is rejected by 48 dB.
 
+It also contains the two **realistic realizations** (so the front-end + cleanup FIR
+are cheap on the device):
+
+- `MultiStageDecimator` — a cascade of halfband decimate-by-2 stages (the cheap
+  front end if we oversample). **Bit-exact** to the cascaded model; 0.08 dB
+  channel-region ripple, 53 dB rejection; folds to **~14 DSP** vs ~43 for one long
+  FIR. Optional in the baseline (the AD936x can deliver the working rate directly).
+- `TdmFirEngine` — the **folded** cleanup FIR: one multiply-accumulate iterated over
+  taps serves all channels (per-channel delay lines indexed by channel). **Bit-exact**
+  to the per-channel parallel FIR; Yosys = 2 DSP.
+
 ```bash
 python channelizer_chain.py
 ```
 
 Plot at `out/channelizer_chain.png` (git-ignored). Realization note: the prototype
-FIRs are fully parallel (1 mult/tap). The real design **folds** taps onto a MAC
-engine; a single long front-end FIR is ~43 DSP, so the shared front-end should be a
-**multistage** HBF/CIC+FIR decimator (a handful of DSP, paid once), and the
-selectivity FIR runs at the low channel rate (~0.2 DSP/channel). Both are folded
-into `feasibility_25ch.py` (still GO).
+direct FIRs are fully parallel (1 mult/tap) — Yosys/Vivado show that upper bound;
+`MultiStageDecimator` + `TdmFirEngine` are the folded/cheap forms.
 
-Next: realize the multistage front-end, fold the selectivity FIR onto a per-lane MAC
-engine, then re-measure the full channelizer in Vivado on the build server.
+**Vivado 2023.2 OOC cross-check** (build server, `xc7z010clg225-1`; see
+`../DEV-SETUP.md` for the recipe): the 21-channel `TdmDdcLane` synthesizes to **4
+DSP, 3374 LUT (19%), 7760 FF (22%), 0 BRAM**, closely matching the Yosys estimate and
+confirming the lane fit; per-channel state lands in FFs here (a Memory-backed lane
+moves it to BRAM). Remaining: integrate front end + lanes + folded cleanup FIR into
+one top with Memory-backed state and run a full Vivado place.
