@@ -266,9 +266,22 @@ the doc's older numbers, because current `maia-sdr` `main` requires them:
   **Bit-exact** end-to-end (framed audio == lane→FIR→AM models, per-channel seq
   monotonic); 6 ch/3 lanes simulated, 21 ch/5 lanes elaborates.
 
+### Real-time throughput budget (§4.2, cycle level) — closed
+- `hdl/realtime_budget.py`: the area GATE didn't check whether the *folded*
+  datapaths keep up with the sample cadence. At Fpl=62.5/Fs=14 MHz there are only
+  ~4.46 cycles/input, so: **chans_per_lane ≤ 4**; the cleanup FIR needs enough lane
+  decimation for its tap count (`duty_fir = cpl·(Fs/decim)·ntaps/Fpl < 1`).
+- **Finding:** the OOC config (dec-64, 119-tap) does **not** close real-time timing
+  (`duty_fir ≈ 1.75`) — it was a *resource* measurement. **Deployment config:
+  chans_per_lane=4, lane_decim=128, ntaps=63 → 6 lanes, audio_decim=7 → 15.6 ksps.**
+- **Validated** with a cycle-accurate stress test at the true cadence: the fitting
+  config is overflow-free + bit-exact; an over-budget config correctly overflows
+  (detector now covers the lane→FIR FIFO, collector FIFOs, and framer FIFO).
+
 ## Next steps
-- §8.2 capture window **resolved**: center 123.438 MHz, Fs ≈ 14 MHz, ~5 lanes for
-  the 21 core channels (`hdl/capture_window.py`); 133.65 MHz deferred.
+- §8.2 capture window **resolved**: center 123.438 MHz, Fs ≈ 14 MHz, **6 lanes**
+  (chans_per_lane=4) for the 21 core channels (`hdl/capture_window.py`,
+  `hdl/realtime_budget.py`); 133.65 MHz deferred.
 - §7 steps 5/7/8 datapath **complete + verified**: lane, front end, folded cleanup
   FIR, integrated `ChannelizerCore` (placed+routed, 62.5 MHz met), folded TDM AM
   back-end, audio framer, and the assembled `ReceiverTop` are all bit-exact.

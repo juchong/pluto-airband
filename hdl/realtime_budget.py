@@ -1,0 +1,190 @@
+#!/usr/bin/env python3
+"""Real-time throughput budget for the time-multiplexed receiver (§4.2, cycle level).
+
+The §4.2 feasibility GATE checked *area* (LUT/FF/DSP/BRAM). This checks the other
+half: can each shared (folded) datapath keep up with the sample cadence? The OOC
+numbers (dec-64 CIC, 119-tap cleanup) were chosen to *measure resources*, not to
+close real-time timing, and the functional sims used a relaxed inter-sample gap.
+Here we make the cycle budget explicit and pick deployment parameters that fit,
+then stress-test ``ReceiverTop`` at the true cadence (one input every
+``Fpl/Fs`` cycles) and confirm **nothing is dropped** (overflow stays 0).
+
+Binding duty cycles (must each stay < 1, with margin):
+
+  lane sweep : the lane visits all its channels one-per-cycle every input sample,
+               so   duty_lane = chans_per_lane / (Fpl / Fs).
+  cleanup FIR: folded MAC, ~ntaps cycles per channel-output, at the channel rate
+               (Fs/lane_decim) for each of its channels:
+               duty_fir = chans_per_lane * (Fs/lane_decim) * (ntaps+ovh) / Fpl.
+  AM back-end: ~4 cycles per channel-output, shared across all N channels:
+               duty_am  = N * (Fs/lane_decim) * 4 / Fpl.
+
+duty_lane forces chans_per_lane <= floor(Fpl/Fs); duty_fir forces enough lane
+decimation for the chosen tap count. Both are satisfied by the recommended config.
+
+Run:  python hdl/realtime_budget.py
+"""
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from amaranth.sim import Simulator
+
+from channelizer_chain import design_cic_compensation
+from ddc_tune_decimate import SYNC_PERIOD
+from receiver_top import ReceiverTop
+from audio_framer import AudioFramer
+
+F_PL = 62.5e6          # PL sync clock (handoff §4.2)
+F_S = 14.0e6           # resolved capture rate (§8.2)
+N = 21                 # core channels
+
+
+def duties(Fs, Fpl, n, cpl, lane_decim, ntaps, am_cycles=4, fir_ovh=6):
+    n_lanes = math.ceil(n / cpl)
+    base, rem = divmod(n, n_lanes)
+    max_size = base + (1 if rem else 0)
+    cyc_in = Fpl / Fs
+    ch_rate = Fs / lane_decim
+    return {
+        "n_lanes": n_lanes, "max_size": max_size, "cyc_in": cyc_in,
+        "ch_rate": ch_rate,
+        "duty_lane": max_size / cyc_in,
+        "duty_fir": max_size * ch_rate * (ntaps + fir_ovh) / Fpl,
+        "duty_am": n * ch_rate * am_cycles / Fpl,
+    }
+
+
+def _print_table():
+    print(f"Fpl={F_PL/1e6:.1f} MHz  Fs={F_S/1e6:.1f} MHz  "
+          f"cycles/input={F_PL/F_S:.2f}  -> chans_per_lane <= {int(F_PL//F_S)}\n")
+    print(f"{'cpl':>3} {'decim':>6} {'ntaps':>6} {'lanes':>6} {'ch_rate':>9} "
+          f"{'duty_lane':>10} {'duty_fir':>9} {'duty_am':>8}  fit")
+    best = None
+    for cpl in (3, 4):
+        for lane_decim in (64, 128, 175, 256):
+            for ntaps in (63, 119):
+                d = duties(F_S, F_PL, N, cpl, lane_decim, ntaps)
+                fit = (d["duty_lane"] < 0.95 and d["duty_fir"] < 0.9
+                       and d["duty_am"] < 0.9)
+                print(f"{cpl:>3} {lane_decim:>6} {ntaps:>6} {d['n_lanes']:>6} "
+                      f"{d['ch_rate']/1e3:>7.1f}k {d['duty_lane']:>10.2f} "
+                      f"{d['duty_fir']:>9.2f} {d['duty_am']:>8.3f}  "
+                      f"{'OK' if fit else 'no'}")
+                if fit and best is None and cpl == 4:
+                    best = (cpl, lane_decim, ntaps)
+    return best
+
+
+def _audio_decim_for(Fs, lane_decim, target_audio=16e3):
+    ch_rate = Fs / lane_decim
+    return max(2, round(ch_rate / target_audio))
+
+
+def _stress(cpl=3, lane_decim=64, ntaps=63, audio_decim=4, n_channels=6,
+            n_in=2600, seed=7):
+    """Drive ReceiverTop at the true cadence (gap = floor(Fpl/Fs)) and report
+    whether any stage overflows and whether the framed audio is bit-exact.
+
+    ``audio_decim`` is kept small here (independent of the 16 ksps deployment
+    value) so a few audio samples appear within a short sim; the real-time
+    stress comes from the inter-sample ``gap`` and the lane/FIR burst cadence,
+    which depend on ``lane_decim``/``ntaps``/``cpl``, not on ``audio_decim``."""
+    coeffs, out_shift = design_cic_compensation(8, 5, ntaps, 0.35, 0.60)
+    dut = ReceiverTop(n_channels=n_channels, chans_per_lane=cpl,
+                      decimation=lane_decim, coeffs=coeffs, out_shift=out_shift,
+                      audio_decim=audio_decim, cic_stages=3, dcblock_k=10,
+                      in_width=12, nco_width=24, stages=3, audio_sample_w=24)
+    gap = int(F_PL // F_S)            # true inter-sample spacing in PL cycles
+    rng = np.random.default_rng(seed)
+    lim = 2 ** 11 - 1
+    samples = rng.integers(-lim, lim, size=(n_in, 2)).astype(np.int64)
+    freqs = [int(round(f * 2 ** dut.nco_width))
+             for f in np.linspace(-0.2, 0.2, n_channels)]
+    words = []
+    overflowed = [False]
+
+    async def bench(ctx):
+        ctx.set(dut.stream_ready, 1)
+        ctx.set(dut.freq_wren, 1)
+        for c, f in enumerate(freqs):
+            ctx.set(dut.freq_waddr, c)
+            ctx.set(dut.freq_wdata, int(f) & (2 ** dut.nco_width - 1))
+            await ctx.tick()
+        ctx.set(dut.freq_wren, 0)
+        await ctx.tick()
+
+        async def step():
+            if ctx.get(dut.overflow):
+                overflowed[0] = True
+            if ctx.get(dut.stream_valid):
+                words.append(ctx.get(dut.stream_data))
+            await ctx.tick()
+
+        for (re, im) in samples:
+            ctx.set(dut.re_in, int(re))
+            ctx.set(dut.im_in, int(im))
+            ctx.set(dut.in_valid, 1)
+            await step()
+            ctx.set(dut.in_valid, 0)
+            for _ in range(gap - 1):
+                await step()
+        for _ in range(4000):
+            await step()
+
+    sim = Simulator(dut)
+    sim.add_clock(SYNC_PERIOD)
+    sim.add_testbench(bench)
+    sim.run()
+
+    # bit-exact check (per channel) against the model, plus no overflow
+    per = {c: [] for c in range(n_channels)}
+    for w in words:
+        _, chan, sample = AudioFramer.unpack(w)
+        per[chan].append(sample)
+    ref = dut.model(samples, freqs)
+    bit_ok = True
+    for c in range(n_channels):
+        g = np.array(per[c], np.int64)
+        e = ref[c]
+        kk = min(len(g), len(e))
+        if kk == 0 or not np.array_equal(g[:kk], e[:kk]):
+            bit_ok = False
+    return dut, gap, audio_decim, (not overflowed[0]), bit_ok, len(words)
+
+
+def main():
+    best = _print_table()
+    print(f"\nRecommended deployment config (4 ch/lane fits with margin): "
+          f"chans_per_lane={best[0]}, lane_decim={best[1]}, cleanup ntaps={best[2]} "
+          f"-> {math.ceil(N/best[0])} lanes; "
+          f"audio_decim={_audio_decim_for(F_S, best[1])} gives "
+          f"{F_S/best[1]/_audio_decim_for(F_S, best[1])/1e3:.1f} ksps audio.")
+
+    print("\nStress test: drive ReceiverTop at the true cadence "
+          f"(one input every floor(Fpl/Fs)={int(F_PL//F_S)} cycles)...")
+
+    # (1) a budget-fitting config: must stay overflow-free AND bit-exact
+    dut, gap, ad, no_ovf, bit_ok, nwords = _stress(
+        cpl=3, lane_decim=64, ntaps=63, audio_decim=4)
+    print(f"  [fits]   {dut.n_channels} ch / {dut.n_lanes} lanes, decim=64, "
+          f"63-tap, gap={gap} -> {nwords} records, overflow-free={no_ovf}, "
+          f"bit-exact={bit_ok}")
+    assert no_ovf, "FIFO overflow at real-time cadence: parameters do not fit"
+    assert bit_ok, "framed audio not bit-exact under real-time cadence"
+
+    # (2) negative control: an over-budget config (FIR too slow, duty>1) MUST
+    #     trip the overflow detector -- proves the detector actually fires.
+    _, _, _, no_ovf2, _, _ = _stress(
+        cpl=3, lane_decim=32, ntaps=119, audio_decim=4, n_in=1500)
+    print(f"  [over]   decim=32, 119-tap (duty_fir>1): overflow-free={no_ovf2} "
+          f"(expected False)")
+    assert not no_ovf2, "over-budget config did not overflow (detector broken?)"
+
+    print("\nPASS: real-time budget closes for the fitting config (no dropped "
+          "samples, still bit-exact); the over-budget config correctly overflows.")
+
+
+if __name__ == "__main__":
+    main()

@@ -98,6 +98,9 @@ class ChannelizerCore(Elaboratable):
         self.out_chan = Signal(range(max(2, n_channels)))
         self.out_re = Signal(signed(self.fir_i.ow), reset_less=True)
         self.out_im = Signal(signed(self.fir_q.ow), reset_less=True)
+        # pulses if the lane->cleanup-FIR FIFO backs up (cleanup FIR can't drain
+        # the per-CIC-boundary burst in time -> a real-time throughput overrun).
+        self.overflow = Signal()
 
     # -- bit-exact reference model -----------------------------------------
     def model(self, samples, freqs):
@@ -133,6 +136,8 @@ class ChannelizerCore(Elaboratable):
             fifo.w_data.eq(Cat(lane.out_chan, lane.out_re, lane.out_im)),
             fifo.w_en.eq(lane.out_valid),
         ]
+        with m.If(lane.out_valid & ~fifo.w_rdy):
+            m.d.comb += self.overflow.eq(1)
 
         # FIFO head -> both cleanup engines (run in lockstep)
         head_chan = fifo.r_data[:cbits]

@@ -283,7 +283,33 @@ python receiver_top.py            # end-to-end bit-exact (6 ch / 3 lanes)
 ```
 
 Verified **bit-exact** end-to-end: framed per-channel audio == (lane model →
-cleanup-FIR model → AM model), per-channel sequence monotonic. The deployment
-21-channel / 5-lane config elaborates (`base_w` 42 b, AM `acc_w` 56 b, audio = top
-24 b). Remaining: splice into the Maia base platform (DMA HP port + control
-registers) and a full-design place.
+cleanup-FIR model → AM model), per-channel sequence monotonic. Remaining: splice
+into the Maia base platform (DMA HP port + control registers) and a full-design
+place.
+
+## `realtime_budget.py`
+
+The §4.2 feasibility GATE checked **area**; this checks **throughput**. The shared
+(folded) datapaths must keep up with the sample cadence: at `Fpl=62.5 MHz`,
+`Fs=14 MHz` there are only `~4.46` PL cycles per input sample, so each binding
+stage has a duty cycle that must stay < 1:
+
+- `duty_lane = chans_per_lane / (Fpl/Fs)` ⟹ **chans_per_lane ≤ 4**.
+- `duty_fir  = chans_per_lane · (Fs/lane_decim) · (ntaps+ovh) / Fpl` ⟹ enough lane
+  decimation for the tap count.
+- `duty_am   = N · (Fs/lane_decim) · 4 / Fpl` (always small).
+
+**Important:** the OOC config (`dec-64`, `119-tap`) was for *resource* measurement
+and does **not** close real-time timing (`duty_fir ≈ 1.75`). The recommended
+deployment config is **`chans_per_lane=4`, `lane_decim=128`, cleanup `ntaps=63`
+→ 6 lanes**, with `audio_decim=7` giving **15.6 ksps** audio (all duties < 0.9).
+
+```bash
+python realtime_budget.py     # prints the duty table + cycle-accurate stress test
+```
+
+A cycle-accurate stress test drives `ReceiverTop` at the **true** cadence (one
+input every `floor(Fpl/Fs)` cycles): a budget-fitting config stays **overflow-free
+and bit-exact**, and an over-budget config (`dec-32`/`119-tap`, `duty_fir>1`)
+**correctly trips** the overflow detector (which now covers the lane→FIR FIFO, the
+collector FIFOs, and the framer FIFO).

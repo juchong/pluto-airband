@@ -101,7 +101,10 @@ class ReceiverTop(Elaboratable):
         self.in_valid = Signal()
         self.re_in = Signal(signed(in_width))
         self.im_in = Signal(signed(in_width))
-        self.overflow = self.framer.overflow
+        # overflow pulses if any stage cannot keep up at the real-time cadence:
+        # a lane output FIFO backs up (cleanup FIR too slow) or the framer FIFO
+        # backs up (AM back-end / DMA too slow). Real-time-valid => stays 0.
+        self.overflow = Signal()
         self.stream_data = self.framer.stream_data
         self.stream_valid = self.framer.stream_valid
         self.stream_ready = self.framer.stream_ready
@@ -130,6 +133,7 @@ class ReceiverTop(Elaboratable):
         # ---- per-lane output staging FIFOs (local_chan, re, im) ----
         clbits = [max(1, (l.n_channels - 1).bit_length()) for l in self.lanes]
         fifos = []
+        lane_ovf = Signal()
         for L, lane in enumerate(self.lanes):
             f = SyncFIFO(width=clbits[L] + 2 * self.base_w, depth=4 * lane.n_channels)
             m.submodules[f"cfifo{L}"] = f
@@ -137,7 +141,12 @@ class ReceiverTop(Elaboratable):
                 f.w_data.eq(Cat(lane.out_chan, lane.out_re, lane.out_im)),
                 f.w_en.eq(lane.out_valid),
             ]
+            with m.If(lane.out_valid & ~f.w_rdy):
+                m.d.comb += lane_ovf.eq(1)
+            with m.If(lane.overflow):                  # internal lane->FIR FIFO
+                m.d.comb += lane_ovf.eq(1)
             fifos.append(f)
+        m.d.comb += self.overflow.eq(self.framer.overflow | lane_ovf)
 
         # ---- round-robin collector: serialize lanes into the AM back-end ----
         rr = Signal(range(max(2, self.n_lanes)))
