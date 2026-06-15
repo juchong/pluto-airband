@@ -24,3 +24,6 @@ hdl/out/
 
 # OS / editor cruft
 .DS_Store
+
+# Built firmware images (large binaries)
+firmware/images/
