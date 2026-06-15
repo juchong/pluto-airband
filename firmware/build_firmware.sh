@@ -58,6 +58,14 @@ echo "== patching devicetree =="
 python3 "$AIRBAND_REPO/firmware/apply_airband_devicetree.py" \
     linux/arch/arm/boot/dts/zynq-pluto-sdr-maiasdr.dtsi
 
+# 3b. Auto-start airband: append --airband to the maia-httpd init script so the
+#     receiver + audio stream come up on boot (idempotent).
+S60=buildroot/board/pluto/S60maia-httpd
+if [ -f "$S60" ] && ! grep -q -- '--airband' "$S60"; then
+    sed -i 's#--ca-cert /mnt/jffs2/maia-sdr-ca.crt#--ca-cert /mnt/jffs2/maia-sdr-ca.crt --airband#' "$S60"
+    echo "== patched $S60: maia-httpd now auto-starts with --airband =="
+fi
+
 # 4. Stage the prebuilt bitstream for HAVE_VIVADO=0 injection.
 cp "$XSA" "$FW/system_top_airband.xsa"
 

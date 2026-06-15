@@ -7,13 +7,15 @@ ADALM-Pluto and pull per-channel audio on the host.
 
 - **FPGA bitstream**: Maia SDR base (spectrometer + recorder + DDC) **plus** the
   21-channel airband receiver (`maia_hdl` `ReceiverTop`) and a **cyclic**
-  `DmaStreamWrite` that streams 64-bit framed audio records into the top 16 MiB
-  of DDR as a hardware ring. Timing-closed at 62.5 MHz (WNS +0.305 ns).
+  `DmaStreamWrite` that streams 64-bit framed audio records into a 16 MiB DDR
+  hardware ring. Timing-closed at 62.5 MHz.
 - **Devicetree**: a `maia_sdr_airband` reserved-memory region
-  (`0x1f000000`, 16 MiB) + a `maia-sdr,rxbuffer` node → `/dev/maia-sdr-airband`.
+  (`0x19000000`, 16 MiB) + a `maia-sdr,rxbuffer` node → `/dev/maia-sdr-airband`.
+  (Relocated from the original `0x1f000000`, which collided with the kernel CMA
+  pool and bricked the device — see `DEV-SETUP.md`.)
 - **maia-httpd**: configures the AD9361 front-end + per-channel NCOs, starts the
   cyclic DMA, drains the ring and serves the **raw framed-audio records over TCP**
-  (default `0.0.0.0:30000`).
+  (default `0.0.0.0:30000`). Auto-starts on boot with `--airband`.
 
 Frame layout (little-endian 64-bit word, see `hdl/audio_framer.py`):
 
@@ -27,32 +29,47 @@ bits [63:40] per-channel sequence counter (wraps at 2**24; gap = dropped samples
 
 Prereqs (already provisioned on `xilinx-builder`, see `DEV-SETUP.md`):
 `plutosdr-fw` clone, the `maia-sdr-devel` Docker image, the `vivado2023_2`
-volume, and a prebuilt cyclic-DMA `system_top.xsa`
-(`make -C maia-sdr/maia-hdl/projects/pluto`).
+volume, and this repo at `~/pluto-build/airband` (maia-sdr fork at its
+`maia-sdr/`).
+
+There are two build scripts:
 
 ```bash
-# this repo checked out at ~/pluto-build/airband, maia-sdr fork at its maia-sdr/
-bash firmware/build_firmware.sh
-# -> ~/pluto-build/plutosdr-fw/build/pluto.frm  and  pluto.dfu
+# FULL build (HAVE_VIVADO=1): rebuilds the bitstream + FSBL + kernel + rootfs.
+# Produces BOTH partitions: boot.{frm,dfu} (mtd0) and pluto.{frm,dfu} (mtd3).
+# Use this for ANY HDL/block-design change. ~30-60 min.
+bash firmware/build_firmware_full.sh
+
+# FIT-only build (HAVE_VIVADO=0): rebuilds only pluto.{frm,dfu} (mtd3) from a
+# prebuilt XSA. Fast (~5-10 min, no Vivado) but ONLY valid when the bitstream
+# and FSBL are unchanged (e.g. a maia-httpd / devicetree / init-script tweak).
+XSA=~/pluto-build/system_top_airband.xsa bash firmware/build_firmware.sh
+# -> ~/pluto-build/plutosdr-fw/build/{boot,pluto}.{frm,dfu}
 ```
 
-The script splices the `pluto-airband` maia-sdr fork into `plutosdr-fw`, patches
-the devicetree, and builds with `HAVE_VIVADO=0` using the prebuilt bitstream (so
-the container needs neither Vivado nor numpy/scipy).
+Both scripts splice the `pluto-airband` maia-sdr fork into `plutosdr-fw`, patch
+the devicetree (airband reserved-memory at `0x19000000`), and patch
+`S60maia-httpd` so the receiver auto-starts with `--airband`.
+
+> **Why two partitions matter:** the **bitstream and FSBL live in `BOOT.BIN`
+> (`boot.frm`, `mtd0`)**, not in `pluto.frm`. A FIT-only build never updates the
+> PL. Flashing only `pluto.dfu` after an HDL change leaves the old bitstream /
+> HP0-disabled FSBL running → airband register aliasing + DMA hang + watchdog
+> reset. See `DEV-SETUP.md`.
 
 ## 2. Flash the Pluto
 
-```bash
-# DFU (recommended), Pluto in DFU mode:
-dfu-util -a firmware.dfu -D pluto.dfu
-dfu-util -a firmware.dfu -R -D pluto.dfu     # -R reboots
+Put the Pluto in DFU mode (power on holding the button until the LED blinks
+slowly), then flash. After an HDL change flash **both** partitions, `boot` first:
 
-# or mass-storage: copy pluto.frm onto the PlutoSDR USB drive, then eject
+```bash
+dfu-util -a boot.dfu     -D boot.dfu     # mtd0: FSBL + bitstream + u-boot
+dfu-util -a firmware.dfu -D pluto.dfu    # mtd3: kernel + DT + rootfs
+dfu-util -e                               # leave DFU / reboot
 ```
 
-The bootloader (`boot.frm`) is **not** changed by this image, so a standard
-`v0.8.x` Maia/Pluto bootloader is required (already present on a Maia-flashed
-Pluto).
+For a FIT-only change (no HDL change) flash just `pluto.dfu`. Mass-storage
+alternative: copy the `.frm` file(s) onto the PlutoSDR USB drive and eject.
 
 ## 3. (optional) Channel plan
 
@@ -92,8 +109,8 @@ The three "sources of truth" for the airband DDR ring must agree:
 
 | Source | Value |
 |---|---|
-| FPGA `MaiaSDRConfig.airband_address_range` | `(0x1f000000, 0x20000000)` |
-| Devicetree `maia_sdr_airband` `reg` | `<0x1f000000 0x01000000>` |
+| FPGA `MaiaSDRConfig.airband_address_range` | `(0x19000000, 0x1a000000)` |
+| Devicetree `maia_sdr_airband` `reg` | `<0x19000000 0x01000000>` |
 | kmod `rxbuffer` `buffer-size` | `0x10000` (→ 256 ring slots) |
 
 `apply_airband_devicetree.py` sets the DT side; `firmware/airband.json` and the

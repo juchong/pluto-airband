@@ -27,3 +27,7 @@ hdl/out/
 
 # Built firmware images (large binaries)
 firmware/images/
+firmware/build/
+
+# Rust build artifacts (host reader)
+target/

@@ -22,26 +22,25 @@ cocotb/Icarus simulations.
 | Python deps | `.venv` (see `requirements-dev.*`) | Amaranth, cocotb, numpy, scipy |
 | `libiio` 0.25 / `iio_info` | built from source → `~/.local` | talk to the Pluto over USB |
 
-### Upstream dependencies (read-only, pinned by SHA)
+### Upstream dependencies
 
-We **build on top of** Maia SDR and do not fork or modify it. The clones below are
-external dependencies — they are git-ignored by this project and pinned to the
-commits we validated against. `maia_hdl` can also be used as a library
-(`pip install maia-hdl`) in our own Amaranth designs.
+We **build on top of** Maia SDR. The airband DSP/DMA/control changes live in our
+**fork** of `maia-sdr` (`maia-hdl` HDL + `maia-httpd` control daemon); the
+firmware assembler `plutosdr-fw` stays at the Maia pin and we splice our fork in
+at build time (see [airband firmware build](#airband-firmware-build-boot--pluto)).
 
-| Repo | Pinned commit | Notes |
+| Repo | Source / pin | Notes |
 |---|---|---|
-| `maia-sdr` | `c96c496a63d720912fcd56e530b905c8bc2c6c84` (2026-04-27, `main`) | primary foundation (DDC, FFT, DMA) |
+| `maia-sdr` (our fork) | `github.com/juchong/maia-sdr`, branch **`pluto-airband`** | airband DDC/decimation/AM, cyclic airband DMA @ `0x1900_0000`, `maia-httpd` airband control + framed-audio TCP stream |
 | └ submodule `XilinxUnisimLibrary` | `1c8e05fd1e9a79ceb8b996a0996674122eed086f` | **initialized** — cocotb tests need `DSP48E1.v`, `FIFO18E1.v`, `glbl.v` |
-| └ submodule `adi-hdl` | `065c8f186ef87ff049d279ed5859ee8d97d91808` | **NOT initialized here** — only used by the Vivado bitstream build on the x86 server; large |
-| `plutosdr-fw` | `7d4cfda89bef67f9e3c2fb8bd196bd4f49698799` (v0.8.2, 2025-11-09) | Maia fork; submodules (linux/hdl/buildroot/u-boot) only needed on build server |
+| └ submodule `adi-hdl` | `065c8f186ef87ff049d279ed5859ee8d97d91808` | needed by the Vivado bitstream build on the x86 server; large |
+| `plutosdr-fw` | `7d4cfda89bef67f9e3c2fb8bd196bd4f49698799` (v0.8.2, 2025-11-09) | Maia fork; submodules (linux/hdl/buildroot/u-boot) only needed on build server. Our fork is spliced into `plutosdr-fw/maia-sdr` at build time. |
 
-Recreate the clones:
+Recreate the clones (Mac dev box — the fork is the working tree for `maia-sdr`):
 
 ```bash
 cd /Users/juanjchong/Documents/GitHub/pluto-airband
-git clone https://github.com/maia-sdr/maia-sdr.git
-git -C maia-sdr checkout c96c496a63d720912fcd56e530b905c8bc2c6c84
+git clone -b pluto-airband https://github.com/juchong/maia-sdr.git
 git -C maia-sdr submodule update --init --depth 1 maia-hdl/XilinxUnisimLibrary
 git clone https://github.com/maia-sdr/plutosdr-fw.git
 git -C plutosdr-fw checkout 7d4cfda89bef67f9e3c2fb8bd196bd4f49698799
@@ -121,10 +120,13 @@ x86-64 Linux host (`pluto-airband-fpga.md` §5.1).
   single biggest gotcha: host `administrator` (uid 1000) maps to **container
   root**, so the firmware build container must run as **`DOCKER_USER=0:0`** (not
   `$(id -u):$(id -g)` as upstream docs assume) to own the bind-mounted source.
-- Source at `~/pluto-build/plutosdr-fw` — `plutosdr-fw` v0.8.2 (`7d4cfda`) cloned
-  recursively (`maia-sdr`, `buildroot`, `linux`, `u-boot-xlnx`, `IQEngine` + nested
-  `adi-hdl`). `plutosdr-fw` pins `maia-sdr` at `c96c496` — same SHA as the Mac dev
-  pin, so HDL versions are consistent.
+- Source layout under `~/pluto-build/`:
+  - `airband/` — clone of **this** repo (the airband fork + build scripts). The
+    `maia-sdr` fork (`pluto-airband` branch) lives at `airband/maia-sdr`.
+  - `plutosdr-fw/` — `plutosdr-fw` v0.8.2 (`7d4cfda`) cloned recursively
+    (`buildroot`, `linux`, `u-boot-xlnx`). Its bundled `maia-sdr` submodule is
+    **replaced** by an rsync of `airband/maia-sdr` at build time, so the
+    bitstream + `maia-httpd` are built from our fork, not the upstream pin.
 
 ### Vivado / Vitis 2023.2
 
@@ -164,6 +166,64 @@ This runs `build-docker.sh` in the devel image (sources Vivado/Vitis/Vitis_HLS,
 runs `make` under an `Xvfb` display for `xsct`). With Vivado present it does the
 full from-source bitstream (`HAVE_VIVADO=1`). Artifacts land in
 `plutosdr-fw/build/` (`.frm`/`.dfu`, `boot.frm`, `system_top.xsa`, etc.).
+
+### Airband firmware build (`boot.*` + `pluto.*`)
+
+`firmware/build_firmware_full.sh` (in this repo) wraps the stock build for the
+airband fork. It (1) splices `airband/maia-sdr` into `plutosdr-fw/maia-sdr`, (2)
+applies the airband reserved-memory devicetree patch
+(`firmware/apply_airband_devicetree.py`), then (3) runs the **full
+`HAVE_VIVADO=1`** build:
+
+```bash
+# on the build server
+cd ~/pluto-build/airband
+bash firmware/build_firmware_full.sh        # ~30–60 min (Vivado synth/PAR + kernel + rootfs)
+```
+
+Produces in `plutosdr-fw/build/`:
+
+| Artifact | Contents | Flash target / MTD |
+|---|---|---|
+| `boot.frm` / `boot.dfu` | `BOOT.BIN` = **FSBL + bitstream + U-Boot** | `mtd0` (DFU alt `boot.dfu`) |
+| `pluto.frm` / `pluto.dfu` | FIT = kernel + **devicetree** + rootfs (+ bitstream copy) | `mtd3` (DFU alt `firmware.dfu`) |
+
+> **Critical lesson (the source of the airband bricking/reset saga):** the
+> **bitstream and the FSBL live in `BOOT.BIN` (`boot.frm`, `mtd0`)**, *not* in
+> `pluto.frm`. A `HAVE_VIVADO=0` build only regenerates `pluto.frm` (FIT/`mtd3`),
+> so the PL keeps running the **old bitstream + old FSBL**. Symptoms when the
+> kernel/DT are new but `BOOT.BIN` is old: airband registers alias to the control
+> block (old PL lacks the airband register page) and the AXI-HP DMA hangs →
+> watchdog hard-reset (old FSBL leaves `S_AXI_HP0` disabled). **Always rebuild
+> and flash `boot.dfu` whenever the HDL/block design changes.**
+
+`firmware/build_firmware.sh` is the FIT-only (`HAVE_VIVADO=0`) shortcut — fast,
+but **only valid when the bitstream/FSBL are unchanged**. Use the full build
+above for any HDL change.
+
+### Memory map (why airband is at `0x1900_0000`)
+
+The airband DMA ring must live in a devicetree `no-map` reserved region that does
+**not** collide with the kernel CMA pool (the original `0x1f00_0000` choice
+bricked the device). It is now carved out of the recorder region:
+
+- recorder: `0x0100_0000 – 0x1900_0000`
+- airband ring: `0x1900_0000 – 0x1a00_0000` (16 MiB)
+
+These are set in `maia-sdr/maia-hdl/maia_hdl/config.py` (`airband_address_range`,
+`recorder_address_range`) and mirrored by `apply_airband_devicetree.py`. The DMA
+start/end addresses are **baked into the bitstream** (`DmaStreamWrite`), so
+changing them requires a bitstream rebuild (`boot.dfu`), not just a DT edit.
+
+### Flash both partitions over DFU
+
+Put the Pluto in DFU mode, then flash **both** images (order: boot first):
+
+```bash
+dfu-util -a boot.dfu     -D plutosdr-fw/build/boot.dfu
+dfu-util -a firmware.dfu -D plutosdr-fw/build/pluto.dfu
+# then: dfu-util -e   (or power-cycle) to leave DFU mode
+```
 
 ### Out-of-context (OOC) module synthesis — real utilization vs Yosys
 
@@ -255,11 +315,30 @@ export PKG_CONFIG_PATH="$HOME/.local/lib/pkgconfig:$PKG_CONFIG_PATH"
 Verify: `iio_info --version` → `0.25 ... backends: xml ip usb`. With no Pluto
 attached, `iio_info -s` prints "No IIO context found" (expected).
 
-## Still TODO before hardware bring-up
+## Status / bring-up
 
-- Add `~/.local/bin` to your shell PATH (see above) for convenient access.
+- ~~Add `~/.local/bin` to your shell PATH (see above) for convenient access.~~
 - ~~Stand up the x86-64 build server and do a clean from-source bitstream build
-  of unmodified Maia SDR (handoff §7 step 1).~~ **Done** — server provisioned,
-  Vivado 2023.2 installed, bitstream built (timing met), base PL usage measured
+  of unmodified Maia SDR.~~ **Done** — server provisioned, Vivado 2023.2
+  installed, bitstream built (timing met), base PL usage measured
   (LUT 5416/17600, FF 6493/35200, BRAM 29/60, DSP 18/80). See `PROGRESS.md`.
-- Flash the baseline Maia image (`build/pluto.dfu`) to a Pluto (§7 step 3).
+- ~~Flash the baseline Maia image to a Pluto.~~ **Done** — baseline Maia verified
+  on hardware.
+- ~~Build the airband bitstream (channelizer + cyclic airband DMA) and integrate
+  into `maia_sdr`.~~ **Done** — `pluto-airband` fork, timing met.
+- ~~First airband firmware flash bricked the device (CMA collision at
+  `0x1f00_0000`).~~ **Fixed** — airband ring relocated to `0x1900_0000`; cause
+  confirmed with a minimal build.
+- ~~Airband enable caused watchdog resets / no DMA after flashing only
+  `pluto.dfu`.~~ **Root-caused + fixed** — `BOOT.BIN`/`mtd0` (old bitstream + FSBL
+  with HP0 disabled) was never reflashed; the full `HAVE_VIVADO=1` build
+  (`boot.dfu` + `pluto.dfu`) was flashed and the receiver now runs.
+- ~~Verify the airband register page + cyclic DMA on hardware.~~ **Done
+  (2026-06-15)** — register page decodes correctly (no aliasing), cyclic DMA
+  advances, all 21 channels stream gap-free over TCP `:30000` (per-channel seq
+  delta = 1), no watchdog reset.
+- ~~Enable airband auto-start.~~ **Done** — `S60maia-httpd` patched to launch
+  `maia-httpd --airband`; verified the receiver comes up automatically on boot.
+
+**The end-to-end receiver is live on hardware.** Remaining work is signal-quality
+tuning (antenna, gain/AGC, `--shift`) and the LiveATC feeder integration.

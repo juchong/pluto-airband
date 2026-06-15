@@ -9,12 +9,12 @@ Authoritative spec: `pluto-airband-fpga.md`. Environment details: `DEV-SETUP.md`
 |---|---|
 | 1. x86 build server bring-up (bitstream build of unmodified Maia) | **done** (Vivado 2023.2; from-source bitstream built, timing met; base PL usage measured) |
 | 2. Mac dev env (Amaranth, cocotb/Icarus, Rust, libiio+dfu-util) | **done** |
-| 3. Flash baseline Maia to Pluto | not started |
+| 3. Flash baseline Maia to Pluto | **done** (baseline verified, then airband image flashed) |
 | 4. Channelizer feasibility (GATE) | **GO** (confirmed vs measured base; 22 ch = 21 core + 1 deferred, fit) |
 | 5. AM demod block | **done** (envelope mag + DC-block + audio decimate, chain verified) |
-| 6. Single-channel end-to-end | blocked on hardware (needs a Pluto) |
-| 7. Multi-channel | **in progress** (integrated channelizer core placed+routed, meets 62.5 MHz; lane replication + top-level integration remain) |
-| 8. Pi streamer | not started |
+| 6. Single-channel end-to-end | **done** (verified on hardware as part of the 21-ch stream) |
+| 7. Multi-channel | **done** — 21 channels live on hardware, gap-free TCP stream, auto-start |
+| 8. Pi streamer | host reader done (`host/airband-reader`); LiveATC feeder integration pending |
 | 9. Hardening | not started |
 
 ## Done
@@ -378,21 +378,48 @@ maia-httpd** (no IIO device), reader in **Rust**.
   fork into `plutosdr-fw`, patches the DT, and builds `pluto.frm`/`.dfu` with
   `HAVE_VIVADO=0` + the prebuilt cyclic-DMA xsa (no Vivado/numpy/scipy needed in
   the container).
-- Addressing invariant reconciled: HDL `airband_address_range (0x1f000000,
-  0x20000000)` == DT `reg <0x1f000000 0x01000000>`, slot `0x10000`.
+- Addressing invariant reconciled: HDL `airband_address_range` == DT
+  `maia_sdr_airband` `reg`, slot `0x10000` (see hardware bring-up below for the
+  final relocated address).
+
+### Hardware bring-up — DONE (2026-06-15, receiver live on a real Pluto)
+First flash bricked the Pluto: the airband reserved-memory node at `0x1f000000`
+**collided with the kernel CMA pool** (`cma: Reserved 16 MiB at 0x1f000000`),
+so the kernel never came up.
+- **Memory-map fix:** relocated the airband DDR ring out of the CMA region by
+  carving it from the recorder area — recorder `0x01000000–0x19000000`, **airband
+  ring `0x19000000–0x1a000000` (16 MiB)**. Updated `config.py`
+  (`airband_address_range`/`recorder_address_range`, `DmaStreamWrite` bakes the
+  addresses into the bitstream) and `apply_airband_devicetree.py` (DT `reg` +
+  recorder shrink). Confirmed the diagnosis with a minimal no-Vivado build, then
+  did the full fix.
+- **Second bug — resets/aliasing on `--airband`:** after relocating, enabling
+  airband still caused watchdog resets and the DMA never advanced. **Root cause:**
+  the `HAVE_VIVADO=0` build only updates `pluto.frm` (FIT/`mtd3`), **never
+  `boot.frm` (`BOOT.BIN`/`mtd0`, which holds the bitstream + FSBL)**. The device
+  ran the new kernel/DT on the *old* PL: airband register page aliased to the
+  control block, and `S_AXI_HP0` was disabled in the old FSBL → AXI hang →
+  watchdog. **Fix:** full `HAVE_VIVADO=1` build (`firmware/build_firmware_full.sh`)
+  producing a matched `boot.dfu` + `pluto.dfu`; flash **both** partitions.
+- **Verified on hardware after flashing both partitions:** clean boot (no
+  panic/watchdog), `maia_sdr_airband@19000000` reserved node present, airband
+  register page decodes correctly (no aliasing, FPGA magic `"maia"`), enabling
+  `--airband` does **not** reset, cyclic DMA advances, **all 21 channels stream
+  gap-free over TCP `:30000`** (per-channel seq delta = 1, 0 drops, ~15 625 sps
+  matching `14 MHz/128/7`).
+- **Auto-start:** patched `buildroot/board/pluto/S60maia-httpd` (baked into both
+  build scripts) so `maia-httpd` launches with `--airband` on boot; rebuilt
+  `pluto.dfu` (FIT-only) and verified the receiver comes up automatically after a
+  power cycle. Full DFU/MTD details: `DEV-SETUP.md`, `firmware/README.md`.
 
 ## Next steps
-- §8.2 capture window **resolved**: center 123.438 MHz, Fs ≈ 14 MHz, **6 lanes**
-  (chans_per_lane=4) for the 21 core channels (`hdl/capture_window.py`,
-  `hdl/realtime_budget.py`); 133.65 MHz deferred.
-- **Build full-design bitstream on the server** (`projects/pluto`, `default`
-  config): generate `maia_sdr.v` (build env needs numpy + scipy now), package IP,
-  run `system_bd.tcl`, place+route → whole-design **timing (62.5 MHz) + resource**
-  numbers for the Z-7010. Watch DSP48 (6 lanes × mixer/FIR) and BRAM headroom.
-- **maia-pac**: regenerate from the new SVD so userspace gets the `airband`
-  register accessors; then a PS-side reader for the framed 64-bit audio ring.
-- Firmware image + flash; bring one real channel up end-to-end on a Pluto.
-- (Blocked on hardware) §7 step 3/6: flash baseline Maia (`build/pluto.dfu`) and
-  bring up one real channel end-to-end on a Pluto.
-- (Blocked on hardware) §7 step 3/6: flash baseline Maia (`build/pluto.dfu`) and
-  bring up one real channel end-to-end on a Pluto.
+- **Signal-quality tuning on real RF:** antenna + gain/AGC (`airband.json`
+  `gain_db`/`agc`) and the host `--shift` (24→16-bit) on live airband traffic.
+  Samples are currently low-level noise (no strong signal on the bench antenna).
+- **LiveATC feeder integration** (§7 step 8 / §8.6): wire `host/airband-reader`
+  per-channel audio into the LiveATC mountpoint convention (server, codec/bitrate
+  still open, §8.6).
+- **Hardening** (§7 step 9): squelch/AGC placement (§8.4), front-end BPF + FM
+  notch hygiene (§8.5), reconnection/feed supervision.
+- **Optional:** add the deferred 133.65 MHz outlier (needs Fs≈20 MHz / 8 lanes /
+  recentered LO — a separate window decision, §8.2).
