@@ -32,10 +32,26 @@ cd "$FW"
 git submodule update --init --recursive linux buildroot u-boot-xlnx
 
 # 2. Splice in our maia-sdr fork (CI pattern) and init its nested submodules.
+#    Use rsync with excludes so the multi-GB Vivado run dirs and Rust/web build
+#    outputs are not copied (HAVE_VIVADO=0 means maia-hdl is not rebuilt here).
 echo "== splicing maia-sdr fork from $FORK =="
 rm -rf maia-sdr
-cp -a "$FORK" maia-sdr
-( cd maia-sdr && git submodule update --init --recursive )
+mkdir -p maia-sdr
+rsync -a \
+    --exclude 'maia-hdl/projects/*/*.runs' \
+    --exclude 'maia-hdl/projects/*/*.cache' \
+    --exclude 'maia-hdl/projects/*/*.gen' \
+    --exclude 'maia-hdl/projects/*/*.hw' \
+    --exclude 'maia-hdl/projects/*/*.ip_user_files' \
+    --exclude 'maia-hdl/projects/*/*.sim' \
+    --exclude 'maia-hdl/projects/*/.Xil' \
+    --exclude '**/target/' \
+    --exclude '**/node_modules/' \
+    "$FORK"/ maia-sdr/
+# maia-httpd/maia-kmod/maia-wasm have no submodules; the maia-hdl Vivado
+# submodules are not needed with HAVE_VIVADO=0, so this is best-effort.
+( cd maia-sdr && git submodule update --init --recursive ) || \
+    echo "WARN: submodule update skipped (not needed for HAVE_VIVADO=0)"
 
 # 3. Add the airband reserved-memory devicetree node (idempotent).
 echo "== patching devicetree =="
