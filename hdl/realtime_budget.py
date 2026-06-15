@@ -41,7 +41,10 @@ F_S = 14.0e6           # resolved capture rate (§8.2)
 N = 21                 # core channels
 
 
-def duties(Fs, Fpl, n, cpl, lane_decim, ntaps, am_cycles=4, fir_ovh=6):
+def duties(Fs, Fpl, n, cpl, lane_decim, ntaps, am_cycles=11, fir_ovh=6):
+    # am_cycles: TdmAmBackend is pipelined one arithmetic stage per clock to
+    # close 62.5 MHz timing -> worst case (decimation boundary) is
+    # ~READ+DC+integ(S)+comb(S)+accept = 11 for S=4 (was 4 when combinational).
     n_lanes = math.ceil(n / cpl)
     base, rem = divmod(n, n_lanes)
     max_size = base + (1 if rem else 0)
