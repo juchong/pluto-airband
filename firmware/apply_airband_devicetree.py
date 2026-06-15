@@ -1,16 +1,28 @@
 #!/usr/bin/env python3
 """Idempotently add the airband reserved-memory region to the Pluto devicetree.
 
-The airband framed-audio DMA writes a continuous ring to the top 16 MiB of the
-Pluto's 512 MiB DDR (phys 0x1f000000 .. 0x20000000), matching
-``MaiaSDRConfig.airband_address_range``. The maia-sdr kernel module exposes that
-region to userspace as an ``rxbuffer`` character device (``/dev/maia-sdr-airband``)
-when a matching reserved-memory node + platform node exist in the devicetree.
+The airband framed-audio DMA writes a continuous ring to a 16 MiB DDR region
+that is *carved from the top of the maia-sdr recording region*
+(phys 0x19000000 .. 0x1a000000), matching
+``MaiaSDRConfig.airband_address_range``. This placement is deliberate: the
+kernel's default CMA region lives at the very top of usable DDR
+(0x1f000000 .. 0x20000000 on the 512 MiB Pluto), and reserving that range as
+``no-map`` collides with CMA and hangs the kernel before USB comes up. By
+carving the ring from the already-reserved recording region instead, usable RAM
+and CMA placement stay byte-for-byte identical to stock maia-sdr.
 
-This inserts both nodes into ``zynq-pluto-sdr-maiasdr.dtsi`` (the shared maia-sdr
-overlay #included by every Pluto rev's .dts), right after the existing
-``maia_sdr_recording`` / ``maia-sdr-spectrometer`` nodes. It is whitespace
-tolerant and a no-op if the airband nodes are already present.
+The maia-sdr kernel module exposes the region to userspace as an ``rxbuffer``
+character device (``/dev/maia-sdr-airband``) when a matching reserved-memory
+node + platform node exist in the devicetree.
+
+This script:
+  1. shrinks the existing ``maia_sdr_recording`` reg so it ends at the airband
+     base (0x19000000) instead of 0x1a000000, and
+  2. inserts the airband reserved-memory node + the ``maia-sdr-airband``
+     rxbuffer platform node into ``zynq-pluto-sdr-maiasdr.dtsi`` (the shared
+     maia-sdr overlay #included by every Pluto rev's .dts).
+
+It is whitespace tolerant and a no-op if the airband nodes are already present.
 
 Usage:
     apply_airband_devicetree.py <path-to-zynq-pluto-sdr-maiasdr.dtsi> [more.dtsi ...]
@@ -23,9 +35,13 @@ import re
 import sys
 import pathlib
 
-# Must match MaiaSDRConfig.airband_address_range (start, end).
-AIRBAND_BASE = 0x1F00_0000
+# Must match MaiaSDRConfig.airband_address_range (start, end) and
+# MaiaSDRConfig.recorder_address_range (which ends at AIRBAND_BASE).
+AIRBAND_BASE = 0x1900_0000
 AIRBAND_SIZE = 0x0100_0000          # 16 MiB
+# The recording region is shrunk so that it ends exactly at AIRBAND_BASE.
+RECORDING_BASE = 0x0100_0000
+RECORDING_SIZE = AIRBAND_BASE - RECORDING_BASE   # 0x18000000 (384 MiB)
 # Ring buffer slot size for the rxbuffer device (region / buffer-size = slots).
 AIRBAND_BUFFER_SIZE = 0x1_0000      # 64 KiB -> 256 slots
 
@@ -70,7 +86,7 @@ def _insert_after_block(text: str, open_re: str, new_node: str) -> str:
 
 
 RESERVED_NODE = (
-    '@OUTER@maia_sdr_airband: maia_sdr_airband@1f000000 {\n'
+    f'@OUTER@maia_sdr_airband: maia_sdr_airband@{AIRBAND_BASE:x} {{\n'
     '@INNER@no-map;\n'
     f'@INNER@reg = <{AIRBAND_BASE:#x} {AIRBAND_SIZE:#x}>;\n'
     '@INNER@label = "maia_sdr_airband";\n'
@@ -86,11 +102,27 @@ PLATFORM_NODE = (
 )
 
 
+def _shrink_recording(text: str) -> str:
+    """Shrink the maia_sdr_recording reg so it ends at AIRBAND_BASE, freeing the
+    top 16 MiB of the recording region for the airband ring."""
+    pat = re.compile(
+        r'(maia_sdr_recording@[0-9a-fA-Fx]+\s*\{[^}]*?reg\s*=\s*<)'
+        r'\s*0x[0-9a-fA-F]+\s+0x[0-9a-fA-F]+\s*(>)',
+        re.DOTALL)
+    new_reg = f'{RECORDING_BASE:#x} {RECORDING_SIZE:#x}'
+    text, n = pat.subn(rf'\g<1>{new_reg}\g<2>', text)
+    if n != 1:
+        raise SystemExit(
+            f'expected exactly one maia_sdr_recording reg to shrink, found {n}')
+    return text
+
+
 def patch(path: pathlib.Path) -> bool:
     text = path.read_text()
     if 'maia_sdr_airband' in text:
         print(f'{path}: already has airband nodes, skipping')
         return False
+    text = _shrink_recording(text)
     text = _insert_after_block(
         text,
         r'maia_sdr_recording:\s*maia_sdr_recording@[0-9a-fA-Fx]+\s*\{',
