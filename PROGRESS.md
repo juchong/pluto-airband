@@ -312,6 +312,36 @@ documented integration shim:
   airband registers, `test/test_register.py` passes. `ReceiverTop` itself stays
   bit-exact (verified separately).
 
+### Full-design bitstream build #1 (server, `projects/pluto`, default config)
+Built on `xilinx-builder` from the fork's `pluto-airband` branch (fresh clone +
+adi-hdl `065c8f1`/XilinxUnisim submodules, venv amaranth 0.5.8 / numpy 1.26.4 /
+scipy 1.15.3, Vivado 2023.2). IP packaging (both configs) + `axi_ad9361` + the
+pluto project all ran; **synth + place + route completed** (design fits the
+Z-7010), but **timing failed**:
+- **Utilization (whole design):** LUT **16279/17600 = 92.5%** (logic 72.4%,
+  mem 59%), FF 17422/35200 = 49.5%, **BRAM 48/60 = 80%**, **DSP 66/80 = 82.5%**.
+  Fits, but LUT is tight.
+- **Timing: WNS = −6.308 ns** (TNS −788.96) on `clk_out1` (62.5 MHz). Worst path:
+  `receiver/am/im_l_reg` → `receiver/am/mem5` write, **41 logic levels / 31
+  CARRY4 (~22 ns)** — `TdmAmBackend` computes `|I+jQ|` (alpha-max-beta-min) +
+  one-pole DC block + all CIC integrator stages **combinationally in one cycle**
+  before the per-channel state write.
+- **Fix:** pipeline `TdmAmBackend` across its FSM cycles (envelope → DC block →
+  CIC in separate clocked stages). The AM duty is only ~0.15 (21 ch ·
+  Fs/lane_decim · 4 / Fpl), so there is ample cycle budget to add stages and stay
+  real-time + bit-exact; mostly adds FFs (49% used), not LUTs. Then rebuild.
+
+### Full-design bitstream build #2 — TIMING MET, bitstream produced
+After pipelining `TdmAmBackend` (one arithmetic stage per cycle; bit-exact +
+overflow-free re-verified), the full `projects/pluto` build **passes**:
+- **Timing MET: WNS = +0.426 ns**, TNS 0.000, WHS +0.006 ns, 0 failing endpoints
+  (62.5 MHz `clk_out1`). (Was WNS −6.308 ns pre-pipeline.)
+- **Utilization:** LUT **16199/17600 = 92.0%**, FF 17464/35200 = 49.6%,
+  **BRAM 48/60 = 80%**, **DSP 66/80 = 82.5%**. LUT is the tight resource.
+- **Artifacts:** `pluto.runs/impl_1/system_top.bit` + `pluto.sdk/system_top.xsa`
+  on `xilinx-builder`. The 21-channel airband receiver fits the Z-7010 and meets
+  timing alongside the full Maia base (spectrometer + recorder + DDC).
+
 ## Next steps
 - §8.2 capture window **resolved**: center 123.438 MHz, Fs ≈ 14 MHz, **6 lanes**
   (chans_per_lane=4) for the 21 core channels (`hdl/capture_window.py`,
