@@ -141,20 +141,29 @@ def _stress(cpl=3, lane_decim=64, ntaps=63, audio_decim=4, n_channels=6,
     sim.add_testbench(bench)
     sim.run()
 
-    # bit-exact check (per channel) against the model, plus no overflow
+    # bit-exact check (per channel) against the model, plus no overflow.
+    # IMPORTANT: also require the HW to emit ~all the model's audio samples. A
+    # lane that silently drops inputs (the half-rate / 2x-detune bug) produces
+    # HALF as many audio samples; comparing only a min-length prefix would mask
+    # that (and the prefix would itself mismatch once tuning differs). We assert
+    # both full-prefix bit-exactness AND that no more than the final in-flight
+    # frame is missing per channel.
     per = {c: [] for c in range(n_channels)}
     for w in words:
         _, chan, sample = AudioFramer.unpack(w)
         per[chan].append(sample)
     ref = dut.model(samples, freqs)
     bit_ok = True
+    complete = True
     for c in range(n_channels):
         g = np.array(per[c], np.int64)
         e = ref[c]
         kk = min(len(g), len(e))
         if kk == 0 or not np.array_equal(g[:kk], e[:kk]):
             bit_ok = False
-    return dut, gap, audio_decim, (not overflowed[0]), bit_ok, len(words)
+        if len(g) < len(e) - 1:          # dropped inputs -> too few audio samples
+            complete = False
+    return dut, gap, audio_decim, (not overflowed[0]), bit_ok and complete, len(words)
 
 
 def main():
@@ -171,11 +180,23 @@ def main():
     # (1) a budget-fitting config: must stay overflow-free AND bit-exact
     dut, gap, ad, no_ovf, bit_ok, nwords = _stress(
         cpl=3, lane_decim=64, ntaps=63, audio_decim=4)
-    print(f"  [fits]   {dut.n_channels} ch / {dut.n_lanes} lanes, decim=64, "
+    print(f"  [fits]   {dut.n_channels} ch / {dut.n_lanes} lanes, cpl=3, decim=64, "
           f"63-tap, gap={gap} -> {nwords} records, overflow-free={no_ovf}, "
-          f"bit-exact={bit_ok}")
+          f"bit-exact+complete={bit_ok}")
     assert no_ovf, "FIFO overflow at real-time cadence: parameters do not fit"
-    assert bit_ok, "framed audio not bit-exact under real-time cadence"
+    assert bit_ok, "framed audio not bit-exact/complete under real-time cadence"
+
+    # (1b) the DEPLOYMENT lane size (chans_per_lane=4) at the true cadence. This
+    #      is the config that ships; the pipelined lane must accept EVERY input
+    #      (no half-rate drop) and stay bit-exact. With the old ~busy gate this
+    #      case dropped every other sample (and would now fail bit-exact+complete).
+    dut, gap, ad, no_ovf, bit_ok, nwords = _stress(
+        cpl=4, lane_decim=64, ntaps=63, audio_decim=4, n_channels=8)
+    print(f"  [deploy] {dut.n_channels} ch / {dut.n_lanes} lanes, cpl=4, decim=64, "
+          f"63-tap, gap={gap} -> {nwords} records, overflow-free={no_ovf}, "
+          f"bit-exact+complete={bit_ok}")
+    assert no_ovf, "FIFO overflow at real-time cadence (cpl=4): parameters do not fit"
+    assert bit_ok, "cpl=4 lane dropped inputs at the true cadence (half-rate bug)"
 
     # (2) negative control: an over-budget config (FIR too slow, duty>1) MUST
     #     trip the overflow detector -- proves the detector actually fires.

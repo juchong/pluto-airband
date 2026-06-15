@@ -84,6 +84,20 @@ $BIN 192.168.2.1:30000 --mode raw --out-dir pcm --shift 6
 Tune `--shift` on live traffic: it right-shifts the 24-bit sample to 16-bit — too
 small clips, too large is quiet (default 8).
 
+### Audition channels live (testing)
+
+To listen to a channel on your speakers and flip between frequencies in real time:
+
+```bash
+cargo build --release --manifest-path host/airband-listen/Cargo.toml
+host/airband-listen/target/release/airband-listen 192.168.2.1:30000
+```
+
+Interactive keys: `↑/↓` (or `j`/`k`, `[`/`]`) step channels, type a number then
+`Enter` to jump, `+`/`-` adjust gain (airband audio is quiet — start by raising it),
+`m` mutes, `q` quits. The display shows a live level meter and cumulative dropped
+samples per channel, so it doubles as a quick link-health check.
+
 ## Customizing the channel plan
 
 The receiver reads `/root/airband.json` on the Pluto at startup; if absent it uses
@@ -122,6 +136,7 @@ ssh root@192.168.2.1 /etc/init.d/S60maia-httpd restart
 | `hdl/` | Amaranth HDL DSP blocks (channelizer, AM demod, framer) + sims; see `hdl/README.md` |
 | `firmware/` | Build scripts, devicetree patch, channel-plan template, flashing guide (`firmware/README.md`) |
 | `host/airband-reader/` | Rust host reader: demux, drop detection, WAV/raw output |
+| `host/airband-listen/` | Rust interactive listener: play one channel live, switch on the fly |
 | `maia-sdr/` | our Maia SDR fork (gitignored here; the airband HDL + `maia-httpd` integration) |
 | `plutosdr-fw/` | Pluto firmware assembler (gitignored; pinned upstream) |
 | `pluto-airband-fpga.md` | the authoritative project spec |
