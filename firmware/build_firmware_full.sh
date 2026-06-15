@@ -32,6 +32,12 @@ cd "$FW"
 # 1. Firmware submodules (kernel/buildroot/u-boot).
 git submodule update --init --recursive linux buildroot u-boot-xlnx
 
+# 1b. Ensure the fork's HDL submodules (adi-hdl, XilinxUnisimLibrary) are checked
+#     out: the container rebuilds the bitstream from these working-tree sources.
+git -C "$FORK" submodule update --init --recursive maia-hdl 2>/dev/null || \
+    git -C "$FORK" submodule update --init --recursive 2>/dev/null || \
+    echo "WARN: could not init fork submodules; assuming they are already present"
+
 # 2. Splice in our maia-sdr fork. Keep the HDL sources (adi-hdl etc.) so the
 #    container can rebuild the bitstream; only drop the heavy Vivado run dirs
 #    and Rust/web build outputs (those regenerate).
@@ -77,6 +83,13 @@ fi
 echo "== full firmware+bitstream build in container (this takes a while) =="
 DOCKER_USER="${DOCKER_USER:-0:0}" TARGET="$TARGET" \
     docker compose run --rm build
+
+# Save the freshly-built bitstream XSA so the fast FIT-only path
+# (build_firmware.sh) can reuse it without rebuilding the bitstream.
+if [ -f "$FW/build/system_top.xsa" ]; then
+    cp "$FW/build/system_top.xsa" "$HOME/pluto-build/system_top_airband.xsa"
+    echo "== saved XSA -> $HOME/pluto-build/system_top_airband.xsa =="
+fi
 
 echo "== artifacts =="
 ls -la "$FW"/build/boot.frm "$FW"/build/boot.dfu \

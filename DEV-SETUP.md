@@ -127,6 +127,36 @@ x86-64 Linux host (`pluto-airband-fpga.md` §5.1).
     (`buildroot`, `linux`, `u-boot-xlnx`). Its bundled `maia-sdr` submodule is
     **replaced** by an rsync of `airband/maia-sdr` at build time, so the
     bitstream + `maia-httpd` are built from our fork, not the upstream pin.
+  - `system_top_airband.xsa` — the bitstream XSA saved by the last full build;
+    consumed by the fast FIT-only rebuild (`build_firmware.sh`).
+
+### Bootstrap the server from scratch
+
+On a fresh x86-64 Ubuntu host with Docker (rootless) installed:
+
+```bash
+mkdir -p ~/pluto-build && cd ~/pluto-build
+
+# 1. This repo (build scripts, devicetree patch, channel-plan template).
+git clone https://github.com/juchong/pluto-airband.git airband
+
+# 2. The maia-sdr fork (airband HDL + maia-httpd), INTO airband/maia-sdr.
+#    (This repo git-ignores maia-sdr/, so the fork is a separate clone living
+#    there.) Init its HDL submodules — the bitstream build needs adi-hdl +
+#    XilinxUnisimLibrary working-tree sources.
+git clone -b pluto-airband https://github.com/juchong/maia-sdr.git airband/maia-sdr
+git -C airband/maia-sdr submodule update --init --recursive maia-hdl
+
+# 3. plutosdr-fw (firmware assembler), pinned, recursive.
+git clone https://github.com/maia-sdr/plutosdr-fw.git
+git -C plutosdr-fw checkout 7d4cfda89bef67f9e3c2fb8bd196bd4f49698799
+git -C plutosdr-fw submodule update --init --recursive linux buildroot u-boot-xlnx
+```
+
+Then install Vivado/Vitis 2023.2 and create the `vivado2023_2` volume (below).
+The build scripts handle the fork splice, devicetree patch, init-script
+auto-start patch, and submodule init automatically — you do not edit
+`plutosdr-fw` by hand.
 
 ### Vivado / Vitis 2023.2
 
@@ -224,6 +254,69 @@ dfu-util -a boot.dfu     -D plutosdr-fw/build/boot.dfu
 dfu-util -a firmware.dfu -D plutosdr-fw/build/pluto.dfu
 # then: dfu-util -e   (or power-cycle) to leave DFU mode
 ```
+
+## Reproduce the build pipeline from scratch (end-to-end)
+
+The whole flow, assuming the server is [bootstrapped](#bootstrap-the-server-from-scratch)
+and Vivado + the `vivado2023_2` volume are in place:
+
+```bash
+# --- on the build server ---------------------------------------------------
+cd ~/pluto-build/airband
+git pull && git -C maia-sdr pull          # get latest airband sources
+
+# FULL build (rebuilds bitstream + FSBL + kernel + rootfs; ~30-60 min).
+# Produces plutosdr-fw/build/{boot,pluto}.{frm,dfu} and saves the XSA.
+bash firmware/build_firmware_full.sh
+
+# Fast follow-up FIT-only rebuilds (software/DT/channel-plan only, ~5-10 min,
+# reuses the saved bitstream; only pluto.{frm,dfu} change):
+bash firmware/build_firmware.sh
+
+# --- copy artifacts to the machine with the Pluto -------------------------
+scp <server>:~/pluto-build/plutosdr-fw/build/{boot,pluto}.dfu firmware/build/
+
+# --- flash (Pluto in DFU mode) --------------------------------------------
+cd firmware/build
+dfu-util -a boot.dfu     -D boot.dfu      # mtd0: bitstream + FSBL + u-boot
+dfu-util -a firmware.dfu -D pluto.dfu     # mtd3: kernel + DT + rootfs
+dfu-util -e
+```
+
+Which script to run:
+
+| Change | Script | Flash |
+|---|---|---|
+| Any HDL / block-design / address-map change | `build_firmware_full.sh` | `boot.dfu` **and** `pluto.dfu` |
+| `maia-httpd`, devicetree, channel plan, init script | `build_firmware.sh` (after one full build exists) | `pluto.dfu` only |
+
+### Verify on hardware
+
+After boot (default `192.168.2.1`, ssh `root` / `analog`):
+
+```bash
+# clean boot + airband reserved-memory node at the relocated address
+dmesg | grep -iE 'cma|maia_sdr_airband|panic|watchdog'
+ls /proc/device-tree/reserved-memory/ | grep airband      # maia_sdr_airband@19000000
+
+# receiver auto-started with --airband, TCP stream listening
+ps w | grep '[m]aia-httpd'                                  # ... --airband
+netstat -ltn | grep :30000
+
+# airband register page decodes (not aliased): version magic, then airband regs
+busybox devmem 0x7C400000                                   # 0x6169616D ("maia")
+```
+
+Then from the host, confirm a live, gap-free 21-channel stream:
+
+```bash
+host/airband-reader/target/release/airband-reader 192.168.2.1:30000
+# expect: 21 channels, ~15625 sps each, 0 dropped samples
+```
+
+A healthy result is: clean boot (no panic/watchdog), `--airband` in the running
+`maia-httpd`, `:30000` listening, and the reader showing all 21 channels with no
+drops. (Audio is near-silent without a real airband signal on the antenna.)
 
 ### Out-of-context (OOC) module synthesis — real utilization vs Yosys
 

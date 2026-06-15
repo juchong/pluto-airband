@@ -16,15 +16,38 @@
 set -euo pipefail
 
 # --- paths (override via env) ---------------------------------------------
+# Prerequisites (see DEV-SETUP.md "Reproduce the build pipeline from scratch"):
+#   - this repo cloned to $AIRBAND_REPO (default ~/pluto-build/airband)
+#   - the maia-sdr fork (pluto-airband branch) cloned to $FORK (default
+#     $AIRBAND_REPO/maia-sdr)
+#   - plutosdr-fw cloned to $FW (default ~/pluto-build/plutosdr-fw)
+#   - a prebuilt bitstream XSA available (produced by build_firmware_full.sh and
+#     saved as ~/pluto-build/system_top_airband.xsa). This script does NOT build
+#     the bitstream; it only repacks the FIT (mtd3) around an existing one.
 AIRBAND_REPO="${AIRBAND_REPO:-$HOME/pluto-build/airband}"          # this repo
 FORK="${FORK:-$AIRBAND_REPO/maia-sdr}"                              # maia-sdr fork (pluto-airband branch)
 FW="${FW:-$HOME/pluto-build/plutosdr-fw}"                           # plutosdr-fw clone
-XSA="${XSA:-$FORK/maia-hdl/projects/pluto/pluto.sdk/system_top.xsa}"  # prebuilt cyclic-DMA xsa
 TARGET="${TARGET:-pluto}"
+
+# Resolve the prebuilt XSA: explicit $XSA, then the saved full-build artifact,
+# then the last plutosdr-fw build output, then the fork's project output.
+if [ -z "${XSA:-}" ]; then
+    for cand in \
+        "$HOME/pluto-build/system_top_airband.xsa" \
+        "$FW/build/system_top.xsa" \
+        "$FORK/maia-hdl/projects/pluto/pluto.sdk/system_top.xsa"; do
+        [ -f "$cand" ] && { XSA="$cand"; break; }
+    done
+fi
 
 echo "== plutosdr-fw at $FW =="
 [ -d "$FW" ] || { echo "ERROR: plutosdr-fw not found at $FW"; exit 1; }
-[ -f "$XSA" ] || { echo "ERROR: prebuilt xsa not found at $XSA (build the bitstream first)"; exit 1; }
+[ -n "${XSA:-}" ] && [ -f "$XSA" ] || {
+    echo "ERROR: no prebuilt XSA found. Run firmware/build_firmware_full.sh first"
+    echo "       (it builds the bitstream), or set XSA=/path/to/system_top.xsa."
+    exit 1
+}
+echo "== using prebuilt bitstream XSA: $XSA =="
 
 cd "$FW"
 
