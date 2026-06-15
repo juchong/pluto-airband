@@ -342,6 +342,45 @@ overflow-free re-verified), the full `projects/pluto` build **passes**:
   on `xilinx-builder`. The 21-channel airband receiver fits the Z-7010 and meets
   timing alongside the full Maia base (spectrometer + recorder + DDC).
 
+### Cyclic audio DMA + bitstream build #3 — TIMING MET
+The one-shot `DmaStreamWrite` (fills start→end then stops, like the recorder)
+was made into a **hardware ring** for the airband audio: `DmaStreamWrite` gains
+an opt-in `cyclic` mode (on reaching `end` it wraps the write pointer back to
+`start` and keeps running; only `stop` halts it; `finished` never pulses). The
+recorder path is unchanged (`cyclic=False`). `airband_dma` now uses `cyclic=True`.
+- **Verified** (`hdl/test_dma_cyclic.py`): pointer wraps within `[start, end)`,
+  the `end` address is never written, streams continuously, `finished` never
+  pulses. Full design elaborates clean.
+- **Server build #3 (`projects/pluto`, default):** **timing MET, WNS +0.305 ns**,
+  TNS 0.000, WHS +0.019 ns. LUT 16223/17600 = 92.2%, BRAM 48/60 = 80%,
+  DSP 66/80 = 82.5%. `system_top.bit` + `system_top.xsa` produced.
+
+### Host/PS software for the framed-audio ring — DONE (compiles + reader tested)
+Decision: keep the maia DMA, serve framed audio over the **network from
+maia-httpd** (no IIO device), reader in **Rust**.
+- **maia-pac regenerated** (`svd2rust 0.37.1`) from the new SVD → `airband_*`
+  register accessors (`airband_control/freq_addr/freq/dma_next_address`).
+- **maia-httpd `airband` module** (`maia-httpd/src/airband.rs` + `fpga.rs`
+  accessors + `args.rs`/`app.rs` wiring): configures the AD9361 (LO/Fs/BW/gain),
+  programs per-channel NCO words (`round((f−LO)/Fs·2²⁴)`), enables the receiver,
+  starts the cyclic DMA, drains `/dev/maia-sdr-airband` (reused
+  `maia-sdr,rxbuffer` device, **no kmod change**) keeping a ≥2-buffer safety lag,
+  and streams the raw 64-bit records over **TCP `0.0.0.0:30000`**. Built-in
+  21-channel default plan; optional `/root/airband.json`. `cargo check` clean.
+- **Devicetree** (`firmware/apply_airband_devicetree.py`): idempotent inserter
+  adds `maia_sdr_airband@1f000000` (16 MiB) reserved-memory + `maia-sdr,rxbuffer`
+  node (`buffer-size 0x10000` → 256 slots). Tested against the pinned dtsi.
+- **Host reader** (`host/airband-reader/`, Rust): connects to the TCP stream,
+  demuxes by channel, detects drops via the per-channel seq counter, scales
+  24→16-bit, outputs stats / per-channel WAV / raw s16; auto-reconnects.
+  Smoke-tested end-to-end (3 channels, injected drop detected exactly).
+- **Firmware build** (`firmware/build_firmware.sh` + `README.md`): splices the
+  fork into `plutosdr-fw`, patches the DT, and builds `pluto.frm`/`.dfu` with
+  `HAVE_VIVADO=0` + the prebuilt cyclic-DMA xsa (no Vivado/numpy/scipy needed in
+  the container).
+- Addressing invariant reconciled: HDL `airband_address_range (0x1f000000,
+  0x20000000)` == DT `reg <0x1f000000 0x01000000>`, slot `0x10000`.
+
 ## Next steps
 - §8.2 capture window **resolved**: center 123.438 MHz, Fs ≈ 14 MHz, **6 lanes**
   (chans_per_lane=4) for the 21 core channels (`hdl/capture_window.py`,

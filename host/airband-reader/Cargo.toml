@@ -1,0 +1,17 @@
+[package]
+name = "airband-reader"
+version = "0.1.0"
+edition = "2021"
+description = "Host-side reader for the Pluto airband framed-audio DMA stream"
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "airband-reader"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4", features = ["derive"] }
+
+[profile.release]
+lto = true
