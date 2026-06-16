@@ -87,6 +87,11 @@ is quiet (often only tens of LSB at 24-bit), so the default is **`-6`** (≈ +36
 makeup). Make it more negative if voice is too quiet, less negative (toward `0`,
 then positive) if loud signals clip.
 
+`--filter` (default **off**) applies a 300–3400 Hz voice band-pass. It is a
+diagnostic/stop-gap that masks out-of-voice-band artifacts but also degrades
+voice; the FPGA CORDIC envelope detector removes the underlying buzz at the
+source, so leave it off in normal use.
+
 ### Audition channels live (testing)
 
 To listen to a channel on your speakers and flip between frequencies in real time:
@@ -98,7 +103,8 @@ host/airband-listen/target/release/airband-listen 192.168.2.1:30000
 
 Interactive keys: `↑/↓` (or `j`/`k`, `[`/`]`) step channels, type a number then
 `Enter` to jump, `+`/`-` adjust gain (airband audio is quiet — start by raising it),
-`m` mutes, `q` quits. The display shows a live level meter and cumulative dropped
+`m` mutes, `f` toggles the diagnostic voice band-pass (off by default; see
+`--filter`), `q` quits. The display shows a live level meter and cumulative dropped
 samples per channel, so it doubles as a quick link-health check.
 
 ### Web UI (Maia spectrometer) — front-end is read-only

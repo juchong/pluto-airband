@@ -24,8 +24,11 @@
 //!   airband-reader 192.168.2.1:30000 --mode raw --out-dir pcm --shift 6
 //! ```
 
+mod filter;
+
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
+use filter::VoiceFilter;
 use std::{
     fs::{self, File},
     io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write},
@@ -76,6 +79,19 @@ struct Args {
     /// Tune on a real signal: too negative clips, too positive is silent.
     #[arg(long, default_value_t = -6, allow_hyphen_values = true)]
     shift: i32,
+    /// Enable the voice band-pass filter (OFF by default).
+    ///
+    /// Diagnostic/fallback only: a 300-3400 Hz band-pass masks out-of-voice-band
+    /// channelizer spurs (a low ~90/330 Hz hum and a ~7.6 kHz whine) but also
+    /// degrades voice. The real fix is in the DSP chain, not this filter.
+    #[arg(long)]
+    filter: bool,
+    /// Voice band-pass low corner in Hz (high-pass)
+    #[arg(long, default_value_t = 300.0)]
+    filter_low: f64,
+    /// Voice band-pass high corner in Hz (low-pass)
+    #[arg(long, default_value_t = 3400.0)]
+    filter_high: f64,
     /// Statistics print interval in seconds
     #[arg(long, default_value_t = 5)]
     stats_interval: u64,
@@ -93,6 +109,8 @@ struct Sink {
     writer: Option<BufWriter<File>>,
     is_wav: bool,
     data_bytes: u64,
+    // optional per-channel voice band-pass (applied before scaling on output)
+    filter: Option<VoiceFilter>,
     // statistics (since last report)
     interval_count: u64,
     interval_peak: i32,
@@ -103,7 +121,13 @@ struct Sink {
 }
 
 impl Sink {
-    fn new(mode: Mode, out_dir: &PathBuf, chan: usize, rate: u32) -> Result<Sink> {
+    fn new(
+        mode: Mode,
+        out_dir: &PathBuf,
+        chan: usize,
+        rate: u32,
+        filter: Option<VoiceFilter>,
+    ) -> Result<Sink> {
         let (writer, is_wav) = match mode {
             Mode::Stats => (None, false),
             Mode::Wav => {
@@ -121,6 +145,7 @@ impl Sink {
             writer,
             is_wav,
             data_bytes: 0,
+            filter,
             interval_count: 0,
             interval_peak: 0,
             total: 0,
@@ -141,16 +166,18 @@ impl Sink {
         self.interval_count += 1;
         self.interval_peak = self.interval_peak.max(sample.abs());
 
-        if let Some(w) = self.writer.as_mut() {
-            // Positive shift attenuates (right-shift); negative shift applies
-            // makeup gain (left-shift). Use i64 intermediates so the left-shift
-            // cannot overflow before the i16 clamp.
-            let scaled = if shift >= 0 {
-                i64::from(sample >> shift)
-            } else {
-                i64::from(sample) << (-shift) as u32
+        if self.writer.is_some() {
+            // Optional voice band-pass, then scale. Positive shift attenuates,
+            // negative shift applies makeup gain; done in float so it composes
+            // with the (fractional) filter output. interval_peak stays on the
+            // raw 24-bit sample so stats still report the true level.
+            let voice = match self.filter.as_mut() {
+                Some(f) => f.process(sample as f64),
+                None => sample as f64,
             };
-            let s16 = scaled.clamp(i16::MIN as i64, i16::MAX as i64) as i16;
+            let scaled = voice * 2f64.powi(-shift);
+            let s16 = scaled.round().clamp(i16::MIN as f64, i16::MAX as f64) as i16;
+            let w = self.writer.as_mut().unwrap();
             w.write_all(&s16.to_le_bytes())?;
             self.data_bytes += 2;
         }
@@ -259,7 +286,12 @@ fn main() -> Result<()> {
             .with_context(|| format!("creating output dir {:?}", args.out_dir))?;
     }
     let mut sinks = (0..args.channels)
-        .map(|c| Sink::new(args.mode, &args.out_dir, c, args.rate))
+        .map(|c| {
+            let filter = args
+                .filter
+                .then(|| VoiceFilter::new(args.rate as f64, args.filter_low, args.filter_high));
+            Sink::new(args.mode, &args.out_dir, c, args.rate, filter)
+        })
         .collect::<Result<Vec<_>>>()?;
     let mut last_report = Instant::now();
 

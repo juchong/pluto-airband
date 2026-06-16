@@ -41,10 +41,13 @@ F_S = 14.0e6           # resolved capture rate (§8.2)
 N = 21                 # core channels
 
 
-def duties(Fs, Fpl, n, cpl, lane_decim, ntaps, am_cycles=11, fir_ovh=6):
+def duties(Fs, Fpl, n, cpl, lane_decim, ntaps, am_cycles=23, fir_ovh=6):
     # am_cycles: TdmAmBackend is pipelined one arithmetic stage per clock to
     # close 62.5 MHz timing -> worst case (decimation boundary) is
-    # ~READ+DC+integ(S)+comb(S)+accept = 11 for S=4 (was 4 when combinational).
+    # ~cordic(12)+scale+DC+integ(S)+comb(S)+accept = 23 for S=4 (the CORDIC
+    # vectoring magnitude replaced the 1-cycle alpha-max-beta-min estimator to
+    # remove the AM buzz; see am_backend_tdm.py). The AM datapath is dedicated,
+    # so this only needs duty_am < 1 with margin -- it stays ~0.85 at decim=128.
     n_lanes = math.ceil(n / cpl)
     base, rem = divmod(n, n_lanes)
     max_size = base + (1 if rem else 0)

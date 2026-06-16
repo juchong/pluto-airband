@@ -17,7 +17,10 @@
 //!   0-9 then Enter      jump to a channel number (Esc cancels)
 //!   +/-                 louder / quieter
 //!   m                   mute toggle
+//!   f                   voice band-pass filter toggle (removes out-of-band buzz)
 //!   q                   quit
+
+mod filter;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -28,6 +31,7 @@ use crossterm::{
     style::{Color, Print, ResetColor, SetForegroundColor},
     terminal::{self, Clear, ClearType},
 };
+use filter::VoiceFilter;
 use rodio::{OutputStream, Sink, Source};
 use std::{
     collections::VecDeque,
@@ -75,6 +79,18 @@ struct Args {
     /// Initial playback gain (linear; airband audio is quiet, adjust with +/-)
     #[arg(long, default_value_t = 3000.0)]
     gain: f32,
+    /// Start with the voice band-pass filter ON (OFF by default; toggle with 'f').
+    ///
+    /// Diagnostic/fallback only: the 300-3400 Hz band-pass masks out-of-voice-band
+    /// channelizer spurs but degrades voice quality. The real fix is in the DSP.
+    #[arg(long)]
+    filter: bool,
+    /// Voice band-pass low corner in Hz (high-pass)
+    #[arg(long, default_value_t = 300.0)]
+    filter_low: f64,
+    /// Voice band-pass high corner in Hz (low-pass)
+    #[arg(long, default_value_t = 3400.0)]
+    filter_high: f64,
 }
 
 /// State shared between the network reader thread, the audio source, and the UI.
@@ -92,10 +108,12 @@ struct Shared {
     records: AtomicU64,
     /// Max samples to keep queued (bounds playback latency).
     max_queue: usize,
+    /// Whether the voice band-pass is applied to the played channel.
+    filter_on: AtomicBool,
 }
 
 impl Shared {
-    fn new(channels: usize, max_queue: usize, start: usize) -> Shared {
+    fn new(channels: usize, max_queue: usize, start: usize, filter_on: bool) -> Shared {
         Shared {
             selected: AtomicUsize::new(start),
             running: AtomicBool::new(true),
@@ -105,6 +123,7 @@ impl Shared {
             drops: (0..channels).map(|_| AtomicU64::new(0)).collect(),
             records: AtomicU64::new(0),
             max_queue,
+            filter_on: AtomicBool::new(filter_on),
         }
     }
 }
@@ -155,8 +174,13 @@ impl Source for ChannelSource {
 
 /// Connects (and reconnects) to the stream, demuxing records into the shared
 /// state. Runs until `shared.running` is cleared.
-fn reader_loop(shared: Arc<Shared>, addr: String, n: usize) {
+fn reader_loop(shared: Arc<Shared>, addr: String, n: usize, rate: u32, lo: f64, hi: f64) {
     let mut last_seq = vec![u32::MAX; n];
+    // Voice band-pass for the currently selected channel. Reset whenever the
+    // selection changes or the filter is toggled so we never carry stale state.
+    let mut vf = VoiceFilter::new(rate as f64, lo, hi);
+    let mut cur_sel = shared.selected.load(Ordering::Relaxed);
+    let mut cur_filter = shared.filter_on.load(Ordering::Relaxed);
     while shared.running.load(Ordering::Relaxed) {
         match TcpStream::connect(&addr) {
             Ok(stream) => {
@@ -190,8 +214,20 @@ fn reader_loop(shared: Arc<Shared>, addr: String, n: usize) {
                     let mag = (sample.unsigned_abs() as f32) / SAMPLE_SCALE;
                     atomic_max_f32(&shared.peak[chan], mag);
 
-                    if chan == shared.selected.load(Ordering::Relaxed) {
-                        let f = (sample as f32) / SAMPLE_SCALE;
+                    let sel = shared.selected.load(Ordering::Relaxed);
+                    if chan == sel {
+                        let filter_on = shared.filter_on.load(Ordering::Relaxed);
+                        if sel != cur_sel || filter_on != cur_filter {
+                            vf.reset();
+                            cur_sel = sel;
+                            cur_filter = filter_on;
+                        }
+                        let s = if filter_on {
+                            vf.process(sample as f64) as f32
+                        } else {
+                            sample as f32
+                        };
+                        let f = s / SAMPLE_SCALE;
                         let mut q = shared.audio.lock().unwrap();
                         q.push_back(f);
                         while q.len() > shared.max_queue {
@@ -235,14 +271,19 @@ fn render(shared: &Shared, n: usize, gain: f32, muted: bool, entry: &str) -> Res
     } else {
         format!("gain x{gain:.0}")
     };
+    let bpf = if shared.filter_on.load(Ordering::Relaxed) {
+        "BPF on"
+    } else {
+        "BPF off"
+    };
     queue!(
         out,
         SetForegroundColor(Color::Cyan),
         Print(format!(
-            "Pluto airband live listener — {status} — {vol} — {records} recs\r\n"
+            "Pluto airband live listener — {status} — {vol} — {bpf} — {records} recs\r\n"
         )),
         ResetColor,
-        Print("↑/↓ select   0-9+Enter jump   +/- gain   m mute   q quit\r\n\r\n"),
+        Print("↑/↓ select   0-9+Enter jump   +/- gain   m mute   f filter   q quit\r\n\r\n"),
     )?;
 
     for ch in 0..n {
@@ -295,7 +336,7 @@ fn main() -> Result<()> {
 
     // ~0.4 s of queued audio caps playback latency on channel switches.
     let max_queue = (args.rate as usize * 2) / 5;
-    let shared = Arc::new(Shared::new(n, max_queue, start));
+    let shared = Arc::new(Shared::new(n, max_queue, start, args.filter));
 
     // Audio output: keep _stream alive for the lifetime of the sink.
     let (_stream, handle) = OutputStream::try_default()
@@ -312,7 +353,8 @@ fn main() -> Result<()> {
     let reader = {
         let shared = Arc::clone(&shared);
         let addr = args.addr.clone();
-        thread::spawn(move || reader_loop(shared, addr, n))
+        let (rate, lo, hi) = (args.rate, args.filter_low, args.filter_high);
+        thread::spawn(move || reader_loop(shared, addr, n, rate, lo, hi))
     };
 
     terminal::enable_raw_mode().context("failed to enter raw terminal mode")?;
@@ -372,6 +414,10 @@ fn main() -> Result<()> {
                     KeyCode::Char('m') => {
                         muted = !muted;
                         sink.set_volume(if muted { 0.0 } else { gain });
+                    }
+                    KeyCode::Char('f') => {
+                        let now = !shared.filter_on.load(Ordering::Relaxed);
+                        shared.filter_on.store(now, Ordering::Relaxed);
                     }
                     _ => {}
                 }

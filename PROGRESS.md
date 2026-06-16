@@ -466,7 +466,39 @@ amplifiers were missing:
 > shells, so `cargo build` lands the binary there, not `host/*/target/`. `unset
 > CARGO_TARGET_DIR` before building host tools to get the repo-local binary.
 
+### Audio buzz — ROOT-CAUSED + FIXED in HDL (2026-06-16, CORDIC magnitude)
+With levels up, a tonal **buzz** was audible on all channels (worst on ch0/5/6/
+10/11/12). Diagnosis (host recordings + numpy modelling, not RF):
+- FFT showed a low **~90/330/660 Hz** comb on every channel plus a channel-
+  specific **~7.6 kHz** whine. Moving the LO to a quiet 240 MHz collapsed all of
+  it — i.e. the tones need an in-band **carrier**, ruling out digital/clock/PSU
+  noise and pointing at the demod of a real signal.
+- **Root cause: the AM envelope detector.** It used a multiplier-free
+  `alpha-max-beta-min` magnitude (`max + 3/8·min`) whose gain **ripples ~10% with
+  the I/Q phase angle**. Every carrier sits slightly off the un-disciplined Pluto
+  LO, so its baseband phasor rotates at the residual offset `df`; the ripple then
+  amplitude-modulates it, emitting spurs at **4·df and harmonics at ~−30 dBc**.
+  Modelled df≈83 Hz → 333/666 Hz; df≈1906 Hz → 7624 Hz (8th harmonic alias) —
+  matching the recordings exactly. Software receivers use exact √(I²+Q²), hence
+  clean.
+- Single-cycle multiplier-free approximations only reached ~−39 dBc (still
+  audible), so the magnitude was replaced with a **CORDIC vectoring** detector in
+  `TdmAmBackend` (`am_backend_tdm.py`): multiplier-free (adds/shifts), relative
+  accuracy set by iteration count not the 43-bit datapath width. **M=12 → spur
+  floor < −140 dBc** (ripple ~0). Constant CORDIC gain K≈1.6468 corrected by a
+  5/8 shift-add so audio levels are unchanged.
+- **Verified in sim:** HW bit-exact to the new CORDIC model; full `ReceiverTop`
+  end-to-end bit-exact; real-time budget closes at the deployment scale (N=21,
+  decim=128, cic=4) — `duty_am` 0.40 → 0.85, overflow-free, complete. Pending:
+  bitstream build + on-hardware listen.
+- **Host band-pass** (`airband-reader`/`airband-listen` `--filter`, 300–3400 Hz)
+  was added first as a stop-gap but **degrades voice and only masks** the buzz, so
+  it is now **opt-in/off by default**; the CORDIC fix is the real solution.
+
 ## Next steps
+- **Build + flash the CORDIC-magnitude bitstream** and confirm the buzz is gone
+  on hardware (A/B with the host `--filter` off). This is the only remaining step
+  for the buzz fix; the change is sim-verified (bit-exact + budget).
 - **Signal-quality tuning on real RF:** front-end locked on-band, manual 71 dB,
   host `--shift -6` → live AWOS (ch0) recovers as clean voice at ~ −19 dBFS. Still
   to do: a better antenna for weaker fields, and per-site tuning of `gain_db` /
