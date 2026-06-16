@@ -36,30 +36,29 @@ Prereqs (already provisioned on `xilinx-builder`, see `DEV-SETUP.md`):
 volume, and this repo at `~/pluto-build/airband` (maia-sdr fork at its
 `maia-sdr/`).
 
-There are two build scripts:
+One build script produces flashable images:
 
 ```bash
-# FULL build (HAVE_VIVADO=1): rebuilds the bitstream + FSBL + kernel + rootfs.
-# Produces BOTH partitions: boot.{frm,dfu} (mtd0) and pluto.{frm,dfu} (mtd3).
-# Use this for ANY HDL/block-design change. ~30-60 min.
+# Push your commits to origin first. This pulls both repos, builds ONLY from
+# committed git state, bakes the fork commit hash into the bitstream (USERID +
+# USR_ACCESS), and produces BOTH partitions: boot.{frm,dfu} (mtd0) and
+# pluto.{frm,dfu} (mtd3). Use for ANY change. ~20 min (Vivado is the long pole).
 bash firmware/build_firmware_full.sh
-
-# FIT-only build (HAVE_VIVADO=0): rebuilds only pluto.{frm,dfu} (mtd3) from a
-# prebuilt XSA. Fast (~5-10 min, no Vivado) but ONLY valid when the bitstream
-# and FSBL are unchanged (e.g. a maia-httpd / devicetree / init-script tweak).
-XSA=~/pluto-build/system_top_airband.xsa bash firmware/build_firmware.sh
 # -> ~/pluto-build/plutosdr-fw/build/{boot,pluto}.{frm,dfu}
 ```
 
-Both scripts splice the `pluto-airband` maia-sdr fork into `plutosdr-fw`, patch
-the devicetree (airband reserved-memory at `0x19000000`), and patch
-`S60maia-httpd` so the receiver auto-starts with `--airband`.
+It clones the `pluto-airband` maia-sdr fork into `plutosdr-fw` at the committed
+HEAD, patches the devicetree (airband reserved-memory at `0x19000000`), and
+patches `S60maia-httpd` so the receiver auto-starts with `--airband`. For a fast
+synthesis/timing check without producing firmware, use
+`firmware/build_bitstream.sh` (host Vivado, not flashable).
 
 > **Why two partitions matter:** the **bitstream and FSBL live in `BOOT.BIN`
-> (`boot.frm`, `mtd0`)**, not in `pluto.frm`. A FIT-only build never updates the
-> PL. Flashing only `pluto.dfu` after an HDL change leaves the old bitstream /
-> HP0-disabled FSBL running → airband register aliasing + DMA hang + watchdog
-> reset. See `DEV-SETUP.md`.
+> (`boot.frm`, `mtd0`)**, with a copy in `pluto.frm`. Flashing only `pluto.dfu`
+> after an HDL change can leave the old bitstream / HP0-disabled FSBL running →
+> airband register aliasing + DMA hang + watchdog reset. After an HDL change,
+> flash **both** and verify the bitstream's embedded UserID equals your committed
+> fork HEAD (the build prints this). See `DEV-SETUP.md`.
 
 ## 2. Flash the Pluto
 

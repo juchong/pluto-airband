@@ -374,10 +374,14 @@ maia-httpd** (no IIO device), reader in **Rust**.
   demuxes by channel, detects drops via the per-channel seq counter, scales
   24→16-bit, outputs stats / per-channel WAV / raw s16; auto-reconnects.
   Smoke-tested end-to-end (3 channels, injected drop detected exactly).
-- **Firmware build** (`firmware/build_firmware.sh` + `README.md`): splices the
-  fork into `plutosdr-fw`, patches the DT, and builds `pluto.frm`/`.dfu` with
-  `HAVE_VIVADO=0` + the prebuilt cyclic-DMA xsa (no Vivado/numpy/scipy needed in
-  the container).
+- **Firmware build** (`firmware/build_firmware_full.sh` + `README.md`): the single
+  flashable-image builder. Pulls this repo + the fork from git, clones the fork
+  into `plutosdr-fw` at the committed HEAD (refuses a dirty tree), patches the DT,
+  runs the full `HAVE_VIVADO=1` build, and bakes the fork commit hash into the
+  bitstream (USERID + USR_ACCESS) so the running gateware is verifiable. The old
+  `HAVE_VIVADO=0` FIT-only shortcut (`build_firmware.sh` + a frozen prebuilt XSA)
+  was **removed** — it silently flashed stale gateware. `build_bitstream.sh`
+  remains as a fast, non-flashable host-Vivado synthesis/timing check.
 - Addressing invariant reconciled: HDL `airband_address_range` == DT
   `maia_sdr_airband` `reg`, slot `0x10000` (see hardware bring-up below for the
   final relocated address).

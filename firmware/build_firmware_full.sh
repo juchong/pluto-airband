@@ -1,16 +1,20 @@
 #!/usr/bin/env bash
 #
 # FULL Pluto airband firmware build (HAVE_VIVADO=1) on the x86-64 build server.
-#
-# Unlike build_firmware.sh (HAVE_VIVADO=0, FIT/mtd3 only), this rebuilds the
-# bitstream AND the FSBL from our maia-sdr fork, then packs BOTH firmware
-# partitions:
+# This is the ONLY script that produces flashable images. It rebuilds the
+# bitstream + FSBL from our maia-sdr fork and packs BOTH firmware partitions:
 #   - build/boot.frm  / build/boot.dfu   -> BOOT.BIN (FSBL + bitstream + u-boot) -> mtd0
 #   - build/pluto.frm / build/pluto.dfu  -> FIT (kernel + DT + rootfs + bitstream) -> mtd3
 #
-# The FSBL is regenerated from the new XSA via xsct, so it matches the new
-# block design (HP0 enabled for the airband DMA). This is the build that fixes
-# the "old bitstream / HP0 disabled" mismatch that crashed airband.
+# Provenance by construction (so a stale-gateware flash cannot happen silently):
+#   1. Builds ONLY from committed git state. Both repos are `git pull`ed at the
+#      start; an uncommitted working tree aborts the build (override: FORCE_DIRTY=1).
+#   2. The fork's short commit hash is baked into the bitstream as USERID +
+#      USR_ACCESS (see maia-hdl/projects/pluto/system_project.tcl). After the
+#      build, `strings .../system_top.bit | grep UserID` MUST equal the commit you
+#      shipped -- this is the authoritative "is the right gateware in the bit"
+#      check (a .bit holds config frames, not net names, so grepping signal names
+#      never works; the embedded UserID does).
 #
 # Run on the build server (Vivado available via the vivado2023_2 docker volume):
 #   bash firmware/build_firmware_full.sh
@@ -18,30 +22,57 @@
 set -euo pipefail
 
 # --- paths (override via env) ---------------------------------------------
-AIRBAND_REPO="${AIRBAND_REPO:-$HOME/pluto-build/airband}"   # this repo
-FORK="${FORK:-$AIRBAND_REPO/maia-sdr}"                       # maia-sdr fork (pluto-airband branch)
+AIRBAND_REPO="${AIRBAND_REPO:-$HOME/pluto-build/airband}"   # this repo (clone of juchong/pluto-airband)
+FORK="${FORK:-$AIRBAND_REPO/maia-sdr}"                       # maia-sdr fork (clone of juchong/maia-sdr, pluto-airband)
 FW="${FW:-$HOME/pluto-build/plutosdr-fw}"                    # plutosdr-fw clone
 TARGET="${TARGET:-pluto}"
 
-echo "== plutosdr-fw at $FW =="
-[ -d "$FW" ] || { echo "ERROR: plutosdr-fw not found at $FW"; exit 1; }
-[ -d "$FORK" ] || { echo "ERROR: maia-sdr fork not found at $FORK"; exit 1; }
+[ -d "$FW" ]   || { echo "ERROR: plutosdr-fw not found at $FW"; exit 1; }
+[ -d "$FORK/.git" ] || { echo "ERROR: maia-sdr fork at $FORK is not a git clone (the server must build from git)"; exit 1; }
+
+# --- 0. Build only from committed git state -------------------------------
+# Pull this repo first and re-exec once, so script/devicetree changes can't be
+# stale. (Guarded against a re-exec loop; skipped if $AIRBAND_REPO isn't a clone.)
+if [ -d "$AIRBAND_REPO/.git" ] && [ -z "${_FWBUILD_REEXECED:-}" ]; then
+    echo "== pull $AIRBAND_REPO =="
+    git -C "$AIRBAND_REPO" pull --ff-only
+    export _FWBUILD_REEXECED=1
+    exec bash "$AIRBAND_REPO/firmware/build_firmware_full.sh" "$@"
+fi
+[ -d "$AIRBAND_REPO/.git" ] || echo "WARN: $AIRBAND_REPO is not a git clone; scripts may be stale (see DEV-SETUP 'Build server')"
+
+echo "== pull fork $FORK =="
+git -C "$FORK" pull --ff-only
+git -C "$FORK" submodule update --init --recursive
+
+# Refuse to ship gateware whose embedded hash would be a lie.
+if [ -n "$(git -C "$FORK" status --porcelain)" ]; then
+    if [ "${FORCE_DIRTY:-0}" = "1" ]; then
+        echo "WARN: fork has uncommitted changes; FORCE_DIRTY=1 set -> baking sentinel hash 0xDEADBEEF"
+        GIT_HASH="deadbeef"
+    else
+        echo "ERROR: fork at $FORK has uncommitted changes. Commit them so the bitstream's"
+        echo "       embedded commit hash is meaningful, or re-run with FORCE_DIRTY=1."
+        git -C "$FORK" status --porcelain
+        exit 1
+    fi
+else
+    GIT_HASH="$(git -C "$FORK" rev-parse --short=8 HEAD)"
+fi
+echo "== building fork $(git -C "$FORK" rev-parse --abbrev-ref HEAD) @ $GIT_HASH =="
+echo "   $(git -C "$FORK" log -1 --format='%h %s')"
 
 cd "$FW"
 
 # 1. Firmware submodules (kernel/buildroot/u-boot).
 git submodule update --init --recursive linux buildroot u-boot-xlnx
 
-# 1b. Ensure the fork's HDL submodules (adi-hdl, XilinxUnisimLibrary) are checked
-#     out: the container rebuilds the bitstream from these working-tree sources.
-git -C "$FORK" submodule update --init --recursive maia-hdl 2>/dev/null || \
-    git -C "$FORK" submodule update --init --recursive 2>/dev/null || \
-    echo "WARN: could not init fork submodules; assuming they are already present"
-
-# 2. Splice in our maia-sdr fork. Keep the HDL sources (adi-hdl etc.) so the
-#    container can rebuild the bitstream; only drop the heavy Vivado run dirs
-#    and Rust/web build outputs (those regenerate).
-echo "== splicing maia-sdr fork from $FORK =="
+# 2. Provide the fork to plutosdr-fw. We mirror the fork's *committed* checkout
+#    (the dirty-tree guard above guarantees there are no uncommitted changes, so
+#    this only ever copies tracked, committed sources -- including the fork's .git
+#    and its submodule working trees, which the container needs for Vivado). Drop
+#    only the heavy regenerated Vivado run dirs and Rust/web build outputs.
+echo "== syncing fork into plutosdr-fw/maia-sdr @ $GIT_HASH =="
 rm -rf maia-sdr
 mkdir -p maia-sdr
 rsync -a \
@@ -56,10 +87,8 @@ rsync -a \
     --exclude '**/target/' \
     --exclude '**/node_modules/' \
     "$FORK"/ maia-sdr/
-# Best-effort: refresh nested submodules. If the gitlink is broken by the
-# rsync, the working-tree files copied above are still sufficient for Vivado.
 ( cd maia-sdr && git submodule update --init --recursive ) 2>/dev/null || \
-    echo "WARN: submodule refresh skipped (using rsync'd working-tree sources)"
+    echo "WARN: submodule refresh skipped (using committed working-tree sources)"
 
 # 3. Devicetree: reset to stock then apply the airband reserved-memory patch
 #    (idempotent, relocated to 0x19000000 to avoid the CMA collision).
@@ -69,8 +98,7 @@ git -C linux checkout -- "arch/arm/boot/dts/zynq-pluto-sdr-maiasdr.dtsi" 2>/dev/
 python3 "$AIRBAND_REPO/firmware/apply_airband_devicetree.py" "$DTSI"
 
 # 3b. Auto-start airband: append --airband to the maia-httpd init script so the
-#     receiver + audio stream come up on boot (idempotent). The init script is a
-#     static buildroot overlay file installed by board/pluto/post-build.sh.
+#     receiver + audio stream come up on boot (idempotent).
 S60=buildroot/board/pluto/S60maia-httpd
 if [ -f "$S60" ] && ! grep -q -- '--airband' "$S60"; then
     sed -i 's#--ca-cert /mnt/jffs2/maia-sdr-ca.crt#--ca-cert /mnt/jffs2/maia-sdr-ca.crt --airband#' "$S60"
@@ -78,17 +106,23 @@ if [ -f "$S60" ] && ! grep -q -- '--airband' "$S60"; then
 fi
 
 # 4. Full build inside the maia-sdr-devel container (Vivado from /opt/Xilinx
-#    volume -> HAVE_VIVADO=1). Default entrypoint = build-docker.sh = `make -C /w`
-#    = clean-build + boot.{frm,dfu} + pluto.{frm,dfu} + jtag-bootstrap.
+#    volume -> HAVE_VIVADO=1). GIT_HASH is exported into the container so the
+#    Vivado flow bakes it into the bitstream (USERID + USR_ACCESS).
 echo "== full firmware+bitstream build in container (this takes a while) =="
 DOCKER_USER="${DOCKER_USER:-0:0}" TARGET="$TARGET" \
-    docker compose run --rm build
+    docker compose run --rm -e GIT_HASH="$GIT_HASH" build
 
-# Save the freshly-built bitstream XSA so the fast FIT-only path
-# (build_firmware.sh) can reuse it without rebuilding the bitstream.
-if [ -f "$FW/build/system_top.xsa" ]; then
-    cp "$FW/build/system_top.xsa" "$HOME/pluto-build/system_top_airband.xsa"
-    echo "== saved XSA -> $HOME/pluto-build/system_top_airband.xsa =="
+# 5. Provenance check: the freshly built bitstream must carry our commit hash.
+BIT="$FW/maia-sdr/maia-hdl/projects/pluto/pluto.runs/impl_1/system_top.bit"
+echo "== bitstream provenance =="
+if [ -f "$BIT" ]; then
+    EMB="$(strings "$BIT" | grep -oiE 'UserID=0x[0-9A-Fa-f]+' | head -1)"
+    echo "   expected UserID=0x$GIT_HASH ; embedded: ${EMB:-<none>}"
+    echo "$EMB" | grep -qiE "0x0*${GIT_HASH}\$" \
+        && echo "   OK: bitstream matches committed fork HEAD" \
+        || echo "   WARNING: embedded UserID does not match $GIT_HASH -- DO NOT FLASH until resolved"
+else
+    echo "   WARNING: $BIT not found; cannot verify provenance"
 fi
 
 echo "== artifacts =="
