@@ -463,6 +463,47 @@ cause to `/sys/kernel/debug/zynq_rst/code`):
 to get back into `dfu-util`); `device_reboot break` → halt in the u-boot prompt;
 `device_reboot ram` / `verbose` / `reset` for the others.
 
+### CRITICAL: the Pluto must be in 1R1T AD9364 mode (`fw_setenv`)
+
+Maia (and our airband window, LO 123.438 MHz) assumes the transceiver is an
+**AD9364** (70 MHz–6 GHz, 1R1T), not the stock **AD9363** (≤ ~2.5–3.8 GHz). This
+is a u-boot env setting, applied with `fw_setenv` — a **one-time** step per device
+that persists across `pluto.frm`/`pluto.dfu` flashes (see the Maia install page,
+"Set up 1R1T AD9364 mode").
+
+Check (all three must match):
+
+```sh
+fw_printenv attr_name attr_val mode
+#   attr_name=compatible
+#   attr_val=ad9364
+#   mode=1r1t
+```
+
+Apply only if they differ, then reboot:
+
+```sh
+fw_setenv attr_name compatible
+fw_setenv attr_val  ad9364
+fw_setenv mode      1r1t
+reboot
+```
+
+Confirm it actually bound as AD9364 after boot (the env patches the devicetree
+`compatible` via `adi_loadvals`):
+
+```sh
+dmesg | grep -i ad936
+#   ad9361 spi0.0: ad9361_probe : enter (ad9364)
+#   cf_axi_adc ...: probed ADC AD9364 as MASTER
+cat /sys/firmware/devicetree/base/amba/spi@*/ad9361-phy@*/compatible   # -> ad9364
+```
+
+Note the IIO node is **always** named `ad9361-phy` and the static FDT board string
+still says `PlutoSDR Rev.B (Z7010/AD9363)` — both are cosmetic. The authoritative
+signals are the `ad9364` probe lines above and the ability to tune the RX LO above
+~3.8 GHz (an AD9363 cannot). On the unit in use this is already set correctly.
+
 ### IP addressing (`ipaddrmulti`)
 
 If host pings to `192.168.2.1` hit a *different* device on the LAN, the Pluto and
