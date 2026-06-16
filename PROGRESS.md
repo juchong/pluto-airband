@@ -2,11 +2,14 @@
 
 Running log of work, decisions, and state for the Pluto FPGA airband receiver.
 Authoritative spec: `SPEC.md`. Build/flash/ops: `BUILD.md`. Hub: `README.md`.
-"Handoff §N" references throughout point to `SPEC.md` section N.
+Older log entries cite "Handoff §N / §7 step N" — the project's *original* spec/task
+numbering. `SPEC.md` has since been rewritten as an as-built spec with a different
+structure; for current design sections and remaining work see `SPEC.md` (§9 lists
+what is left).
 
 ## Status at a glance
 
-| Handoff §7 task | State |
+| Milestone (original task sequence) | State |
 |---|---|
 | 1. x86 build server bring-up (bitstream build of unmodified Maia) | **done** (Vivado 2023.2; from-source bitstream built, timing met; base PL usage measured) |
 | 2. Mac dev env (Amaranth, cocotb/Icarus, Rust, libiio+dfu-util) | **done** |
@@ -110,8 +113,10 @@ the doc's older numbers, because current `maia-sdr` `main` requires them:
    Costs ~5 time-mux lanes (≤8 the Z-7010 fits). 133.65 MHz is a **nice-to-have**,
    deferred (would force Fs≈20 MHz / 8 lanes / center 125.75 MHz); it can be added
    later as a separate decision without disturbing the core.
-3. Audio rate: 8 ksps vs 16 ksps.
-4. Squelch/AGC placement: FPGA vs Pi (default: Pi first).
+3. ~~Audio rate: 8 ksps vs 16 ksps~~ — **RESOLVED: 15625 sps** (`audio_decim=7`,
+   14 MHz / 128 / 7).
+4. Squelch/AGC placement: FPGA vs Pi (default: Pi first) — still open (currently
+   neither: fixed manual gain, no squelch).
 5. Front-end filtering: airband BPF + broadcast-FM notch (hygiene).
 6. liveatc specifics: server, mountpoint convention, codec/bitrate.
 
@@ -455,9 +460,13 @@ amplifiers were missing:
 - **RF gain:** the AD9361 AGC modes set gain from the *wideband* 14 MHz power and
   settle low, starving weak narrowband channels. Measured ch0 (118.050 AWOS, raw
   24-bit peak): slow_attack@48 dB → ~40, fast_attack@55 → ~54, hybrid@57 → ~71,
-  manual 64 → ~154, **manual 71 → ~280**. ADC does not overload (per-channel peak
-  sums scale linearly with gain). → Default changed to **fixed `agc:"manual"`,
-  `gain_db:71.0`** (`firmware/airband.json` + `AirbandConfig::default`).
+  manual 64 → ~154, **manual 71 → ~280** (per-channel peak scales ~linearly with
+  gain). → Default changed to **fixed `agc:"manual"`, `gain_db:71.0`**
+  (`firmware/airband.json` + `AirbandConfig::default`).
+  > Correction (later finding): while each *narrowband* channel peak scales with
+  > gain, the *wideband* ADC composite **does clip ~15% at 71 dB** at strong-signal
+  > sites — see the RE-DIAGNOSED section below. Lower `gain_db` if you hear
+  > distortion.
 - **Host makeup gain:** `airband-reader --shift` was unsigned (right-shift only;
   default 8 → divided the quiet sample to silence). Made it **signed** (negative =
   left-shift / makeup gain), default **`-6`** (≈ +36 dB). `airband-listen` default
@@ -537,10 +546,10 @@ the buzz persisted (only its spectrum shifted). A from-the-RF investigation
   host `--shift -6` → live AWOS (ch0) recovers as clean voice at ~ −19 dBFS. Still
   to do: a better antenna for weaker fields, and per-site tuning of `gain_db` /
   `--shift` (lower gain if a strong local signal ever overloads the front-end).
-- **LiveATC feeder integration** (§7 step 8 / §8.6): wire `host/airband-reader`
+- **LiveATC feeder integration** (`SPEC.md` §9): wire `host/airband-reader`
   per-channel audio into the LiveATC mountpoint convention (server, codec/bitrate
-  still open, §8.6).
-- **Hardening** (§7 step 9): squelch/AGC placement (§8.4), front-end BPF + FM
-  notch hygiene (§8.5), reconnection/feed supervision.
+  still open).
+- **Hardening** (`SPEC.md` §9): squelch/AGC placement, front-end BPF + FM notch
+  hygiene, reconnection/feed supervision.
 - **Optional:** add the deferred 133.65 MHz outlier (needs Fs≈20 MHz / 8 lanes /
-  recentered LO — a separate window decision, §8.2).
+  recentered LO — a separate window decision, `SPEC.md` §5).

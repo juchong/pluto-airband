@@ -3,7 +3,7 @@
 The complete build/deploy/operate reference: the macOS dev environment, the
 x86-64 build server, firmware build + DFU flashing, the u-boot/devicetree
 invariants, and field troubleshooting. Start at `README.md` for the project hub;
-see `SPEC.md` for design rationale (this guide covers §5.2 of the spec and more).
+see `SPEC.md` for design rationale (this guide expands on §8 of the spec).
 
 The macOS (Apple Silicon) box is the fast inner loop for authoring Amaranth HDL
 and running cocotb/Icarus sims; Vivado synthesis/bitstream/firmware runs on the
@@ -89,9 +89,9 @@ The pins match the upstream **`maia-sdr-devel` container** (the source of truth
 that upstream CI uses), tag `20260304`
 ([Dockerfile](https://github.com/maia-sdr/maia-sdr-docker/blob/main/maia-sdr-devel/Dockerfile)):
 
-- **Amaranth `0.5.8`** — the handoff doc's `0.5.2` is stale; current `main`'s
-  cocotb tests use the cocotb 2.0 API and `0.5.2` emits the obsolete `read_ilang`
-  yosys command. `0.5.8` emits `read_rtlil` and works with modern yosys.
+- **Amaranth `0.5.8`** — current `main`'s cocotb tests use the cocotb 2.0 API, and
+  older `0.5.x` (e.g. `0.5.2`) emits the obsolete `read_ilang` yosys command.
+  `0.5.8` emits `read_rtlil` and works with modern yosys.
 - **cocotb `2.0.1`** (+ `cocotb-bus`) — the tests use the cocotb 2.0 `unit=`
   kwarg; cocotb 1.x fails.
 - **numpy `1.26.4`** (`<2`) — Ubuntu 24.04 apt ships numpy 1.26; numpy 2's NEP-50
@@ -104,7 +104,7 @@ that upstream CI uses), tag `20260304`
 The Maia Docker images are **`linux/amd64`-only** (verified via the GHCR registry
 API — no `arm64` / multi-arch variant exists). They wrap **Vivado 2023.2, which is
 x86-64-only**, so they cannot be native on Apple Silicon. They run on a separate
-x86-64 Linux host (`SPEC.md` §5.1).
+x86-64 Linux host (`SPEC.md` §8).
 
 - `ghcr.io/maia-sdr/maia-sdr-devel` — Yosys/Icarus/Amaranth/Rust + everything to
   run Vivado 2023.2 (Vivado supplied via a Docker volume at `/opt/Xilinx`). Used

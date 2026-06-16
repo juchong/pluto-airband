@@ -36,7 +36,7 @@ Expected (validated): Run A output settles to a constant complex DC value with
 `out/ddc_tune_decimate.png` (git-ignored).
 
 This is the building block for the airband channelizer: per-channel
-`NCO tune → decimate → (next) AM envelope detect` (handoff doc §4, §7 steps 5–6).
+`NCO tune → decimate → (next) AM envelope detect` (`SPEC.md` §4).
 
 ## `am_demod.py`
 
@@ -65,7 +65,7 @@ python am_demod.py
 
 ## `am_audio.py`
 
-The AM back-end and the full single-channel chain (handoff §7 step 5, completed):
+The AM back-end and the full single-channel chain (`SPEC.md` §4.2):
 
 - `DCBlock` — one-pole high-pass (leaky-integrator DC estimate, then subtract)
   that strips the carrier-amplitude DC term left by the envelope detector.
@@ -88,8 +88,9 @@ frequency-offset AM tone through the chain, tunes the NCO, demodulates, and
 recovers a clean low-rate audio tone at the expected frequency. Plot at
 `out/am_audio.png` (git-ignored).
 
-Audio rate (8 vs 16 ksps) is open decision §8.3 — `audio_decim`/`cic_stages` are
-parameters; nothing here hard-codes the choice.
+`audio_decim`/`cic_stages` are parameters; nothing here hard-codes the rate. The
+shipping receiver uses **`audio_decim=7` → 15 625 sps** (14 MHz / 128 / 7); see
+`SPEC.md` §4.2.
 
 ## `synth_estimate.py`
 
@@ -114,10 +115,10 @@ Yosys estimates to be re-confirmed with Vivado.
 
 ## `feasibility_25ch.py`
 
-The §4.2 resource-fit **GATE** for the final channel set (22 = 21 core + 1
-deferred). Uses the measured per-block costs above plus a time-multiplexing
+The `SPEC.md` §4.1 resource-fit **GATE** for the final channel set (22 = 21 core +
+1 deferred). Uses the measured per-block costs above plus a time-multiplexing
 throughput model to size a shared channelizer and compare against the Z-7010
-budget for several capture-window choices (§8.2). (Filename is historical — the
+budget for several capture-window choices (§5). (Filename is historical — the
 planning target was 25.)
 
 ```bash
@@ -134,7 +135,7 @@ BRAM). Binding resources: BRAM36 then LUT. AM back-end costs zero DSP.
 
 ## `capture_window.py`
 
-Resolves the §8.2 capture window from the operator's channel list. Picks the
+Resolves the `SPEC.md` §5 capture window from the operator's channel list. Picks the
 center (LO) frequency so the zero-IF **DC/LO-leakage spur** lands in a guard gap
 between channels, sizes the complex sample rate so every channel stays in the
 central ~80% of the band (clear of the filter skirts), and reports the resulting
@@ -152,7 +153,7 @@ lanes / center 125.75 MHz). Plot at `out/capture_window.png` (git-ignored).
 
 ## `channelizer_lane.py`
 
-Prototype of **one time-multiplexed channelizer lane** (handoff §7 step 7): a
+Prototype of **one time-multiplexed channelizer lane** (`SPEC.md` §4): a
 single NCO + complex-mixer + CIC-decimator datapath shared across `n_channels`
 channels, with all per-channel state (NCO phase, CIC integrator/comb registers,
 decimation counter) in arrays indexed by a channel counter. One wideband IQ sample
@@ -181,13 +182,13 @@ per-lane cleanup FIR are built and verified separately in `channelizer_chain.py`
 
 ## `channelizer_chain.py`
 
-The two filtering stages the lane prototype deferred (handoff §4.2 / §7 step 7),
+The two filtering stages the lane prototype deferred (`SPEC.md` §4),
 built on one generic integer block, `FIRStage` (direct-form decimating FIR, verified
 **bit-exact** to its model at decimation 1 and 4):
 
 - `FrontEndDecimator` — a **shared** complex FIR low-pass decimator (one per
   receiver, amortized over all channels). The AD936x is run oversampled and this one
-  block decimates the whole capture to the working rate (~the §8.2 window) with a
+  block decimates the whole capture to the working rate (~the `SPEC.md` §5 window) with a
   *flat* passband — a CIC here would droop the band edges and starve the outer
   channels. **Verified:** 0.01 dB passband ripple across the channel region, 57 dB
   rejection beyond the window.
@@ -227,7 +228,7 @@ in `channelizer_core.py` moves it to BRAM).
 
 ## `channelizer_core.py`
 
-Integrated channelizer (handoff §7 step 8): **`ChannelizerCore`** wires the verified
+Integrated channelizer (`SPEC.md` §4): **`ChannelizerCore`** wires the verified
 blocks into one top — `TdmDdcLaneBRAM` → burst-absorbing `SyncFIFO` → folded complex
 cleanup FIR (`TdmFirEngineBRAM` ×2, I and Q in lockstep). All channels share one
 decimation cadence, so each CIC boundary emits a burst of N outputs; the FIFO buffers
@@ -259,7 +260,7 @@ large margin.
 
 ## `am_backend_tdm.py`
 
-**`TdmAmBackend`** — the AM demodulator, folded over channels (handoff §7 step 5).
+**`TdmAmBackend`** — the AM demodulator, folded over channels (`SPEC.md` §4.2).
 It iterates one datapath (`|I+jQ|` → one-pole DC block → CIC audio decimator) over
 all channels, holding each channel's DC-block and CIC state in
 `amaranth.lib.memory` (BRAM/distributed RAM). The magnitude is a multiplier-free
@@ -279,18 +280,19 @@ python am_backend_tdm.py
 
 **`AudioFramer`** — packs each per-channel audio strobe into a fixed 8-byte
 record and exposes an AXI4-Stream (`stream_data`/`valid`/`ready`) that plugs
-straight into `maia_hdl.dma.DmaStreamWrite` (`width=64`). Record layout (§4.3):
+straight into `maia_hdl.dma.DmaStreamWrite` (`width=64`). Record layout (`SPEC.md` §6):
 `bits[31:0]` signed sample, `bits[39:32]` channel index, `bits[63:40]` per-channel
 sequence counter (so userspace can demux and detect drops). Verified: sample +
 channel + monotonic per-channel sequence preserved through the staging FIFO.
 
 ## `receiver_top.py`
 
-**`ReceiverTop`** — the complete receiver datapath (handoff §7 step 7):
+**`ReceiverTop`** — the complete receiver datapath (`SPEC.md` §4):
 wideband IQ → N `ChannelizerCore` lanes (same stream broadcast) → round-robin
 collector → `TdmAmBackend` → `AudioFramer` → DMA stream. Channels are balanced
-across `ceil(N/chans_per_lane)` lanes (e.g. 21 → `[5,4,4,4,4]`); one lane sweeps
-all its channels per input sample, so the lane count is set by `Fpl/Fs`. Per-channel
+across `ceil(N/chans_per_lane)` lanes; the shipping config is `chans_per_lane=4`,
+so 21 → **6 lanes** `[4,4,4,3,3,3]`. One lane sweeps all its channels per input
+sample, so `chans_per_lane` is bounded by `Fpl/Fs` (≈4.46 here). Per-channel
 NCO tuning words are written through a flat register interface
 (`freq_wren`/`freq_waddr`=global channel/`freq_wdata`), routed to the owning lane.
 
@@ -305,7 +307,7 @@ place.
 
 ## `realtime_budget.py`
 
-The §4.2 feasibility GATE checked **area**; this checks **throughput**. The shared
+The `SPEC.md` §4.1 feasibility GATE checked **area**; this checks **throughput**. The shared
 (folded) datapaths must keep up with the sample cadence: at `Fpl=62.5 MHz`,
 `Fs=14 MHz` there are only `~4.46` PL cycles per input sample, so each binding
 stage has a duty cycle that must stay < 1:

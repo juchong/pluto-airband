@@ -17,6 +17,7 @@ This README is the hub. Each topic has a single home:
 | If you want to… | Go to |
 |---|---|
 | Flash a prebuilt image and listen (fastest path) | [Quick start](#quick-start) (below) |
+| Consume the audio stream from your own program | [Audio output interface](#audio-output-interface-write-your-own-client) (below) |
 | Understand the design, constraints, and rationale | **[`SPEC.md`](SPEC.md)** — authoritative design spec |
 | Build firmware, flash, set up the dev/build env, troubleshoot | **[`BUILD.md`](BUILD.md)** |
 | Know what each FPGA/DSP block does | **[`hdl/README.md`](hdl/README.md)** |
@@ -82,7 +83,7 @@ lives there and a mismatch hangs the receiver):
 cd firmware/build
 dfu-util -a boot.dfu     -D boot.dfu     # FPGA bitstream + FSBL + bootloader (mtd0)
 dfu-util -a firmware.dfu -D pluto.dfu    # kernel + devicetree + rootfs       (mtd3)
-dfu-util -e                               # reboot
+dfu-util -a firmware.dfu -e              # detach + reboot (plain `-e` errors with >1 alt)
 ```
 
 The receiver starts automatically on boot; the Pluto is reachable at `192.168.2.1`
@@ -133,6 +134,54 @@ Interactive keys: `↑/↓` (or `j`/`k`, `[`/`]`) step channels, type a number t
 `m` mutes, `f` toggles the diagnostic voice band-pass (off by default; see
 `--filter`), `q` quits. The display shows a live level meter and cumulative dropped
 samples per channel, so it doubles as a quick link-health check.
+
+### Audio output interface (write your own client)
+
+`airband-reader`/`airband-listen` are thin clients over a single **raw TCP byte
+stream**; there is no IIO device and no per-channel socket. To get audio out from
+any language, implement this contract (the authoritative spec is
+[`SPEC.md`](SPEC.md) §6):
+
+- **Connect** to TCP `192.168.2.1:30000`. The server only writes; it pushes a
+  continuous stream of fixed **8-byte little-endian records**, 8-byte aligned from
+  the first byte (it sends whole 64 KiB buffers), so just read 8 bytes at a time.
+- **Each record is one audio sample for one channel:**
+
+```
+bits [31:0]  audio sample    — signed, 24-bit content sign-extended to 32 bits
+bits [39:32] channel index   — 0..20
+bits [63:40] sequence number — per-channel, +1 per sample, wraps at 2**24
+```
+
+- **Demux:** switch on the channel byte and append the sample to that channel's
+  stream. Each channel is mono PCM at **15625 sps** (`Fs/128/7`). Records from
+  different channels are interleaved; within one channel they are in order.
+- **Drop detection:** a per-channel jump in the sequence number (delta > 1) means
+  `delta-1` samples were dropped (FPGA FIFO overflow or a slow client). The server
+  buffers ~256 chunks per client and *lags* a client that can't keep up — that
+  surfaces as a sequence jump, never a stall, so always check the counter.
+- **Level:** the 24-bit sample is near unity-gain and airband AM is quiet (often
+  tens of LSB), so apply makeup gain before narrowing to 16-bit (the tools default
+  to a left-shift of 6 ≈ +36 dB; see `--shift`).
+
+Minimal consumer (decode + demux, no resampling):
+
+```python
+import socket, struct
+s = socket.create_connection(("192.168.2.1", 30000))
+buf = b""
+while True:
+    buf += s.recv(65536)
+    while len(buf) >= 8:
+        word = struct.unpack_from("<Q", buf)[0]
+        buf = buf[8:]
+        sample = word & 0xFFFFFFFF
+        if sample & 0x80000000:          # sign-extend the 32-bit field
+            sample -= 1 << 32
+        chan = (word >> 32) & 0xFF       # 0..20
+        seq  = (word >> 40) & 0xFFFFFF   # per-channel sequence
+        # `sample` is one 15625 sps mono sample for channel `chan`
+```
 
 ### Web UI (Maia spectrometer) — front-end is read-only
 

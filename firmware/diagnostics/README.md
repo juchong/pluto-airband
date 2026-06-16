@@ -13,7 +13,8 @@ AD9361 ADC samples *before* any airband processing:
 
 - A **~485 kHz spur comb phase-locked to 120.000 MHz** sits across the airband.
   120.000 MHz is exactly the **3rd harmonic of the Pluto's 40 MHz reference**
-  oscillator. The airband (118–137 MHz) unavoidably straddles it.
+  oscillator, and it falls squarely inside the receiver's capture window
+  (118.05–128.5 MHz), so it cannot be tuned around.
 - These spurs land inside the passbands of the channels reported as bad
   (ch0/2/3/5/6/8/10/11/12 at ~18–26 dB) and miss the clean ones
   (ch7/9/14/16/18). A spur inside a 25 kHz channel cannot be removed by the

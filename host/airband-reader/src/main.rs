@@ -82,8 +82,9 @@ struct Args {
     /// Enable the voice band-pass filter (OFF by default).
     ///
     /// Diagnostic/fallback only: a 300-3400 Hz band-pass masks out-of-voice-band
-    /// channelizer spurs (a low ~90/330 Hz hum and a ~7.6 kHz whine) but also
-    /// degrades voice. The real fix is in the DSP chain, not this filter.
+    /// artifacts but also degrades voice. It does NOT fix the on-air "buzz", which
+    /// is an RF hardware spur (a comb locked to the Pluto's 40 MHz reference),
+    /// upstream of all DSP -- see firmware/diagnostics/. Leave off in normal use.
     #[arg(long)]
     filter: bool,
     /// Voice band-pass low corner in Hz (high-pass)
