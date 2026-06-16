@@ -499,10 +499,35 @@ With levels up, a tonal **buzz** was audible on all channels (worst on ch0/5/6/
   was added first as a stop-gap but **degrades voice and only masks** the buzz, so
   it is now **opt-in/off by default**; the CORDIC fix is the real solution.
 
+### Audio buzz — RE-DIAGNOSED as an RF hardware spur problem (2026-06-16, PM)
+**Supersedes the CORDIC conclusion above.** After flashing the CORDIC bitstream
+the buzz persisted (only its spectrum shifted). A from-the-RF investigation
+(raw-IQ capture via maia's recorder + on-device sweeps; toolkit in
+`firmware/diagnostics/`) established the real root cause:
+- The buzz is in the **raw wideband ADC samples, upstream of all airband DSP**.
+  The bit-exact DSP chain is **clean on idle input** (`dsp_chain_sim.py`), so no
+  HDL/CORDIC/DC-block/CIC change can fix it.
+- It is a **~485 kHz spur comb phase-locked to 120.000 MHz = 3rd harmonic of the
+  40 MHz reference**. The comb lines land inside the passbands of exactly the bad
+  channels (ch0/2/3/5/6/8/10/11/12, ~18–26 dB) and miss the clean ones.
+- The spurs are **invariant to sample rate (BBPLL/ADC clock), LO, and gain** —
+  i.e. physical, reference-locked RF, not digital aliases, synth spurs, or
+  clipping intermod. The internal-clock change test (`samplerate_spur_test.py`)
+  showed **zero** spur movement → **no firmware/HDL fix is possible**.
+- Side finding: production manual gain **71 dB clips the ADC ~15%**; lowering
+  gain stops clipping but neither removes the in-band spurs nor is worth the lost
+  weak-signal sensitivity (`gain_sweep.py`).
+- The low (~40–47 Hz) modulation that makes the spurs *audible* is most likely
+  the switching supply AM-ing the comb (a static carrier would be DC-blocked).
+- **Remedies are hardware**: clean/linear power + USB ferrites (reduce the AM),
+  shielding against 120 MHz coupling, an external clean reference, and/or channel
+  triage (prefer the spur-free channels ch7/9/14/16/18). See
+  `firmware/diagnostics/README.md`.
+
 ## Next steps
-- **Build + flash the CORDIC-magnitude bitstream** and confirm the buzz is gone
-  on hardware (A/B with the host `--filter` off). This is the only remaining step
-  for the buzz fix; the change is sim-verified (bit-exact + budget).
+- **Buzz is hardware-bound** (see RE-DIAGNOSED section): pursue power-supply
+  cleanup / shielding / external reference; no further HDL work will help. Keep
+  the CORDIC magnitude (it is the correct demod regardless and improves accuracy).
 - **Signal-quality tuning on real RF:** front-end locked on-band, manual 71 dB,
   host `--shift -6` → live AWOS (ch0) recovers as clean voice at ~ −19 dBFS. Still
   to do: a better antenna for weaker fields, and per-site tuning of `gain_db` /
