@@ -7,8 +7,22 @@ channel is AM-demodulated to audio on-chip and streamed off the device over the
 network — suitable for feeding multiple [LiveATC](https://www.liveatc.net/) audio
 streams from one SDR.
 
-> **Status:** live on hardware. All 21 channels stream gap-free; the receiver
-> auto-starts on boot. See `PROGRESS.md` for the full history.
+> **Status:** live on hardware — all 21 channels stream gap-free and the receiver
+> auto-starts on boot. See [Status & known limitations](#status--known-limitations).
+
+## Documentation
+
+This README is the hub. Each topic has a single home:
+
+| If you want to… | Go to |
+|---|---|
+| Flash a prebuilt image and listen (fastest path) | [Quick start](#quick-start) (below) |
+| Understand the design, constraints, and rationale | **[`SPEC.md`](SPEC.md)** — authoritative design spec |
+| Build firmware, flash, set up the dev/build env, troubleshoot | **[`BUILD.md`](BUILD.md)** |
+| Know what each FPGA/DSP block does | **[`hdl/README.md`](hdl/README.md)** |
+| Diagnose audio artifacts / understand the channel "buzz" | **[`firmware/diagnostics/README.md`](firmware/diagnostics/README.md)** |
+| Know the firmware image contents + DDR addressing invariants | **[`firmware/README.md`](firmware/README.md)** |
+| See the engineering history and decisions | **[`PROGRESS.md`](PROGRESS.md)** |
 
 ## How it works
 
@@ -41,13 +55,28 @@ This is built **on top of** [Maia SDR](https://maia-sdr.org/); the airband DSP,
 DMA, and control live in our fork (`github.com/juchong/maia-sdr`, `pluto-airband`
 branch). The Maia base (spectrometer/recorder/DDC) is preserved.
 
+## Status & known limitations
+
+- **Live on hardware:** 21 channels, gap-free TCP stream, auto-start on boot.
+- **Channel "buzz" is an RF hardware spur — not fixable in firmware.** A spur comb
+  phase-locked to the Pluto's 40 MHz reference (3rd harmonic at **120.000 MHz**)
+  falls inside some channels' passbands. It is independent of the HDL/DSP, the
+  demod, and the gain. Remedies are hardware (clean power, shielding, external
+  reference, channel triage). Full root-cause analysis and a diagnostic toolkit:
+  [`firmware/diagnostics/README.md`](firmware/diagnostics/README.md).
+- **Single shared front-end:** one RX gain serves all 21 channels (no per-channel
+  AGC). The default is fixed manual gain near max for weak-signal sensitivity;
+  this can clip the wideband ADC at strong-signal sites — see [Channel plan](#channel-plan).
+- **LiveATC feeder integration** is still pending — see `PROGRESS.md` → Next steps.
+
 ## Quick start
 
 ### 1. Flash a Pluto
 
-Prebuilt images are produced by the build server (see `firmware/README.md` and
-`DEV-SETUP.md`). Put the Pluto in DFU mode (power on while holding the button
-until the LED blinks slowly), then flash **both** partitions:
+Prebuilt images come from the build server. Put the Pluto in DFU mode (power on
+while holding the button until the LED blinks slowly), then flash **both**
+partitions (after any FPGA change you must reflash `boot.dfu` too — the bitstream
+lives there and a mismatch hangs the receiver):
 
 ```bash
 cd firmware/build
@@ -56,12 +85,10 @@ dfu-util -a firmware.dfu -D pluto.dfu    # kernel + devicetree + rootfs       (m
 dfu-util -e                               # reboot
 ```
 
-> If you only changed the channel plan / software (not the FPGA), reflash just
-> `pluto.dfu`. After any FPGA change you **must** reflash `boot.dfu` too — the
-> bitstream lives there, and a mismatch hangs the receiver. See `firmware/README.md`.
-
-The receiver starts automatically on boot. By default the Pluto is reachable at
-`192.168.2.1` over USB.
+The receiver starts automatically on boot; the Pluto is reachable at `192.168.2.1`
+over USB. Full build + flash + first-boot details (incl. the u-boot env that a
+`boot.dfu` flash wipes) are in **[`BUILD.md`](BUILD.md)** and
+[`firmware/README.md`](firmware/README.md).
 
 ### 2. Listen
 
@@ -81,17 +108,16 @@ $BIN 192.168.2.1:30000 --mode wav --out-dir caps
 $BIN 192.168.2.1:30000 --mode raw --out-dir pcm
 ```
 
-`--shift` scales the 24-bit demod sample into 16-bit before output: **positive
-right-shifts (attenuate), negative left-shifts (makeup gain)**. Airband AM audio
-is quiet (often only tens of LSB at 24-bit), so the default is **`-6`** (≈ +36 dB
-makeup). Make it more negative if voice is too quiet, less negative (toward `0`,
-then positive) if loud signals clip.
+`--shift` scales the 24-bit demod sample into 16-bit: **positive right-shifts
+(attenuate), negative left-shifts (makeup gain)**. Airband AM audio is quiet
+(often only tens of LSB at 24-bit), so the default is **`-6`** (≈ +36 dB makeup).
+Make it more negative if voice is too quiet, less negative (toward `0`, then
+positive) if loud signals clip.
 
 `--filter` (default **off**) applies a 300–3400 Hz voice band-pass. It only
-**masks** out-of-voice-band artifacts and also degrades voice, so leave it off
-in normal use. The residual on-air "buzz" heard on some channels is an **RF
-hardware spur** (a comb locked to the Pluto's 40 MHz reference), not a DSP issue,
-and cannot be removed in firmware — see `firmware/diagnostics/README.md`.
+**masks** out-of-voice-band artifacts and also degrades voice, so leave it off in
+normal use. (The residual on-air "buzz" is an RF hardware spur, not a DSP issue —
+see [Status & known limitations](#status--known-limitations).)
 
 ### Audition channels live (testing)
 
@@ -121,7 +147,7 @@ front-end off-band and made every channel demodulate noise. The lock is enforced
 server-side (`/api/ad9361` is a no-op under `--airband`), so the radio stays on
 the airband band no matter what the browser does.
 
-## Customizing the channel plan
+## Channel plan
 
 The receiver reads `/root/airband.json` on the Pluto at startup; if absent it uses
 the same built-in defaults. A template is at `firmware/airband.json`:
@@ -149,9 +175,9 @@ Rules:
   and starve weak channels, so the default is fixed `agc: "manual"` at `gain_db:
   71.0` (near max) to favour weak-signal sensitivity. At strong-signal sites 71 dB
   can clip the *wideband* ADC (~15% observed) — lower `gain_db` if you hear
-  distortion, trading some sensitivity. Note: lowering gain does **not** remove
-  the fixed-frequency channel "buzz" (an RF hardware spur, see
-  `firmware/diagnostics/README.md`).
+  distortion, trading some sensitivity. Lowering gain does **not** remove the
+  fixed-frequency channel "buzz" (an RF hardware spur; see
+  [`firmware/diagnostics/README.md`](firmware/diagnostics/README.md)).
 
 Apply a new plan:
 
@@ -164,22 +190,25 @@ ssh root@192.168.2.1 /etc/init.d/S60maia-httpd restart
 
 | Path | What |
 |---|---|
+| `README.md` | this hub: overview, status, quick start, channel plan, doc map |
+| `SPEC.md` | the authoritative project spec (design, constraints, rationale) |
+| `BUILD.md` | dev/build env, build server, firmware build + flash, troubleshooting |
+| `PROGRESS.md` | running engineering log + decisions |
 | `hdl/` | Amaranth HDL DSP blocks (channelizer, AM demod, framer) + sims; see `hdl/README.md` |
-| `firmware/` | Build scripts, devicetree patch, channel-plan template, flashing guide (`firmware/README.md`) |
+| `firmware/` | build scripts, devicetree patch, channel-plan template, image notes (`firmware/README.md`) |
+| `firmware/diagnostics/` | RF diagnostic toolkit + the buzz root-cause analysis (`firmware/diagnostics/README.md`) |
 | `host/airband-reader/` | Rust host reader: demux, drop detection, WAV/raw output |
 | `host/airband-listen/` | Rust interactive listener: play one channel live, switch on the fly |
 | `maia-sdr/` | our Maia SDR fork (gitignored here; the airband HDL + `maia-httpd` integration) |
 | `plutosdr-fw/` | Pluto firmware assembler (gitignored; pinned upstream) |
-| `pluto-airband-fpga.md` | the authoritative project spec |
-| `PROGRESS.md` | running engineering log + decisions |
-| `DEV-SETUP.md` | dev environment, build server, and bitstream/firmware build details |
 
 ## Building from source
 
 Firmware/bitstream are built on an x86-64 Linux server with Vivado 2023.2 (the Maia
-Docker images are amd64-only). HDL authoring and simulation run natively on macOS.
-Full setup — Mac dev env, build server, Vivado volume, `libiio` — is in
-`DEV-SETUP.md`; the firmware build + flash specifics are in `firmware/README.md`.
+Docker images are amd64-only); HDL authoring and simulation run natively on macOS.
+The full recipe — Mac dev env, build server, Vivado volume, `libiio`, firmware
+build + flash — is in **[`BUILD.md`](BUILD.md)** (with image specifics in
+[`firmware/README.md`](firmware/README.md)).
 
 ## Credits
 

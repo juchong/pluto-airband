@@ -1,9 +1,13 @@
-# Pluto Airband — Development Environment Setup
+# Pluto Airband — Build, Flash & Operations
 
-This documents the **macOS (Apple Silicon) native development environment** for the
-Pluto FPGA multichannel airband receiver (see `pluto-airband-fpga.md` §5.2). It is
-the fast inner-loop environment for authoring Amaranth HDL and running
-cocotb/Icarus simulations.
+The complete build/deploy/operate reference: the macOS dev environment, the
+x86-64 build server, firmware build + DFU flashing, the u-boot/devicetree
+invariants, and field troubleshooting. Start at `README.md` for the project hub;
+see `SPEC.md` for design rationale (this guide covers §5.2 of the spec and more).
+
+The macOS (Apple Silicon) box is the fast inner loop for authoring Amaranth HDL
+and running cocotb/Icarus sims; Vivado synthesis/bitstream/firmware runs on the
+x86-64 Linux build server.
 
 > **Scope:** this machine is the *development* box, **not** the build server.
 > Vivado synthesis / bitstream / firmware assembly runs on a separate **x86-64
@@ -100,7 +104,7 @@ that upstream CI uses), tag `20260304`
 The Maia Docker images are **`linux/amd64`-only** (verified via the GHCR registry
 API — no `arm64` / multi-arch variant exists). They wrap **Vivado 2023.2, which is
 x86-64-only**, so they cannot be native on Apple Silicon. They run on a separate
-x86-64 Linux host (`pluto-airband-fpga.md` §5.1).
+x86-64 Linux host (`SPEC.md` §5.1).
 
 - `ghcr.io/maia-sdr/maia-sdr-devel` — Yosys/Icarus/Amaranth/Rust + everything to
   run Vivado 2023.2 (Vivado supplied via a Docker volume at `/opt/Xilinx`). Used

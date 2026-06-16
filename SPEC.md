@@ -1,4 +1,8 @@
-# Pluto FPGA Multichannel Airband Receiver — Project Handoff
+# Pluto Airband — Design Spec & Handoff
+
+> The authoritative design spec. Section numbers (§) referenced elsewhere
+> (code comments, `PROGRESS.md`) point here. For build/flash/ops see `BUILD.md`,
+> for status/history see `PROGRESS.md`, and start at `README.md` for the hub.
 
 ## Purpose of this document
 

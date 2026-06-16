@@ -3,7 +3,7 @@
 Our own simulation/experiment code. We **use `maia_hdl` as a library** (installed
 editable from the pinned clone) and do not modify the upstream tree.
 
-Prereqs (see `../DEV-SETUP.md`):
+Prereqs (see `../BUILD.md`):
 
 ```bash
 source ../.venv/bin/activate
@@ -220,7 +220,7 @@ direct FIRs are fully parallel (1 mult/tap) — Yosys/Vivado show that upper bou
 `MultiStageDecimator` + `TdmFirEngine` are the folded/cheap forms.
 
 **Vivado 2023.2 OOC cross-check** (build server, `xc7z010clg225-1`; see
-`../DEV-SETUP.md` for the recipe): the 21-channel `TdmDdcLane` synthesizes to **4
+`../BUILD.md` for the recipe): the 21-channel `TdmDdcLane` synthesizes to **4
 DSP, 3374 LUT (19%), 7760 FF (22%), 0 BRAM**, closely matching the Yosys estimate and
 confirming the lane fit; per-channel state lands in FFs here (the Memory-backed lane
 in `channelizer_core.py` moves it to BRAM).

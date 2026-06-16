@@ -39,7 +39,7 @@ if [ -d "$AIRBAND_REPO/.git" ] && [ -z "${_FWBUILD_REEXECED:-}" ]; then
     export _FWBUILD_REEXECED=1
     exec bash "$AIRBAND_REPO/firmware/build_firmware_full.sh" "$@"
 fi
-[ -d "$AIRBAND_REPO/.git" ] || echo "WARN: $AIRBAND_REPO is not a git clone; scripts may be stale (see DEV-SETUP 'Build server')"
+[ -d "$AIRBAND_REPO/.git" ] || echo "WARN: $AIRBAND_REPO is not a git clone; scripts may be stale (see BUILD.md 'Build server')"
 
 echo "== pull fork $FORK =="
 git -C "$FORK" pull --ff-only

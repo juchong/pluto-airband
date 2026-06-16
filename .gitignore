@@ -1,7 +1,7 @@
 # Python virtual environment (recreate from requirements-dev.lock.txt)
 .venv/
 
-# Upstream dependencies — cloned separately, pinned by SHA in DEV-SETUP.md.
+# Upstream dependencies — cloned separately, pinned by SHA in BUILD.md.
 # We build *on top of* these and do not track or modify their trees.
 maia-sdr/
 plutosdr-fw/

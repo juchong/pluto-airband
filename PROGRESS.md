@@ -1,7 +1,8 @@
 # Progress Log
 
 Running log of work, decisions, and state for the Pluto FPGA airband receiver.
-Authoritative spec: `pluto-airband-fpga.md`. Environment details: `DEV-SETUP.md`.
+Authoritative spec: `SPEC.md`. Build/flash/ops: `BUILD.md`. Hub: `README.md`.
+"Handoff §N" references throughout point to `SPEC.md` section N.
 
 ## Status at a glance
 
@@ -24,19 +25,19 @@ Authoritative spec: `pluto-airband-fpga.md`. Environment details: `DEV-SETUP.md`
   `icarus-verilog`, `yosys`, `dfu-util`. Rust via rustup (`~/.cargo`).
 - Python `.venv` (3.12) with pinned deps — see `requirements-dev.txt` /
   `requirements-dev.lock.txt`.
-- Upstream clones pinned by SHA (see `DEV-SETUP.md`): `maia-sdr` and
+- Upstream clones pinned by SHA (see `BUILD.md`): `maia-sdr` and
   `plutosdr-fw`. `XilinxUnisimLibrary` submodule initialized; `adi-hdl` not.
 - **Validated:** `python -m unittest` in `maia-hdl/` → 51 tests OK; full
   `maia-hdl/test_cocotb/` suite → all PASS.
 - **libiio 0.25** (tag `b6028fd`) built from source → `~/.local` (plain dylib +
   tools, no sudo). `iio_info --version` OK, backends `xml ip usb`. Pinned in
-  `DEV-SETUP.md`. (Add `~/.local/bin` to PATH for convenience.)
+  `BUILD.md`. (Add `~/.local/bin` to PATH for convenience.)
 
 ### x86 build server + baseline bitstream (handoff §7 step 1)
 - Server provisioned (Ubuntu 22.04 x86-64, 32 vCPU). **Rootless Docker** — the
   firmware build container must run as `DOCKER_USER=0:0` (host user maps to
   container root); upstream's `$(id -u):$(id -g)` fails to write the bind mount.
-  Setup details in `DEV-SETUP.md`.
+  Setup details in `BUILD.md`.
 - **Vivado/Vitis/Vitis_HLS 2023.2** installed to `/opt/Xilinx` (Zynq-7000 only),
   bound to the `vivado2023_2` docker volume.
 - **From-source bitstream of unmodified Maia SDR built end-to-end** (kernel,
@@ -83,7 +84,7 @@ Authoritative spec: `pluto-airband-fpga.md`. Environment details: `DEV-SETUP.md`
 - **This Mac is the development box, not the build server.** Vivado is x86-64
   only; the Maia Docker images are `linux/amd64`-only (verified via GHCR API), so
   synthesis/bitstream/firmware runs on a separate x86-64 Linux host with Docker
-  (handoff §5.1). Provisioned — see "x86 build server" above and `DEV-SETUP.md`.
+  (handoff §5.1). Provisioned — see "x86 build server" above and `BUILD.md`.
 - **Repo:** workspace root is a git repo tracking only our artifacts
   (docs, requirements, future HDL/Pi code), pushed to
   `github.com/juchong/pluto-airband`.
@@ -191,7 +192,7 @@ the doc's older numbers, because current `maia-sdr` `main` requires them:
     iterated over taps serves all channels (per-channel delay lines indexed by
     channel). **Bit-exact** to the per-channel parallel FIR. Yosys: **2 DSP**.
 - **Vivado 2023.2 OOC cross-check** (build server, `xc7z010clg225-1`, the real
-  Pluto part — see `DEV-SETUP.md`):
+  Pluto part — see `BUILD.md`):
   - `TdmDdcLane` (21 ch): **4 DSP, 3374 LUT (19%), 7760 FF (22%), 0 BRAM** — closely
     matches Yosys (4 DSP / 3583 LUT / 7708 FF), de-risking the LUT/FF estimates. The
     per-channel state lands in FFs (register file); a Memory-backed lane moves it to
@@ -230,7 +231,7 @@ the doc's older numbers, because current `maia-sdr` `main` requires them:
   CIC adder cascade); moving the delay lines to BRAM dropped FF to ~0.9 k and
   pipelining the lane closed timing (+3.07 ns) for +650 FF. ~5 such lanes cover the
   21 core channels and still leave large margin. Flow + reports: `hdl/ooc_place.tcl`,
-  `DEV-SETUP.md`.
+  `BUILD.md`.
 
 ### Channelizer feasibility GATE (§4.2) — GO for N=22
 - `hdl/synth_estimate.py`: emits Verilog for the real maia-hdl `DDC` and our AM
@@ -414,7 +415,7 @@ so the kernel never came up.
 - **Auto-start:** patched `buildroot/board/pluto/S60maia-httpd` (baked into both
   build scripts) so `maia-httpd` launches with `--airband` on boot; rebuilt
   `pluto.dfu` (FIT-only) and verified the receiver comes up automatically after a
-  power cycle. Full DFU/MTD details: `DEV-SETUP.md`, `firmware/README.md`.
+  power cycle. Full DFU/MTD details: `BUILD.md`, `firmware/README.md`.
 
 ### AD9361 front-end lock — DONE (2026-06-16, "all channels on noise" root-caused)
 After the cadence fix the stream ran at the correct rate but every channel still

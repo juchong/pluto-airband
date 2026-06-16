@@ -14,7 +14,7 @@
 # short commit hash into the bitstream (USERID + USR_ACCESS via system_project.tcl).
 #
 # Prereqs on the host:
-#   - Vivado 2023.2 at $VIVADO_SETTINGS (see DEV-SETUP.md host-Vivado notes).
+#   - Vivado 2023.2 at $VIVADO_SETTINGS (see BUILD.md host-Vivado notes).
 #   - A Python venv at $VENV with amaranth/numpy/scipy (the Verilog-gen deps).
 #   - The maia-sdr fork (pluto-airband branch) cloned at $FORK.
 #
