@@ -280,6 +280,29 @@ is quiet). Modes: `stats` (live link health, default), `wav` (one WAV/channel), 
 plays one channel live and switches on the fly. Neither applies the voice band-pass
 by default; it only masks artifacts (see §7).
 
+### 6.5 Web config API and page
+The channel plan and front-end settings can be edited from a browser instead of
+hand-editing JSON. `maia-httpd` exposes a small REST API consumed by the static
+page `maia-wasm/assets/airband.html` (served at `/airband.html`, also linked from
+the main UI). The page renders a live spectrum + waterfall from the existing
+`/waterfall` WebSocket, overlays the channel plan, and offers zoom/pan, a
+full-band minimap, per-channel signal meters, and add/remove/retune editing.
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /api/airband` | Returns the persisted (pending) config: `center_hz`, `samp_rate`, `rf_bandwidth`, `gain_db`, `agc`, `channels` (`[{freq_hz, label?}]`), `poll_ms`, plus capability/read-only fields `max_channels` (21), `samp_rate_locked` (`true`), `enabled` (receiver active), and `needs_restart` (persisted ≠ running). |
+| `PATCH /api/airband` | Merges the provided fields, **validates** (≤ `max_channels` channels, each within `center_hz ± samp_rate/2`, `gain_db ∈ [0, 77]`, `poll_ms ≥ 1`; `samp_rate` cannot be changed), and persists the merged config to `/root/airband.json`. Returns the updated config. |
+| `POST /api/system/restart` | Restarts the `maia-httpd` service (detached, ~1 s delay) so a freshly saved config is applied. If unavailable, reboot manually. |
+
+The config handlers only read/write the JSON file — they never touch the radio
+or FPGA. Because the channelizer NCO words are programmed once at startup
+(§6.1), saved changes take effect only after the receiver is restarted (hence
+`needs_restart` and the page's "Restart receiver" button). `AppState` keeps the
+config loaded at boot (the *running* plan) so the handler can report whether a
+restart is pending. Optional per-channel labels are stored in a
+`channel_labels` array parallel to `channels_hz`; they are cosmetic (used only
+by the web UI) and ignored by the receiver.
+
 ## 7. Known limitation: the channel "buzz" is an RF hardware spur
 
 A persistent audible buzz on several channels was root-caused to a **physical,

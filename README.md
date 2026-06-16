@@ -235,6 +235,37 @@ scp firmware/airband.json root@192.168.2.1:/root/airband.json   # password: anal
 ssh root@192.168.2.1 /etc/init.d/S60maia-httpd restart
 ```
 
+### Web config page (recommended)
+
+Instead of editing JSON by hand, open the browser config page served by the
+Pluto:
+
+```
+http://192.168.2.1:8000/airband.html     # also linked from the main UI → settings → "Other"
+```
+
+It shows a **live spectrum + waterfall** of the captured band (fed by the same
+`/waterfall` WebSocket as the main UI) with the channel plan overlaid, so you can
+*see* whether a channel carries traffic before committing to it:
+
+- **Add / remove / reorder / relabel** channels; drag a marker (or edit the MHz
+  field) to retune; "Add peak" snaps a new channel onto the strongest visible
+  signal. A slot counter enforces the **21**-channel limit.
+- **Zoom & pan:** type a frequency to auto-zoom to it, scroll-wheel to zoom,
+  drag to pan, or use the **full-band minimap** to jump around. Known RF spur
+  and DC bands are shaded so you can avoid placing channels on them.
+- **Per-channel signal meters** (peak vs. noise floor) update live, and a
+  suggested squelch level is derived from the noise floor.
+- **Front-end controls:** center frequency, RF bandwidth, gain, AGC mode, poll
+  interval (`samp_rate` is read-only — it is fixed by the bitstream).
+- **Presets + import/export** of the JSON plan.
+
+Saving **persists `/root/airband.json`** and shows a banner; click **Restart
+receiver** (or reboot) to apply — the channelizer NCOs are programmed once at
+startup, so a restart is required. The page drives the
+[`/api/airband` REST API](SPEC.md#65-web-config-api-and-page); see `SPEC.md` for
+the request/response schema.
+
 ## Repository layout
 
 | Path | What |

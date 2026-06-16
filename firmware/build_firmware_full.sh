@@ -90,6 +90,15 @@ rsync -a \
 ( cd maia-sdr && git submodule update --init --recursive ) 2>/dev/null || \
     echo "WARN: submodule refresh skipped (using committed working-tree sources)"
 
+# 2b. The airband config web page (maia-wasm/assets/airband.html + .js + .css) is
+#     a plain static page served by maia-httpd from the rootfs www dir. The
+#     maia-sdr buildroot package installs the whole maia-wasm/assets/ tree, so
+#     these files ship automatically -- guard against them going missing.
+for f in airband.html airband.js airband.css; do
+    [ -f "maia-sdr/maia-wasm/assets/$f" ] || \
+        echo "WARN: maia-wasm/assets/$f missing from synced fork; /airband.html will not be served"
+done
+
 # 3. Devicetree: reset to stock then apply the airband reserved-memory patch
 #    (idempotent, relocated to 0x19000000 to avoid the CMA collision).
 echo "== patching devicetree =="
