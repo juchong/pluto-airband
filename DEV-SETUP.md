@@ -208,8 +208,22 @@ applies the airband reserved-memory devicetree patch
 ```bash
 # on the build server
 cd ~/pluto-build/airband
-bash firmware/build_firmware_full.sh        # ~30–60 min (Vivado synth/PAR + kernel + rootfs)
+bash firmware/build_firmware_full.sh        # ~20 min end-to-end (see breakdown below)
 ```
+
+**Per-phase wall-clock** (measured on `xilinx-builder`, 32 vCPU; full clean
+`HAVE_VIVADO=1` build). Use these to size waits so you don't poll more than
+necessary — the bitstream is the only long pole:
+
+| Phase (in order) | ~Time | Log marker to watch for |
+|---|---|---|
+| kernel `zImage` + U-Boot SPL | ~2 min | `Kernel: arch/arm/boot/zImage is ready` |
+| `maia-httpd` Rust release build | ~4 min | `Compiling maia-httpd` … `Finished \`release\`` |
+| `maia-wasm` web UI (wasm-pack) | ~3 min | `Compiling maia-wasm` / `Optimizing wasm` |
+| buildroot rootfs + Vivado IP packaging (both configs) | ~4 min | `Building pluto project [...pluto_vivado.log] ...` |
+| **Vivado pluto synth → place → route → bitstream** | **~7 min** | `write_bitstream completed successfully` |
+| FSBL/`BOOT.BIN` + FIT packaging → artifacts | ~2 min | `== artifacts ==` then `Flash BOTH partitions` |
+| **total** | **~20 min** | (first poll ≥ 15 min in) |
 
 Produces in `plutosdr-fw/build/`:
 
@@ -230,6 +244,185 @@ Produces in `plutosdr-fw/build/`:
 `firmware/build_firmware.sh` is the FIT-only (`HAVE_VIVADO=0`) shortcut — fast,
 but **only valid when the bitstream/FSBL are unchanged**. Use the full build
 above for any HDL change.
+
+### Running a build from an agent (launch detached + wait-and-check)
+
+The build outlives the SSH session and far outlives a single tool-call timeout,
+so **never run it in the foreground** and never sit in a tight poll loop (the
+harness aborts long-lived local pollers, and SSH control sessions can drop —
+neither affects the build because it runs under `nohup`). Pattern that works:
+
+1. **Push first.** The server builds from the `maia-sdr` fork's `pluto-airband`
+   branch; an HDL fix only takes effect after you push and the server pulls.
+   On the server: `git -C ~/pluto-build/airband/maia-sdr pull --ff-only`.
+   (HDL lives in the fork; `hdl/*.py` in *this* repo is the sim mirror only.)
+2. **Launch detached**, logging to a file, and immediately return:
+   ```bash
+   ssh administrator@10.0.16.36 'cd ~/pluto-build/airband && \
+     nohup bash firmware/build_firmware_full.sh > ~/pluto-build/fwbuild.log 2>&1 & echo PID=$!'
+   ```
+3. **Do a one-shot smoke check** ~5 s later (`tail` the log) to confirm it
+   started, then **stop polling**.
+4. **Wait in coarse blocks** sized to the table above — first check at **~15 min**,
+   then every few minutes. Each check is a *fresh, short* SSH (don't hold one
+   open): `pgrep -f build_firmware_full.sh` for liveness +
+   `tail ~/pluto-build/fwbuild.log`. Stable pings with no progress for >10 min
+   past the expected phase ⇒ inspect `.../projects/pluto/pluto_vivado.log`.
+5. **Done when** the build process is gone AND all four artifacts exist
+   (`build/{boot,pluto}.{frm,dfu}`). Confirm **timing met** before flashing:
+   `grep "write_bitstream completed successfully" .../pluto_vivado.log` and the
+   `Post Routing Timing Summary | WNS=` line must be ≥ 0.
+
+### Flashing + first-boot expectations (for unattended reflash)
+
+With the Pluto already in DFU mode (`dfu-util -l` shows `alt=0 boot.dfu` …
+`alt=1 firmware.dfu`):
+
+```bash
+scp administrator@10.0.16.36:'~/pluto-build/plutosdr-fw/build/{boot,pluto}.dfu' firmware/build/
+dfu-util -a boot.dfu     -D firmware/build/boot.dfu     # mtd0 (~2 s)
+dfu-util -a firmware.dfu -D firmware/build/pluto.dfu    # mtd3 (~100 s, 19 MB)
+dfu-util -e || true                                     # detach -> boot (may already have left DFU)
+```
+
+First boot after a flash is **slow**: the device answers ping within ~30 s
+(kernel + USB-ethernet gadget up) but `sshd`/`maia-httpd` (`:22` / `:30000`)
+can take **several minutes** more. Stable pings with **0 % loss** mean no
+watchdog reset loop (the old airband failure mode dropped pings every ~10–30 s).
+Verify over SSH (`sshpass -p analog ssh root@192.168.2.1`): clean `dmesg`
+(no `watchdog`/`panic`), `maia_sdr_airband@19000000` reserved node present,
+`maia-httpd` running, then on the host run `airband-reader 192.168.2.1:30000`
+and confirm **~15625 sps/channel** (= 14 MHz / 128 / 7) — half that (7813) means
+an old/half-rate bitstream is still loaded.
+
+### CRITICAL: the AD9361 front-end is locked read-only under `--airband`
+
+**Symptom (the "all channels on noise" saga):** the stream runs at the correct
+rate and 0 drops, but every channel is near-silent noise — *even though the band
+is active*. The Maia waterfall (`http://<pluto>:8000`) shows lots of signals, but
+they're at **2.4 GHz / 61.44 Msps**, not the airband window.
+
+**Cause:** the AD9361 is a **single shared front-end**. The airband task programs
+it to **123.438 MHz / 14 Msps** at startup, but the Maia web UI re-applies its own
+settings: on every page load `maia-wasm`'s `preferences.apply()` re-`PATCH`es each
+stored AD9361 field, and the stored *defaults are 2.4 GHz LO / 61.44 Msps*. That
+retunes the radio off-band, so the channelizer NCOs (baked for 14 Msps) all land
+on noise.
+
+**Fix (shipped, fork commit `aa9364e`):** when `maia-httpd` runs with `--airband`
+the front-end is **locked read-only** — `/api/ad9361` `PATCH`/`PUT` is a no-op
+(returns current values), `/api` exposes `"airband": true`, and the web UI
+disables the RX freq / Fs / bandwidth / gain / AGC controls. The airband task
+still configures the AD9361 directly on the iio device, so it is unaffected. This
+is **software-only** (FIT-only build, reflash `pluto.dfu`; no bitstream change).
+
+**Diagnose** (if you see noise on a build *without* the lock, or after manual iio
+pokes): check the live front-end and re-assert it if it drifted off-band.
+
+```sh
+# on the device
+P=/sys/bus/iio/devices/iio:device0
+cat $P/out_altvoltage0_RX_LO_frequency   # must be 123438000, not 2399999998
+cat $P/in_voltage_sampling_frequency     # must be 14000000, not 61440000
+# re-assert (Fs and bandwidth before LO):
+echo 14000000  > $P/in_voltage_sampling_frequency
+echo 14000000  > $P/in_voltage_rf_bandwidth
+echo 123438000 > $P/out_altvoltage0_RX_LO_frequency
+```
+
+Or from the host: `curl -s http://<pluto>:8000/api | grep -o '"airband":[a-z]*'`
+should print `"airband":true`, and the `ad9361` block should read
+`rx_lo_frequency 123438000 / sampling_frequency 14000000`.
+
+### CRITICAL: the `uio_pdrv_genirq.of_id` u-boot env (or `maia-httpd` won't start)
+
+**Symptom:** the device boots cleanly, `dropbear`/`:22` is up, but `maia-httpd`
+is **not running** and `:30000` never opens. Running it by hand fails with:
+
+```
+Error: failed to open maia-sdr UIO
+Caused by: UIO device not found
+```
+
+and `/sys/class/uio/` is **empty** even though the DT node
+`/proc/device-tree/fpga-axi@0/maia-sdr@7C400000` exists with
+`compatible = "uio_pdrv_genirq"`.
+
+**Cause:** `maia-httpd` reaches the FPGA register block through a **UIO device**
+created by the built-in `uio_pdrv_genirq` driver. That driver only binds a node
+whose `compatible` equals its `of_id` module parameter, and `of_id` is settable
+**only** via the kernel bootarg `uio_pdrv_genirq.of_id=uio_pdrv_genirq`. That
+bootarg is **not** in the default ADI firmware — Maia adds it through the
+**u-boot environment** (the `qspiboot` / `qspiboot_verbose` / `ramboot_verbose`
+boot-sequence variables each append it to `bootargs`). The env lives in its own
+flash partition (`mtd1`, `qspi-uboot-env`), **not** in `boot.dfu`/`mtd0`. A Pluto
+that still has the factory u-boot env (or any env without this bootarg) gets no
+`/dev/uio0` → `maia-httpd` aborts.
+
+**Diagnose** (over serial or SSH):
+
+```sh
+grep -o 'uio_pdrv_genirq.of_id=[^ ]*' /proc/cmdline   # empty == the bug
+ls /sys/class/uio/                                    # empty == no UIO bound
+fw_printenv | grep uio_pdrv_genirq                    # is it in the env at all?
+```
+
+**Fix — use `fw_setenv`, do NOT reflash the bootloader.** This is the
+[officially recommended method](https://maia-sdr.org/installation/) ("Set up the
+u-boot environment"). Set the three boot-sequence variables to include the
+bootarg, then reboot. The exact strings are in `plutosdr-fw/build/uboot-env.txt`
+after a build (and on the maia-sdr install page); enter them **one at a time**:
+
+```sh
+fw_setenv ramboot_verbose  '... clk_ignore_unused uio_pdrv_genirq.of_id=uio_pdrv_genirq uboot="${uboot-version}" ...'
+fw_setenv qspiboot_verbose '... clk_ignore_unused uio_pdrv_genirq.of_id=uio_pdrv_genirq uboot="${uboot-version}" ...'
+fw_setenv qspiboot         '... clk_ignore_unused uio_pdrv_genirq.of_id=uio_pdrv_genirq uboot="${uboot-version}" ...'
+reboot
+```
+
+`fw_setenv` rewrites `mtd1` in the device-native env format that the **running**
+u-boot reads, so it works regardless of which u-boot is on `mtd0`. The env
+persists across `pluto.frm`/`pluto.dfu` flashes, so this is a **one-time** step
+per device.
+
+> **Do NOT** try to fix this by DFU-flashing `boot.dfu` (`mtd0`) or
+> `uboot-env.dfu` (`mtd1`, DFU `alt=3`). Two traps, both observed here:
+> 1. The **factory u-boot write-protects `mtd0`** (`sf protect lock 0 100000`),
+>    so `dfu-util -a boot.dfu …` reports `Done!` but is a **silent no-op** — the
+>    factory u-boot (and its built-in default env, no `of_id`) keeps running.
+>    Check what's actually on `mtd0` with
+>    `strings /dev/mtd0 | grep -i 'u-boot\|plutosdr'`.
+> 2. The raw `uboot-env.dfu` image flashed to `alt=3` is **rejected by the
+>    factory u-boot** (different env format), which then falls back to its
+>    built-in default env (again no `of_id`) — even though `fw_printenv` *can*
+>    read the image. `fw_setenv` avoids this because it writes the canonical
+>    `fw_env.config` layout (`/dev/mtd1 0x0 0x20000`).
+> Flashing the bootloader is also explicitly discouraged upstream (a bad write
+> bricks the device and needs JTAG to recover).
+
+**Not the cause — don't chase these:**
+- `dmesg: maia_sdr: no symbol version for module_layout` is the **normal** ADI
+  out-of-tree-module taint, *not* a kernel/module mismatch. Confirm the kernel is
+  pinned correctly instead: device `uname -r` ==
+  `6.1.0-271887-g9670e17f01f1-dirty`, and the built `maia-sdr.ko` vermagic matches
+  it exactly (`plutosdr-fw` v0.8.2 pins linux 6.1.0 and maia-sdr `812de20` = the
+  v0.12.0 tag our airband branch is based on).
+
+**Handy reboot shortcuts** (from `/usr/sbin/device_reboot`, writes the reset
+cause to `/sys/kernel/debug/zynq_rst/code`):
+`device_reboot sf` → reboot into **Serial-Flash DFU mode** (no need to power-cycle
+to get back into `dfu-util`); `device_reboot break` → halt in the u-boot prompt;
+`device_reboot ram` / `verbose` / `reset` for the others.
+
+### IP addressing (`ipaddrmulti`)
+
+If host pings to `192.168.2.1` hit a *different* device on the LAN, the Pluto and
+the duplicate collide. The Maia firmware sets `ipaddrmulti=1` by default, which
+assigns **every** `192.168.0.1 … 192.168.255.1` to `usb0`, so the Pluto answers on
+whatever `192.168.x.0/24` the host USB-ethernet interface lands on. To pin a
+single address (e.g. to dodge a duplicate) use the u-boot env:
+`fw_setenv ipaddr 192.168.50.1` (and `fw_setenv ipaddrmulti 0` to disable the
+multi-bind), then reboot.
 
 ### Memory map (why airband is at `0x1900_0000`)
 
@@ -298,6 +491,11 @@ After boot (default `192.168.2.1`, ssh `root` / `analog`):
 # clean boot + airband reserved-memory node at the relocated address
 dmesg | grep -iE 'cma|maia_sdr_airband|panic|watchdog'
 ls /proc/device-tree/reserved-memory/ | grep airband      # maia_sdr_airband@19000000
+
+# UIO bootarg present + UIO device created (else maia-httpd can't start; see the
+# "uio_pdrv_genirq.of_id" section above for the fw_setenv fix)
+grep -o 'uio_pdrv_genirq.of_id=[^ ]*' /proc/cmdline         # must be non-empty
+ls /sys/class/uio/                                          # must list uio0
 
 # receiver auto-started with --airband, TCP stream listening
 ps w | grep '[m]aia-httpd'                                  # ... --airband

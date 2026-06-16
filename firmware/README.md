@@ -15,7 +15,11 @@ ADALM-Pluto and pull per-channel audio on the host.
   pool and bricked the device — see `DEV-SETUP.md`.)
 - **maia-httpd**: configures the AD9361 front-end + per-channel NCOs, starts the
   cyclic DMA, drains the ring and serves the **raw framed-audio records over TCP**
-  (default `0.0.0.0:30000`). Auto-starts on boot with `--airband`.
+  (default `0.0.0.0:30000`). Auto-starts on boot with `--airband`. While
+  `--airband` is set the AD9361 front-end is **locked read-only** — the
+  `/api/ad9361` HTTP endpoint is a no-op and the Maia web UI disables the RF
+  controls — so the web UI can't retune the radio off the airband band (123.438
+  MHz / 14 Msps). See `DEV-SETUP.md` ("the AD9361 front-end is locked read-only").
 
 Frame layout (little-endian 64-bit word, see `hdl/audio_framer.py`):
 

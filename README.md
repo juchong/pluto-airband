@@ -98,6 +98,19 @@ Interactive keys: `↑/↓` (or `j`/`k`, `[`/`]`) step channels, type a number t
 `m` mutes, `q` quits. The display shows a live level meter and cumulative dropped
 samples per channel, so it doubles as a quick link-health check.
 
+### Web UI (Maia spectrometer) — front-end is read-only
+
+The Pluto still serves the Maia SDR web UI at `http://192.168.2.1:8000`, and its
+waterfall is handy for seeing live activity across the **118–128 MHz** airband
+window. Because the airband receiver owns the single AD9361 front-end (its
+channelizer is built for **123.438 MHz / 14 Msps**), those controls — RX freq,
+sampling freq, RF bandwidth, gain, AGC — are **locked read-only** while the
+receiver is running. This is deliberate: the web UI used to silently retune the
+radio to its 2.4 GHz / 61.44 Msps defaults on page load, which moved the
+front-end off-band and made every channel demodulate noise. The lock is enforced
+server-side (`/api/ad9361` is a no-op under `--airband`), so the radio stays on
+the airband band no matter what the browser does.
+
 ## Customizing the channel plan
 
 The receiver reads `/root/airband.json` on the Pluto at startup; if absent it uses

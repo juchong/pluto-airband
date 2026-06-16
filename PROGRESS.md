@@ -412,10 +412,42 @@ so the kernel never came up.
   `pluto.dfu` (FIT-only) and verified the receiver comes up automatically after a
   power cycle. Full DFU/MTD details: `DEV-SETUP.md`, `firmware/README.md`.
 
+### AD9361 front-end lock — DONE (2026-06-16, "all channels on noise" root-caused)
+After the cadence fix the stream ran at the correct rate but every channel still
+sat on noise on hardware. **Root cause: the Maia web UI was retuning the radio
+off the airband band.** The AD9361 is a single shared front-end; on every page
+load `maia-wasm`'s `preferences.apply()` re-`PATCH`es each stored AD9361 setting,
+and the stored defaults are **2.4 GHz LO / 61.44 Msps**. That overwrote the
+123.438 MHz / 14 Msps front-end the airband task programs at startup, so the
+channelizer NCOs (baked for 14 Msps) all sat off-band → noise. (The "waterfall
+full of signals" was 2.4 GHz Wi-Fi.) Confirmed on the device: `RX_LO=2399999998,
+Fs=61440000`; re-asserting `123.438 MHz / 14 Msps` over iio immediately dropped
+RSSI 99→77 dB and the waterfall showed airband-band carriers.
+- **Fix (fork commit `aa9364e`):** when `--airband` is set the receiver owns the
+  AD9361 and the front-end is **locked read-only**:
+  - `maia-httpd` `app.rs`: `AppState` carries `airband_locked` (from `--airband`).
+  - `httpd/ad9361.rs`: `ad9361_update` is a **no-op while locked** (returns the
+    current values), so no `PATCH`/`PUT` on `/api/ad9361` can retune the radio.
+    The airband task configures the AD9361 directly on the iio device, so it is
+    unaffected.
+  - `maia-json` `Api` gains an `airband: bool` flag; `httpd/api.rs` populates it.
+  - `maia-wasm` `ui.rs`: `update_airband_lock()` disables the RX freq / Fs /
+    bandwidth / gain / AGC controls when the flag is set (UX; the server enforces
+    it independently).
+- **Software-only** (no HDL/bitstream change): FIT-only build, reflash `pluto.dfu`
+  only. **Verified on hardware after reflash:** `maia-wasm v0.12.0-14-gaa9364e`,
+  `/api` returns `airband:true`, front-end boots on-band (123.438 MHz / 14 Msps,
+  RSSI ~80 dB); loading the web UI with stale 2.4 GHz/61.44 Msps prefs **no longer
+  clobbers** the front-end (device stays 123.438/14M, all five controls
+  `disabled:true`); stream still 21 ch / ~15.6 ksps / 0 drops.
+
 ## Next steps
 - **Signal-quality tuning on real RF:** antenna + gain/AGC (`airband.json`
   `gain_db`/`agc`) and the host `--shift` (24→16-bit) on live airband traffic.
-  Samples are currently low-level noise (no strong signal on the bench antenna).
+  With the front-end lock in place the waterfall now shows real carriers in the
+  118–128 MHz window; per-channel AM peaks are still low because the channels are
+  idle between transmissions (AM output only rises during an active call on a
+  channel center). Next: tune on live voice traffic.
 - **LiveATC feeder integration** (§7 step 8 / §8.6): wire `host/airband-reader`
   per-channel audio into the LiveATC mountpoint convention (server, codec/bitrate
   still open, §8.6).
