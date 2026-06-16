@@ -87,10 +87,11 @@ is quiet (often only tens of LSB at 24-bit), so the default is **`-6`** (≈ +36
 makeup). Make it more negative if voice is too quiet, less negative (toward `0`,
 then positive) if loud signals clip.
 
-`--filter` (default **off**) applies a 300–3400 Hz voice band-pass. It is a
-diagnostic/stop-gap that masks out-of-voice-band artifacts but also degrades
-voice; the FPGA CORDIC envelope detector removes the underlying buzz at the
-source, so leave it off in normal use.
+`--filter` (default **off**) applies a 300–3400 Hz voice band-pass. It only
+**masks** out-of-voice-band artifacts and also degrades voice, so leave it off
+in normal use. The residual on-air "buzz" heard on some channels is an **RF
+hardware spur** (a comb locked to the Pluto's 40 MHz reference), not a DSP issue,
+and cannot be removed in firmware — see `firmware/diagnostics/README.md`.
 
 ### Audition channels live (testing)
 
@@ -146,8 +147,11 @@ Rules:
 - **Gain:** airband signals are weak and intermittent. The AD9361 AGC modes
   (`slow_attack`/`fast_attack`/`hybrid`) settle to ~55 dB on the *wideband* power
   and starve weak channels, so the default is fixed `agc: "manual"` at `gain_db:
-  71.0` (near max). Lower `gain_db` only if a strong local signal overloads the
-  front-end (audible distortion across channels).
+  71.0` (near max) to favour weak-signal sensitivity. At strong-signal sites 71 dB
+  can clip the *wideband* ADC (~15% observed) — lower `gain_db` if you hear
+  distortion, trading some sensitivity. Note: lowering gain does **not** remove
+  the fixed-frequency channel "buzz" (an RF hardware spur, see
+  `firmware/diagnostics/README.md`).
 
 Apply a new plan:
 

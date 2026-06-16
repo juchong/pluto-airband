@@ -399,9 +399,11 @@ LSB** (i.e. ~ −90 to −100 dBFS at 24-bit). Two things were eating it:
    | manual 64 dB | 64 dB | ~154 |
    | **manual 71 dB** | **71 dB** | **~280** |
 
-   Fixed **manual gain near max (71 dB)** wins by ~5×; the ADC does not overload
-   here (per-channel peak sums scale linearly with gain). This is now the default
-   in `firmware/airband.json` and the `maia-httpd` built-in
+   Fixed **manual gain near max (71 dB)** wins by ~5× for weak-signal recovery
+   and is the default. Caveat (found later, see `firmware/diagnostics/`): at
+   strong-signal sites 71 dB clips the *wideband* ADC (~15% of samples); lower
+   `gain_db` if you hear distortion. Note this does not remove the fixed RF-spur
+   "buzz". This is the default in `firmware/airband.json` and the `maia-httpd` built-in
    (`AirbandConfig::default`). To apply without reflashing, drop the config on the
    device and restart:
 

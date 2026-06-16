@@ -87,8 +87,10 @@ scp firmware/airband.json root@192.168.2.1:/root/airband.json
 `samp_rate` MUST stay at the value the channelizer was built for (14 MHz) and
 every `channels_hz` entry must be within `center_hz ± samp_rate/2`. The default
 uses fixed `agc: "manual"` at `gain_db: 71.0` — airband signals are weak and the
-AD9361 AGC modes settle to ~55 dB and starve weak channels. Lower `gain_db` only
-if a strong local signal overloads the front-end.
+AD9361 AGC modes settle to ~55 dB and starve weak channels. At 71 dB the wideband
+ADC can clip (~15%) at strong-signal sites; lower `gain_db` if you hear
+distortion (it trades weak-signal sensitivity and does not remove the RF-spur
+"buzz" — see `diagnostics/README.md`).
 
 ## 4. Read audio on the host
 

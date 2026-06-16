@@ -44,11 +44,16 @@ This is the building block for the airband channelizer: per-channel
 via multiplier-free **alpha-max-beta-min** (`max + 3/8·min`). 2-cycle pipeline.
 
 > **Superseded in the datapath.** Its gain ripples ~10% with the I/Q phase angle,
-> which amplitude-modulates each (slightly off-tuned) carrier into audible audio
-> spurs at 4·df and harmonics (~−30 dBc — the "buzz"). The shipping receiver uses
-> a ripple-free **CORDIC vectoring magnitude** in `am_backend_tdm.py:TdmAmBackend`
-> instead. `EnvelopeMagnitude` is kept only for the standalone self-test /
-> resource estimate. See `am_backend_tdm.py` for the analysis and fix.
+> which amplitude-modulates each (slightly off-tuned) carrier and adds demod
+> spurs at 4·df and harmonics (~−30 dBc). The shipping receiver uses a ripple-free
+> **CORDIC vectoring magnitude** in `am_backend_tdm.py:TdmAmBackend` instead, so
+> the demodulator itself is artifact-free. `EnvelopeMagnitude` is kept only for
+> the standalone self-test / resource estimate.
+>
+> Note: the audible on-air "buzz" was later root-caused to an **RF hardware spur**
+> (a comb locked to the Pluto's 40 MHz reference), independent of the demod — see
+> `firmware/diagnostics/README.md` and `PROGRESS.md`. CORDIC is the correct
+> detector regardless, but it is not the fix for that buzz.
 
 The script verifies the HW matches an exact integer model, bounds the
 approximation error (≈ −2.8%/+6.8%), and demonstrates AM-tone recovery; plot at
@@ -260,7 +265,7 @@ all channels, holding each channel's DC-block and CIC state in
 `amaranth.lib.memory` (BRAM/distributed RAM). The magnitude is a multiplier-free
 **CORDIC vectoring** detector (`CORDIC_ITERS=12`): unlike the old alpha-max-beta-min
 estimator it has **no angle-dependent gain ripple**, so it does not modulate
-off-tuned carriers into audible audio spurs (the buzz). A short sequential FSM
+off-tuned carriers into demod spurs. A short sequential FSM
 processes one channel (CORDIC iterations + DC + CIC stages); `busy` gates the
 caller; the AM duty has ample headroom (~0.85 at the deployment rate). **Bit-exact**
 to the per-channel `cordic_magnitude → DCBlock → CICDecimator` models, and recovers

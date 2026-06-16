@@ -470,7 +470,11 @@ amplifiers were missing:
 > shells, so `cargo build` lands the binary there, not `host/*/target/`. `unset
 > CARGO_TARGET_DIR` before building host tools to get the repo-local binary.
 
-### Audio buzz — ROOT-CAUSED + FIXED in HDL (2026-06-16, CORDIC magnitude)
+### Audio buzz — CORDIC magnitude (2026-06-16) — SUPERSEDED, see next section
+> **Note:** this section's conclusion (buzz fixed by the CORDIC demod) was wrong.
+> The buzz persisted after flashing; it was re-diagnosed as an RF hardware spur.
+> See "RE-DIAGNOSED as an RF hardware spur problem" below. CORDIC is retained as
+> the correct demodulator. The analysis below is kept as history.
 With levels up, a tonal **buzz** was audible on all channels (worst on ch0/5/6/
 10/11/12). Diagnosis (host recordings + numpy modelling, not RF):
 - FFT showed a low **~90/330/660 Hz** comb on every channel plus a channel-
