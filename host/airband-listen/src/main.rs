@@ -73,7 +73,7 @@ struct Args {
     #[arg(long, default_value_t = DEFAULT_RATE)]
     rate: u32,
     /// Initial playback gain (linear; airband audio is quiet, adjust with +/-)
-    #[arg(long, default_value_t = 30.0)]
+    #[arg(long, default_value_t = 3000.0)]
     gain: f32,
 }
 

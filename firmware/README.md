@@ -86,7 +86,10 @@ scp firmware/airband.json root@192.168.2.1:/root/airband.json
 ```
 
 `samp_rate` MUST stay at the value the channelizer was built for (14 MHz) and
-every `channels_hz` entry must be within `center_hz ± samp_rate/2`.
+every `channels_hz` entry must be within `center_hz ± samp_rate/2`. The default
+uses fixed `agc: "manual"` at `gain_db: 71.0` — airband signals are weak and the
+AD9361 AGC modes settle to ~55 dB and starve weak channels. Lower `gain_db` only
+if a strong local signal overloads the front-end.
 
 ## 4. Read audio on the host
 
@@ -100,12 +103,14 @@ host/airband-reader/target/release/airband-reader 192.168.2.1:30000
 airband-reader 192.168.2.1:30000 --mode wav --out-dir caps
 
 # raw s16le per channel (chNN.s16), e.g. to pipe into an encoder:
-airband-reader 192.168.2.1:30000 --mode raw --out-dir pcm --shift 6
+airband-reader 192.168.2.1:30000 --mode raw --out-dir pcm
 ```
 
-Tune `--shift` on a live signal (it right-shifts the 24-bit sample to 16-bit:
-too small clips, too large is quiet). The reader reconnects automatically and
-flags any FPGA/transport drops via the per-channel sequence counter.
+`--shift` scales the 24-bit sample into 16-bit: **positive = attenuate
+(right-shift), negative = makeup gain (left-shift)**. Airband AM audio is quiet,
+so the default is `-6` (≈ +36 dB). More negative = louder; positive if loud
+signals clip. The reader reconnects automatically and flags any FPGA/transport
+drops via the per-channel sequence counter.
 
 ## Notes / addressing invariants
 

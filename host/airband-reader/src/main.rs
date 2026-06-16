@@ -68,11 +68,14 @@ struct Args {
     /// Output directory for wav/raw modes
     #[arg(long, default_value = "airband-out")]
     out_dir: PathBuf,
-    /// Right-shift applied to the 24-bit sample before clamping to i16
+    /// Bit-shift applied to the 24-bit sample before clamping to i16.
     ///
-    /// Tune this on a real signal: too small clips, too large is quiet.
-    #[arg(long, default_value_t = 8)]
-    shift: u32,
+    /// Positive = right-shift (attenuate); negative = left-shift (makeup gain).
+    /// Airband AM audio is quiet (often tens of LSB at 24-bit), so a negative
+    /// value is usually needed to bring voice up to a usable 16-bit level.
+    /// Tune on a real signal: too negative clips, too positive is silent.
+    #[arg(long, default_value_t = -6, allow_hyphen_values = true)]
+    shift: i32,
     /// Statistics print interval in seconds
     #[arg(long, default_value_t = 5)]
     stats_interval: u64,
@@ -126,7 +129,7 @@ impl Sink {
         })
     }
 
-    fn push(&mut self, seq: u32, sample: i32, shift: u32) -> Result<()> {
+    fn push(&mut self, seq: u32, sample: i32, shift: i32) -> Result<()> {
         if let Some(prev) = self.last_seq {
             let expected = (prev + 1) % SEQ_MOD;
             if seq != expected {
@@ -139,7 +142,15 @@ impl Sink {
         self.interval_peak = self.interval_peak.max(sample.abs());
 
         if let Some(w) = self.writer.as_mut() {
-            let s16 = (sample >> shift).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+            // Positive shift attenuates (right-shift); negative shift applies
+            // makeup gain (left-shift). Use i64 intermediates so the left-shift
+            // cannot overflow before the i16 clamp.
+            let scaled = if shift >= 0 {
+                i64::from(sample >> shift)
+            } else {
+                i64::from(sample) << (-shift) as u32
+            };
+            let s16 = scaled.clamp(i16::MIN as i64, i16::MAX as i64) as i16;
             w.write_all(&s16.to_le_bytes())?;
             self.data_bytes += 2;
         }

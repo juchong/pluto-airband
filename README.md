@@ -78,11 +78,14 @@ $BIN 192.168.2.1:30000
 $BIN 192.168.2.1:30000 --mode wav --out-dir caps
 
 # raw s16le per channel (chNN.s16) to pipe into an encoder/feeder
-$BIN 192.168.2.1:30000 --mode raw --out-dir pcm --shift 6
+$BIN 192.168.2.1:30000 --mode raw --out-dir pcm
 ```
 
-Tune `--shift` on live traffic: it right-shifts the 24-bit sample to 16-bit — too
-small clips, too large is quiet (default 8).
+`--shift` scales the 24-bit demod sample into 16-bit before output: **positive
+right-shifts (attenuate), negative left-shifts (makeup gain)**. Airband AM audio
+is quiet (often only tens of LSB at 24-bit), so the default is **`-6`** (≈ +36 dB
+makeup). Make it more negative if voice is too quiet, less negative (toward `0`,
+then positive) if loud signals clip.
 
 ### Audition channels live (testing)
 
@@ -121,8 +124,8 @@ the same built-in defaults. A template is at `firmware/airband.json`:
   "center_hz":   123438000,   // AD9361 RX LO (capture center) — keep within the built window
   "samp_rate":   14000000,    // MUST stay 14 MHz (the rate the channelizer was built for)
   "rf_bandwidth":14000000,
-  "gain_db":     40.0,        // used when agc = "manual"
-  "agc":         "slow_attack", // "manual" | "slow_attack" | "fast_attack" | "hybrid"
+  "gain_db":     71.0,        // used when agc = "manual"; near-max for weak airband
+  "agc":         "manual",    // "manual" | "slow_attack" | "fast_attack" | "hybrid"
   "poll_ms":     20,
   "channels_hz": [ 118050000, 119200000, /* … up to 21 … */ 128500000 ]
 }
@@ -134,6 +137,11 @@ Rules:
 - Up to **21** entries in `channels_hz`, each within `center_hz ± samp_rate/2`
   (i.e. 116.438–130.438 MHz). Out-of-window channels are rejected at startup.
 - Changing `center_hz` re-tunes the whole window; keep all desired channels inside it.
+- **Gain:** airband signals are weak and intermittent. The AD9361 AGC modes
+  (`slow_attack`/`fast_attack`/`hybrid`) settle to ~55 dB on the *wideband* power
+  and starve weak channels, so the default is fixed `agc: "manual"` at `gain_db:
+  71.0` (near max). Lower `gain_db` only if a strong local signal overloads the
+  front-end (audible distortion across channels).
 
 Apply a new plan:
 

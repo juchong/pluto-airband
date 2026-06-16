@@ -334,6 +334,55 @@ Or from the host: `curl -s http://<pluto>:8000/api | grep -o '"airband":[a-z]*'`
 should print `"airband":true`, and the `ad9361` block should read
 `rx_lo_frequency 123438000 / sampling_frequency 14000000`.
 
+### "Receiver works but no audio" — it's a level problem, not the DSP
+
+**Symptom:** the stream runs (correct rate, 0 drops) and the channel carrying a
+known always-on signal (e.g. AWOS on 118.050) is the loudest in `airband-reader`
+stats, but it's still near-silent when you play/record it.
+
+The DSP chain (channelizer → `|I+jQ|` → DC block → audio CIC) is unity-ish gain
+and bit-exact in sim — it does not amplify. So the 24-bit audio sample only ever
+gets as large as the demodulated signal, which for weak airband AM is **tens of
+LSB** (i.e. ~ −90 to −100 dBFS at 24-bit). Two things were eating it:
+
+1. **AGC starves weak channels.** `slow_attack`/`fast_attack`/`hybrid` set RF
+   gain from the *wideband* (14 MHz) power and settle to ~48–57 dB, which leaves
+   the weak narrowband carrier tiny. Measured ch0 raw 24-bit peak:
+
+   | gain setting | RF gain | ch0 peak |
+   |---|---|---|
+   | slow_attack | 48 dB | ~40 |
+   | fast_attack | 55 dB | ~54 |
+   | hybrid | 57 dB | ~71 |
+   | manual 64 dB | 64 dB | ~154 |
+   | **manual 71 dB** | **71 dB** | **~280** |
+
+   Fixed **manual gain near max (71 dB)** wins by ~5×; the ADC does not overload
+   here (per-channel peak sums scale linearly with gain). This is now the default
+   in `firmware/airband.json` and the `maia-httpd` built-in
+   (`AirbandConfig::default`). To apply without reflashing, drop the config on the
+   device and restart:
+
+   ```sh
+   cat firmware/airband.json | ssh root@192.168.2.1 'cat > /root/airband.json'
+   ssh root@192.168.2.1 /etc/init.d/S60maia-httpd restart
+   ```
+
+   (The Pluto's dropbear has no `sftp-server`, so `scp` fails — pipe over `ssh`,
+   or `scp -O`.)
+
+2. **The host reader needs makeup gain.** `airband-reader --shift` scales the
+   24-bit sample into 16-bit; it is **signed** — positive right-shifts
+   (attenuate), negative left-shifts (gain). The default is `-6` (≈ +36 dB). With
+   manual 71 dB + `--shift -6`, ch0 lands at ~ −19 dBFS, no clipping, ~60 % of
+   energy in the 300–3400 Hz voice band, ~22 dB above the idle-channel floor.
+   `airband-listen` has the same need: its `--gain` default is 3000 (adjust live
+   with `+`/`-`).
+
+To confirm audio is *real voice* (not a carrier spike), record a few seconds and
+check the voice-band energy fraction, e.g. with numpy on `chNN.wav`: a live AWOS
+channel sits ~20+ dB over an idle channel with most energy in 300–3400 Hz.
+
 ### CRITICAL: the `uio_pdrv_genirq.of_id` u-boot env (or `maia-httpd` won't start)
 
 **Symptom:** the device boots cleanly, `dropbear`/`:22` is up, but `maia-httpd`

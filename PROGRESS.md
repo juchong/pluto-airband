@@ -441,13 +441,36 @@ RSSI 99→77 dB and the waterfall showed airband-band carriers.
   clobbers** the front-end (device stays 123.438/14M, all five controls
   `disabled:true`); stream still 21 ch / ~15.6 ksps / 0 drops.
 
+### Audio level — DONE (2026-06-16, "works but no audio" root-caused)
+With the front-end locked on-band, the receiver demodulated correctly but every
+channel was near-silent. **Root cause: signal level, not the DSP.** The chain
+(channelizer → `|I+jQ|` → DC block → audio CIC) is ~unity gain (bit-exact in
+sim), so weak airband AM only reaches tens of LSB at 24-bit (~ −95 dBFS). Two
+amplifiers were missing:
+- **RF gain:** the AD9361 AGC modes set gain from the *wideband* 14 MHz power and
+  settle low, starving weak narrowband channels. Measured ch0 (118.050 AWOS, raw
+  24-bit peak): slow_attack@48 dB → ~40, fast_attack@55 → ~54, hybrid@57 → ~71,
+  manual 64 → ~154, **manual 71 → ~280**. ADC does not overload (per-channel peak
+  sums scale linearly with gain). → Default changed to **fixed `agc:"manual"`,
+  `gain_db:71.0`** (`firmware/airband.json` + `AirbandConfig::default`).
+- **Host makeup gain:** `airband-reader --shift` was unsigned (right-shift only;
+  default 8 → divided the quiet sample to silence). Made it **signed** (negative =
+  left-shift / makeup gain), default **`-6`** (≈ +36 dB). `airband-listen` default
+  `--gain` raised 30 → 3000.
+- **Verified on hardware:** manual 71 dB + `--shift -6` → ch0 at **−19 dBFS, peak
+  ~18900, 0% clip, ~60% voice-band energy, ~22 dB over the idle-channel floor**;
+  21 ch / 0 drops. Config pushed to `/root/airband.json` (persists across reboot);
+  built-in default + host tools updated for fresh builds.
+
+> Gotcha logged: `CARGO_TARGET_DIR` is exported to a sandbox cache dir in agent
+> shells, so `cargo build` lands the binary there, not `host/*/target/`. `unset
+> CARGO_TARGET_DIR` before building host tools to get the repo-local binary.
+
 ## Next steps
-- **Signal-quality tuning on real RF:** antenna + gain/AGC (`airband.json`
-  `gain_db`/`agc`) and the host `--shift` (24→16-bit) on live airband traffic.
-  With the front-end lock in place the waterfall now shows real carriers in the
-  118–128 MHz window; per-channel AM peaks are still low because the channels are
-  idle between transmissions (AM output only rises during an active call on a
-  channel center). Next: tune on live voice traffic.
+- **Signal-quality tuning on real RF:** front-end locked on-band, manual 71 dB,
+  host `--shift -6` → live AWOS (ch0) recovers as clean voice at ~ −19 dBFS. Still
+  to do: a better antenna for weaker fields, and per-site tuning of `gain_db` /
+  `--shift` (lower gain if a strong local signal ever overloads the front-end).
 - **LiveATC feeder integration** (§7 step 8 / §8.6): wire `host/airband-reader`
   per-channel audio into the LiveATC mountpoint convention (server, codec/bitrate
   still open, §8.6).

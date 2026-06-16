@@ -1,10 +1,10 @@
 {
-  "_comment": "Optional airband receiver config for maia-httpd. Copy to /root/airband.json on the Pluto. If absent, maia-httpd uses these same built-in defaults. samp_rate MUST be the value the channelizer was built for (audio rate = samp_rate / 128 / 7 = 15625 sps at 14 MHz). channels_hz: up to 21 absolute channel centers, all within center_hz +/- samp_rate/2.",
+  "_comment": "Optional airband receiver config for maia-httpd. Copy to /root/airband.json on the Pluto. If absent, maia-httpd uses these same built-in defaults. samp_rate MUST be the value the channelizer was built for (audio rate = samp_rate / 128 / 7 = 15625 sps at 14 MHz). channels_hz: up to 21 absolute channel centers, all within center_hz +/- samp_rate/2. gain: airband voice is weak/intermittent; the AD9361 AGC modes (slow/fast/hybrid) settle to ~55 dB and starve weak channels, so the default is fixed manual gain near max (71 dB). Lower gain_db if a strong local signal overloads the front-end (audible distortion across channels).",
   "center_hz": 123438000,
   "samp_rate": 14000000,
   "rf_bandwidth": 14000000,
-  "gain_db": 40.0,
-  "agc": "slow_attack",
+  "gain_db": 71.0,
+  "agc": "manual",
   "poll_ms": 20,
   "channels_hz": [
     118050000,
