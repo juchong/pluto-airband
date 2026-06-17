@@ -11,7 +11,8 @@
 #      start; an uncommitted working tree aborts the build (override: FORCE_DIRTY=1).
 #   2. The fork's short commit hash is baked into the bitstream as USERID +
 #      USR_ACCESS (see maia-hdl/projects/pluto/system_project.tcl). After the
-#      build, `strings .../system_top.bit | grep UserID` MUST equal the commit you
+#      build, `strings .../system_top.bit | grep -i UserID` (bare hex, e.g.
+#      "UserID=8B601CF0") MUST equal the commit you
 #      shipped -- this is the authoritative "is the right gateware in the bit"
 #      check (a .bit holds config frames, not net names, so grepping signal names
 #      never works; the embedded UserID does).
@@ -125,9 +126,12 @@ DOCKER_USER="${DOCKER_USER:-0:0}" TARGET="$TARGET" \
 BIT="$FW/maia-sdr/maia-hdl/projects/pluto/pluto.runs/impl_1/system_top.bit"
 echo "== bitstream provenance =="
 if [ -f "$BIT" ]; then
-    EMB="$(strings "$BIT" | grep -oiE 'UserID=0x[0-9A-Fa-f]+' | head -1)"
-    echo "   expected UserID=0x$GIT_HASH ; embedded: ${EMB:-<none>}"
-    echo "$EMB" | grep -qiE "0x0*${GIT_HASH}\$" \
+    # Vivado's BITSTREAM.CONFIG.USERID embeds bare uppercase hex in the .bit
+    # header (e.g. "UserID=8B601CF0"), not a 0x-prefixed value -- tolerate both.
+    EMB="$(strings "$BIT" | grep -oiE 'UserID=(0x)?[0-9A-Fa-f]+' | head -1)"
+    EMB_HEX="$(printf '%s' "$EMB" | grep -oiE '[0-9A-Fa-f]+$' | tr 'A-F' 'a-f')"
+    echo "   expected UserID=$GIT_HASH ; embedded: ${EMB:-<none>}"
+    printf '%s' "$EMB_HEX" | grep -qiE "^0*${GIT_HASH}\$" \
         && echo "   OK: bitstream matches committed fork HEAD" \
         || echo "   WARNING: embedded UserID does not match $GIT_HASH -- DO NOT FLASH until resolved"
 else

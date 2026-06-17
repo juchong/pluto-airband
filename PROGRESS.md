@@ -538,6 +538,45 @@ the buzz persisted (only its spectrum shifted). A from-the-RF investigation
   triage (prefer the spur-free channels ch7/9/14/16/18). See
   `firmware/diagnostics/README.md`.
 
+### Web channel-config page — DONE on hardware (2026-06-16)
+A browser config page (`/airband.html`) now edits the channel plan + front-end
+settings against a new `maia-httpd` REST API, with a live spectrum/waterfall from
+the `/waterfall` WebSocket. Shipped and verified end-to-end on the device.
+- **Backend (fork):** `GET`/`PATCH /api/airband` (read/persist the plan to
+  `/root/airband.json`; validates ≤21 channels, in-window, gain 0–77 dB, poll
+  ≥1 ms; `samp_rate` locked) and `POST /api/system/restart` (applies a saved
+  config by restarting the service). `AppState` holds the boot-time (running)
+  config + path so the handler reports `needs_restart`. New `maia-json` types
+  `Airband`/`PatchAirband`/`AirbandChannel`/`AirbandAgcMode` (snake_case serde);
+  `AirbandConfig` gained `Serialize`/`PartialEq` + optional `channel_labels`.
+- **Frontend (fork):** static `airband.{html,js,css}` (Canvas2D spectrum +
+  scrolling waterfall, channel markers, per-channel signal meters, spur/DC bands,
+  zoom/pan + full-band minimap, add/remove/retune/label editing, presets +
+  import/export). Linked from the main UI's settings dialog.
+- **Build-flow fix (fork `8b601cf`):** the bitstream commit-hash baking used
+  `write_bitstream -g USERID:.. -g USR_ACCESS:..`, but Vivado 2023.2's
+  `write_bitstream` has **no `-g`** (legacy `bitgen` syntax) → impl_1 died with
+  "Unknown option '-g'". This had never built since it was added. Fixed by
+  stamping `BITSTREAM.CONFIG.USERID`/`USR_ACCESS` from a pre-`write_bitstream`
+  TCL hook (`system_project.tcl`). Note Vivado embeds **bare hex** in the .bit
+  header (`UserID=8B601CF0`), not `0x`-prefixed — the provenance grep in
+  `build_firmware_full.sh` + `BUILD.md` was updated to match.
+- **Build + flash:** full `HAVE_VIVADO=1` build, timing met (WNS +0.296 ns,
+  WHS +0.009 ns), `write_bitstream` OK, embedded `UserID=8B601CF0` == fork HEAD.
+  Software-only change → reflashed **`pluto.dfu` only** (u-boot env untouched, no
+  serial re-apply); the airband gateware logic is unchanged. (Runtime
+  `USR_ACCESS` still reads the old mtd0 bitstream until a both-partition flash —
+  expected for a FIT-only reflash.)
+- **Verified on hardware:** clean boot, no panic/watchdog, `maia-httpd --airband`
+  up, `:30000` listening, stream **21 ch / ~15.6 ksps / 0 drops**. `GET
+  /api/airband` returns the 21-ch plan; `PATCH` valid persists + flips
+  `needs_restart`, out-of-range gain → 400, off-window channel → 400; `POST
+  /api/system/restart` brings the service back in ~6 s and applies the config
+  (AD9361 re-tuned). **Browser-tested** `/airband.html`: waterfall + 21 channel
+  markers + signal meters render, spur/DC bands + minimap draw, label edit →
+  Save → `/root/airband.json` written + "saved" + restart banner, Add-channel
+  capped at 21/21. Test config removed afterward (device left pristine).
+
 ## Next steps
 - **Buzz is hardware-bound** (see RE-DIAGNOSED section): pursue power-supply
   cleanup / shielding / external reference; no further HDL work will help. Keep

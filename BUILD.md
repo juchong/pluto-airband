@@ -269,7 +269,7 @@ committed fork HEAD. To check by hand on the server:
 FW=~/pluto-build/plutosdr-fw
 BIT=$FW/maia-sdr/maia-hdl/projects/pluto/pluto.runs/impl_1/system_top.bit
 git -C ~/pluto-build/airband/maia-sdr rev-parse --short=8 HEAD   # the commit you shipped
-strings "$BIT" | grep -oiE 'UserID=0x[0-9a-f]+'                  # must equal 0x<that hash>
+strings "$BIT" | grep -oiE 'UserID=[0-9a-f]+'                    # bare hex, must equal <that hash>
 grep "write_bitstream completed successfully" \
   $FW/maia-sdr/maia-hdl/projects/pluto/pluto_vivado.log | tail -1
 ```
