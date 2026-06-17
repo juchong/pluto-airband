@@ -14,6 +14,18 @@ but they do **NOT** include the device-specific `fw_setenv` customizations:
   * `usb_ethernet_mode=ncm`   -> CDC-NCM USB gadget (macOS/iOS need this; the
                                  default is `rndis`, so the Mac never gets a
                                  usb0 IP and the web UI / SSH appear "dead")
+  * `ad936x_ext_refclk_override` -> per-unit 40 MHz reference calibration. The
+                                 `adi_loadvals` boot script does
+                                 `fdt set /clocks/clock@0 clock-frequency
+                                 <value>`, so all tuning hits the nominal
+                                 frequency. The value MUST be wrapped in literal
+                                 angle brackets (`<...>`) or u-boot fdt set stores
+                                 a string and the clock is ignored (this script
+                                 adds them). This board measured **39,999,338 Hz**
+                                 (carrier centered to <0.5 ppm vs a known AWOS at
+                                 118.050); RE-MEASURE per unit with
+                                 firmware/diagnostics/measure_offset.py and pass
+                                 --refclk-hz (0 to skip / leave default).
 
 So after every `boot.dfu` flash you MUST re-apply these or you waste time
 chasing "networking is broken" / "web won't load" / "wrong transceiver". This
@@ -180,6 +192,11 @@ def main():
                     help="USB ethernet gadget mode (macOS/iOS=ncm, Android=ecm, Windows=rndis). Default ncm.")
     ap.add_argument("--ipaddrmulti", action="store_true",
                     help="Also set ipaddrmulti=1 (bind 192.168.x.1 across subnets).")
+    ap.add_argument("--refclk-hz", type=int, default=39999338,
+                    help="Per-unit 40 MHz reference calibration (ad936x_ext_refclk_override). "
+                         "Measure with diagnostics/measure_offset.py. Pass 0 to skip. "
+                         "Default 39999338 = this board's measured value (carrier centered "
+                         "to <0.5 ppm vs a known AWOS).")
     ap.add_argument("--check", action="store_true", help="Read-only audit; change nothing.")
     ap.add_argument("--no-reboot", action="store_true", help="Apply but do not reboot.")
     args = ap.parse_args()
@@ -193,6 +210,10 @@ def main():
     }
     if args.ipaddrmulti:
         desired["ipaddrmulti"] = "1"
+    if args.refclk_hz:
+        # Literal angle brackets are REQUIRED: u-boot `fdt set` needs <N> to store
+        # an integer cell; a bare decimal is stored as a string and ignored.
+        desired["ad936x_ext_refclk_override"] = "<%d>" % args.refclk_hz
 
     con = Console(args.port)
     changed = False
@@ -205,7 +226,7 @@ def main():
             ok = (cur == want)
             print("  %-18s = %-12s  (want %s) %s" % (k, cur, want, "OK" if ok else "-> SET"))
             if not ok and not args.check:
-                con.run("fw_setenv %s %s" % (k, want))
+                con.run("fw_setenv %s '%s'" % (k, want))   # quote: value may contain <>
                 changed = True
 
         # uio_pdrv_genirq boot args: only rewrite the (long) boot-sequence vars

@@ -30,9 +30,11 @@ Supporting facts established along the way:
 - The disturbance is present in the **raw wideband IQ** captured via maia's own
   recorder, i.e. upstream of all airband logic — see `iq_envelope.py`,
   `wideband_spectrum.py`.
-- At the production manual gain of **71 dB the ADC clips ~15%** of samples;
+- At the original manual gain of **71 dB the ADC clips ~13–15%** of samples;
   lowering gain stops the clipping and the wideband AM but does **not** remove
-  the in-band spurs and costs real-signal sensitivity — see `gain_sweep.py`.
+  the in-band spurs — see `gain_sweep.py` / `floor_sweep.py`. (This clipping was
+  the real cause of the "poor noise floor"; the default is now **48 dB**, just
+  below the clipping knee — see `floor_sweep.py` and `SPEC.md` §5.)
 - The buzz is coherent/common-mode across all channels (one source); the low
   (~40–47 Hz) modulation is most likely the switching supply amplitude-
   modulating the spur comb (a static carrier would be removed by the DC block).
@@ -63,6 +65,8 @@ Supporting facts established along the way:
 | `spur_classify.py` | Captures at two LO frequencies and classifies each peak as fixed-offset (LO-relative synth spur) vs fixed-absolute (clock harmonic / EMI / real RF); maps internal spurs to channels. | gain + LO |
 | `samplerate_spur_test.py` | Sweeps the AD9361 sample rate and checks whether in-band spurs move (clock alias) or stay (physical). | gain + LO + Fs |
 | `gain_sweep.py` | Sweeps RX gain; reports ADC RMS/peak/clip% and low-freq wideband AM. | gain |
+| `floor_sweep.py` | Sweeps RX gain; per gain reports clip%, wideband PSD noise floor (median dBFS), SFDR (worst in-band spur above floor), and strong-peak count. Used to set the manual gain just below ADC clipping (the 71→48 dB change). | gain |
+| `measure_offset.py` | Measures a known carrier's frequency error (e.g. a commissioned AWOS) and derives the 40 MHz reference ppm error + the `ad936x_ext_refclk_override` value to calibrate it out. | recorder only |
 | `lo_band_am.py` | At a fixed clean gain, compares wideband level + low-freq AM across LO bands (internal vs external test). | gain + LO |
 | `iq_envelope.py` | Raw-IQ level/clipping, slow power-envelope AM (buzz signature), impulsive-glitch detection. Captures live or reads a `.sigmf-data` file. | recorder only |
 | `buzz_meter.py` | Connects to the decoded audio stream, demuxes channels, reports per-channel buzz metrics (comb%, 7625 Hz tone, etc.). A/B tool. | read-only stream |

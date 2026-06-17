@@ -607,6 +607,101 @@ live-validated by pushing assets to `/root` and reloading. Screenshots in
 - **Zoom less sensitive (touch/trackpad).** Wheel zoom is `exp(deltaY·0.0015)`
   with line/page normalization and ±50 clamp (~7%/notch vs. the old fixed 20%).
 
+### TX quieted on boot (receive-only build) — DONE on hardware (2026-06-16)
+"Pluto is producing EMI that affects other radios" + "suspect it affects its own
+RX." This is a pure receiver, but the Pluto boots the AD9361 in **FDD with the TX
+LO running** and only ~10 dB TX attenuation — i.e. it actively transmits a carrier.
+- **Live state read (iio sysfs, `ad9361-phy` = `iio:device0`):** `ensm_mode=fdd`,
+  `out_altvoltage1_TX_LO_powerdown=0`, `TX_LO=2.450 GHz`,
+  `out_voltage0_hardwaregain=-10 dB`. The TX DDS tones (`cf-ad9361-dds-core-lpc`)
+  were already silent (`scale=0`), so nothing *intentional* was sent — the emitter
+  is the **2.45 GHz LO carrier + TX-path noise leaking out the TX port**.
+- **No rx-only ENSM.** `ensm_mode_available = sleep wait alert fdd pinctrl
+  pinctrl_fdd_indep`; RX needs FDD and `alert` kills RX too. But in FDD the RX/TX
+  LOs are independent synths, so the fix is to **power down the TX LO** and **floor
+  TX attenuation**: `out_altvoltage1_TX_LO_powerdown=1`,
+  `out_voltage0_hardwaregain=-89.75` (range `[-89.75 … 0]`).
+- **RX unaffected (verified).** After the change the waterfall + per-channel meters
+  are unchanged; `RX_LO` still locked at 123.438 MHz, `ensm=fdd`.
+- **Own-RX A/B (raw `/waterfall`, 4096 bins, median of 60 frames):** in-band noise
+  floor **72.50 dB (TX on) vs 72.59 dB (TX off)** — no measurable change. 2.45 GHz
+  is far out of the 118–138 MHz window, so the TX LO does *not* raise our own floor;
+  the win is **external** (no radiated 2.45 GHz carrier to desense nearby radios).
+  The known in-band 120 MHz spur is the 40 MHz ref 3rd harmonic, unrelated to TX.
+- **Persistence.** rootfs is **ramfs** (`ntype=ramfs`) — a live `iio` write is lost
+  on power cycle, and `maia-httpd` never touches the TX. So the quiet step is baked
+  into the boot init: `firmware/patch_tx_quiet.py` idempotently injects a
+  backgrounded, retry-until-`ad9361-phy`-ready block into the `start)` case of
+  `buildroot/board/pluto/S60maia-httpd`, wired into `build_firmware_full.sh` (step
+  3c, next to the existing `--airband` patch). Marker-guarded (`airband-tx-quiet`),
+  tested for idempotency + `sh -n`. Effective immediately on the running unit via
+  the live `iio` writes; power-cycle-persistent after the next firmware flash.
+
+### Noise floor "extremely poor" → it was ADC clipping — DONE on hardware (2026-06-16)
+"Massive peaks, noise floor much worse than expected." Dug into the AD9361
+front-end (datasheet/UG-570 knobs) and measured rather than guessed.
+- **Tracking already optimal.** `in_voltage_{rf,bb}_dc_offset_tracking_en=1`,
+  `in_voltage_quadrature_tracking_en=1`, `calib_mode=auto` → DC spike + image
+  already suppressed; not the problem. RX FIR was off; analog RX BW = 14 MHz (= Fs).
+- **Root cause = clipping, not noise.** `firmware/diagnostics/floor_sweep.py`
+  (new) sweeps gain and reports clip% / PSD floor / SFDR / strong-peak count from
+  raw recorder IQ. Result at the 71 dB default: **13.4 % of samples clip**, effective
+  floor jammed to **−5.8 dBFS**. Hard clipping is a broadband intermod generator →
+  that *was* the "poor floor" + scattered peaks.
+
+  | gain | clip% | floor dBFS | SFDR dB |
+  |---|---|---|---|
+  | 71 | 13.4 | −5.8 | 26.5 |
+  | 55 | 0.77 | −13.8 | 22.6 |
+  | **48** | **0.25** | **−17.6** | 20.9 |
+  | 40 | ~0 | −24.9 | 20.7 |
+
+  Clipping vanishes by ~48 dB; floor drops ~19 dB **with no SNR loss** (signal+noise
+  scale together until the far-below quantization-limited region). SFDR stays ~20 dB
+  at every gain → the surviving peaks are the **gain-invariant 120 MHz reference
+  comb** (40 MHz ref 3rd harmonic), hardware-only, as before.
+- **Fix shipped.** Default `gain_db` **71 → 48** in `firmware/airband.json` (+ updated
+  `_comment`), applied live and to `/root/airband.json`. Web-page floor metric fell
+  ~70 → ~58 dB. Verdict on other levers: TX already quieted (prior entry); analog BW
+  narrow 14→11 MHz and an RX FIR are ~1 dB each (deferred); XADC / unused PS
+  peripherals not worth the device-tree risk; the comb needs a clean reference /
+  shielding. Docs: `SPEC.md` §5, `README.md` (Channel plan + Status),
+  `firmware/diagnostics/README.md`.
+
+### Reference-oscillator calibration vs known AWOS — DONE on hardware (2026-06-16)
+Zoomed the web UI on ch0 (118.050 MHz AWOS, just commissioned → transmit freq
+trustworthy) and the carrier sat slightly off the marker. Measured instead of
+eyeballing: `firmware/diagnostics/measure_offset.py` (new) records IQ, finds the
+carrier with a 4 M-pt FFT + parabolic interpolation (3.3 Hz bins, 46 dB SNR).
+- **Result (repeatable to <0.3 Hz over 4 runs):** carrier **+1597 Hz high** of the
+  118.050 marker → reference **−13.53 ppm low**, true XO ≈ **39,999,459 Hz**. (AM
+  envelope demod tolerates a 1.6 kHz carrier offset, so audio was unaffected; this
+  is an alignment/centering fix.)
+- **Fix = reference calibration, not an LO nudge.** A fixed LO shift only nulls one
+  frequency; the proper correction is the per-unit XO value (u-boot env
+  `ad936x_ext_refclk_override`; `adi_loadvals` `fdt set`s `/clocks/clock@0
+  clock-frequency` = the `ad9364_ext_refclk` the transceiver runs on).
+- **Two gotchas found by rebooting and re-measuring (first attempt failed):**
+  1. **Brackets mandatory.** `fw_setenv ad936x_ext_refclk_override 39999459` (bare
+     decimal) was silently ignored — `fdt set` needs `<N>` for an integer cell, else
+     it stores a string. Correct: `fw_setenv ... "<39999338>"`.
+  2. **Baseline isn't 40 MHz.** The booted DTB bakes 39,999,891 Hz, and
+     displayed = f_true·(believed/true_xo), so the override is `believed × true/
+     displayed`, derived from the measured error vs the LIVE clock — not 40e6·(1+ppm).
+- **Verified end-to-end:** set `<39999338>`, rebooted → DT clk = 39,999,338, carrier
+  error **+1671 → +51 Hz**; web UI shows the AWOS carrier centered on the 118.050
+  marker (`docs`/screenshot). Reapplied the ramfs-only session state after reboot
+  (gain 48 via `/root/airband.json` + restart; TX-quiet `iio` writes).
+- **Warmed-up check (~75 min uptime):** residual settles to **≈ −43 Hz (+0.36 ppm)**
+  — the 39,999,338 setting holds within **±0.4 ppm cold→warm**; remaining error is
+  XO thermal drift, negligible for 25 kHz AM. No re-tune warranted (a TCXO/GPSDO is
+  the only way to do better).
+- **Reproducible:** `measure_offset.py` now reads the live believed reference and
+  prints the exact bracketed `fw_setenv` (iterate if residual >~1 ppm);
+  `pluto_setup_env.py` gained `--refclk-hz` (default 39999338, brackets added
+  automatically) to re-apply after a `boot.dfu` flash. Docs: `SPEC.md` §5.2,
+  `firmware/diagnostics/README.md`. **Per unit** — re-measure for a different Pluto.
+
 ## Next steps
 - **Buzz is hardware-bound** (see RE-DIAGNOSED section): pursue power-supply
   cleanup / shielding / external reference; no further HDL work will help. Keep

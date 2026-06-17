@@ -115,6 +115,17 @@ if [ -f "$S60" ] && ! grep -q -- '--airband' "$S60"; then
     echo "== patched $S60: maia-httpd now auto-starts with --airband =="
 fi
 
+# 3c. Quiet the AD9361 TX on boot (this is a receive-only build). The Pluto comes
+#     up in FDD with the TX LO running (2.45 GHz default) at only ~10 dB
+#     attenuation, which leaks a carrier + TX-path noise -> EMI to nearby radios
+#     and a raised RX noise floor. There is no rx-only ENSM, but RX/TX LOs are
+#     independent in FDD, so we power down the TX LO and floor TX attenuation.
+#     rootfs is ramfs, so this must live in the init script to survive a power
+#     cycle. Idempotent (guarded by the airband-tx-quiet marker).
+if [ -f "$S60" ]; then
+    python3 "$AIRBAND_REPO/firmware/patch_tx_quiet.py" "$S60"
+fi
+
 # 4. Full build inside the maia-sdr-devel container (Vivado from /opt/Xilinx
 #    volume -> HAVE_VIVADO=1). GIT_HASH is exported into the container so the
 #    Vivado flow bakes it into the bitstream (USERID + USR_ACCESS).

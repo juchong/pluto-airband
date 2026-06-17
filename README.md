@@ -66,8 +66,15 @@ branch). The Maia base (spectrometer/recorder/DDC) is preserved.
   reference, channel triage). Full root-cause analysis and a diagnostic toolkit:
   [`firmware/diagnostics/README.md`](firmware/diagnostics/README.md).
 - **Single shared front-end:** one RX gain serves all 21 channels (no per-channel
-  AGC). The default is fixed manual gain near max for weak-signal sensitivity;
-  this can clip the wideband ADC at strong-signal sites — see [Channel plan](#channel-plan).
+  AGC). Default is fixed manual **48 dB** — the highest gain that doesn't overload
+  the wideband ADC. (The earlier 71 dB clipped ~13% of samples, which *was* the
+  "poor noise floor": broadband clipping intermod, not real noise. See
+  [Channel plan](#channel-plan).)
+- **Transmitter quieted on boot.** This is a pure receiver, but the Pluto powers up
+  in FDD with the TX LO running (2.45 GHz, ~10 dB attenuation) — radiated EMI to
+  nearby radios. The firmware now powers down the TX LO and floors TX attenuation at
+  boot (`firmware/patch_tx_quiet.py` → `S60maia-httpd`); RX is unaffected (the
+  in-band noise floor is identical with TX on/off — measured). See `SPEC.md` §5.1.
 - **LiveATC feeder integration** is still pending — see `PROGRESS.md` → Next steps.
 
 ## Quick start
@@ -206,7 +213,7 @@ the same built-in defaults. A template is at `firmware/airband.json`:
   "center_hz":   123438000,   // AD9361 RX LO (capture center) — keep within the built window
   "samp_rate":   14000000,    // MUST stay 14 MHz (the rate the channelizer was built for)
   "rf_bandwidth":14000000,
-  "gain_db":     71.0,        // used when agc = "manual"; near-max for weak airband
+  "gain_db":     48.0,        // used when agc = "manual"; highest gain w/o ADC clipping
   "agc":         "manual",    // "manual" | "slow_attack" | "fast_attack" | "hybrid"
   "poll_ms":     20,
   "channels_hz": [ 118050000, 119200000, /* … up to 21 … */ 128500000 ]
@@ -219,13 +226,17 @@ Rules:
 - Up to **21** entries in `channels_hz`, each within `center_hz ± samp_rate/2`
   (i.e. 116.438–130.438 MHz). Out-of-window channels are rejected at startup.
 - Changing `center_hz` re-tunes the whole window; keep all desired channels inside it.
-- **Gain:** airband signals are weak and intermittent. The AD9361 AGC modes
-  (`slow_attack`/`fast_attack`/`hybrid`) settle to ~55 dB on the *wideband* power
-  and starve weak channels, so the default is fixed `agc: "manual"` at `gain_db:
-  71.0` (near max) to favour weak-signal sensitivity. At strong-signal sites 71 dB
-  can clip the *wideband* ADC (~15% observed) — lower `gain_db` if you hear
-  distortion, trading some sensitivity. Lowering gain does **not** remove the
-  fixed-frequency channel "buzz" (an RF hardware spur; see
+- **Gain:** one shared RX gain serves all 21 channels; fixed `agc: "manual"` (the
+  AD9361 AGC modes settle on *wideband* power and starve weak channels). The default
+  is **`gain_db: 48.0`** — the highest gain that does *not* overload the wideband
+  ADC. The previous 71 dB (chosen for weak-signal sensitivity) drove the ADC into
+  **hard clipping ~13% of samples**; that broadband intermod is what made the noise
+  floor look terrible (effective floor ~−6 dBFS) and scattered spurs across the band.
+  A measured sweep ([`firmware/diagnostics/floor_sweep.py`](firmware/diagnostics/floor_sweep.py))
+  shows clipping gone by ~48 dB and the floor ~19 dB lower with no SNR loss. Raise
+  toward 55–71 dB only for a quieter site / better antenna (watch the clip %); lower
+  if a strong local signal still overloads. Gain does **not** remove the
+  fixed-frequency channel "buzz" (the 120 MHz reference-harmonic spur; see
   [`firmware/diagnostics/README.md`](firmware/diagnostics/README.md)).
 
 Apply a new plan:

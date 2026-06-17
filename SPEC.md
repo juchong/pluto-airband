@@ -206,15 +206,88 @@ The receiver reads `/root/airband.json` at startup (template:
   118.05–128.5 MHz; every channel sits inside the central ~80% of the band, clear
   of the filter skirts. (Channel selection and the LO choice — placing the zero-IF
   DC/LO-leakage spur in a guard gap — are derived in `hdl/capture_window.py`.)
-- **Gain:** one shared RX gain serves all 21 channels (no per-channel AGC). The
-  default is fixed **manual 71 dB**, near max, to favour weak/intermittent airband
-  signals; the AD9361 AGC modes settle on wideband power and starve weak channels.
-  At strong-signal sites 71 dB can clip the wideband ADC (~15% observed) — lower
-  `gain_db` if you hear distortion, trading sensitivity.
+- **Gain:** one shared RX gain serves all 21 channels (no per-channel AGC); fixed
+  **manual gain** (the AD9361 AGC modes settle on wideband power and starve weak
+  channels). The default is **48 dB** — the highest gain that does *not* overload
+  the wideband ADC. The original 71 dB was chosen for weak-signal sensitivity but
+  drove the ADC into **hard clipping ~13 % of samples**; that broadband intermod —
+  not a real noise floor — raised the displayed floor to ~−6 dBFS and sprayed
+  spurs across the band. A measured gain sweep (`firmware/diagnostics/floor_sweep.py`)
+  showed clipping vanishes by ~48 dB, dropping the floor ~19 dB with **no SNR loss**
+  (signal and noise scale together until the noise/quantization-limited region far
+  below). Raise toward 55–71 dB only at a quieter site / with a better antenna
+  (watch clip %); lower if a strong local signal still overloads. The residual
+  in-band spur comb (120 MHz = 40 MHz reference 3rd harmonic, §7) is gain-invariant
+  hardware RF, not addressed by gain.
 
 While `maia-httpd` runs with `--airband`, the AD9361 front-end is **locked
 read-only** (`/api/ad9361` is a no-op and the web UI disables RF controls) so the
 web UI cannot retune the radio off the airband band.
+
+### 5.1 Transmitter quieted on boot (receive-only)
+
+This is a pure receiver, but the Pluto powers up with the AD9361 in **FDD with the
+TX LO running** (`out_altvoltage1_TX_LO_powerdown=0`, default `TX_LO=2.45 GHz`) at
+only ~10 dB TX attenuation. That radiates a 2.45 GHz carrier (plus TX-path noise)
+which is audible EMI to nearby radios. There is no rx-only ENSM mode on the Pluto
+AD9361 driver (`ensm_mode_available = sleep wait alert fdd pinctrl
+pinctrl_fdd_indep`) and RX requires FDD, but in FDD the RX and TX LOs are
+independent synthesizers, so the TX is quieted without touching RX:
+
+- `out_altvoltage1_TX_LO_powerdown = 1` — power down the TX LO synth.
+- `out_voltage0_hardwaregain = -89.75` — TX attenuation floor (range `[-89.75 … 0]`).
+
+RX is unaffected (waterfall, per-channel meters, and the 123.438 MHz RX LO all
+unchanged). An A/B on the raw `/waterfall` feed (median of 60 frames, 4096 bins)
+shows the in-band noise floor is identical with TX on vs off (~72.5 dB) — 2.45 GHz
+is far outside the 118–138 MHz window, so the TX never raised our *own* floor; the
+benefit is the eliminated external carrier. (The separate in-band 120 MHz spur is
+the 40 MHz reference's 3rd harmonic, not the TX — see §7.)
+
+The rootfs is **ramfs**, so this is not a runtime `maia-httpd` setting; it is baked
+into the boot init script. `firmware/patch_tx_quiet.py` idempotently injects a
+backgrounded, retry-until-`ad9361-phy`-ready block into the `start)` case of
+`buildroot/board/pluto/S60maia-httpd`, wired into `firmware/build_firmware_full.sh`
+(step 3c). On a running unit the same two `iio` writes apply the change immediately;
+it becomes power-cycle-persistent at the next firmware flash.
+
+### 5.2 Reference-oscillator calibration (per unit)
+
+The Pluto's 40 MHz reference is an uncalibrated oscillator; its ppm error shifts
+every tuned frequency proportionally. Measured against a known-accurate carrier
+(a freshly commissioned **AWOS at 118.050 MHz**), a true 118.050 MHz signal landed
+~1.6 kHz high. Calibration uses the u-boot env var **`ad936x_ext_refclk_override`**
+— the `adi_loadvals` boot script does `fdt set /clocks/clock@0 clock-frequency
+<value>`, so the AD9361 driver computes its PLL/decimation from the *true* reference
+and the nominal 123.438 MHz LO / 14 MHz Fs are hit exactly (all 21 channels
+corrected together; the channelizer NCO math is unchanged). `/clocks/clock@0` is the
+`ad9364_ext_refclk` the transceiver runs on.
+
+Two gotchas, both learned on hardware:
+- **Angle brackets are mandatory.** `fdt set ... clock-frequency <N>` needs the
+  literal `<>` (an integer cell); a bare decimal is stored as a *string* and
+  silently ignored, leaving the baked DTB value. Set it as
+  `fw_setenv ad936x_ext_refclk_override "<39999338>"`.
+- **The value is the absolute true XO, not 40 MHz×(1+ppm).** The booted DTB on this
+  unit bakes a non-nominal clock (39,999,891 Hz), and the displayed carrier scales
+  as `f_true·(believed_ref / true_xo)`. So the override = the *current* believed
+  reference × (true/displayed), i.e. derived from the measured error against the
+  live clock — **not** from nominal 40 MHz. This board: **39,999,338 Hz**.
+
+Result: carrier error **+1671 Hz → +51 Hz** at apply, and after the unit warmed up
+(~75 min) it settles to **≈ −43 Hz (+0.36 ppm)** — i.e. the 39,999,338 Hz setting
+holds within **±0.4 ppm across the cold→warm swing**. The remaining error is
+ordinary XO thermal drift (the bare-XO Pluto cannot do better without a TCXO/GPSDO),
+and ±0.4 ppm (~±50 Hz at 118 MHz) is negligible for 25 kHz AM channels.
+
+- **Measure:** `firmware/diagnostics/measure_offset.py [true_MHz]` — recorder-only;
+  reads the live believed reference (via SSH) and prints the exact bracketed
+  `fw_setenv` command. Iterate (apply → reboot → re-measure) if residual >~1 ppm.
+- **Apply:** `fw_setenv ad936x_ext_refclk_override "<hz>"` then reboot. Persistent
+  in the env partition; a `boot.dfu` flash resets the env, after which
+  `firmware/pluto_setup_env.py --refclk-hz <hz>` re-applies it (brackets added
+  automatically; default carries this board's value). **Per unit** — re-measure for
+  a different Pluto.
 
 ## 6. Control plane and data plane
 
