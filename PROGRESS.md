@@ -577,6 +577,36 @@ the `/waterfall` WebSocket. Shipped and verified end-to-end on the device.
   Save → `/root/airband.json` written + "saved" + restart banner, Add-channel
   capped at 21/21. Test config removed afterward (device left pristine).
 
+### Web config UI refinements — DONE on hardware (2026-06-17)
+Follow-up fixes after first on-device use. All client-side (`airband.{html,js,css}`);
+live-validated by pushing assets to `/root` and reloading. Screenshots in
+`docs/images/`; embedded in `README.md` → *Web config page*.
+- **Waterfall showed only a black plot — two compounding bugs.** (1) CSS
+  specificity: the overlay `<canvas>` matched `.canvas_stack canvas { background:
+  #05070a }` (0,1,1), which out-ranked a plain `.overlay { background:transparent }`
+  (0,1,0), so the opaque overlay hid the spectrum + waterfall (only the markers
+  drawn *on* it showed). Fixed with `.canvas_stack canvas.overlay` (0,2,1).
+  (2) dB scaling: `percentile()` used a hardcoded `[-120, 40] dB` histogram range
+  while the live feed is ~65–98 dB, so the noise-floor estimate and color window
+  collapsed. Now the percentile range is derived from the frame and the color
+  window tracks the measured floor (≈ the main UI's 35/85 dB profile). Verified
+  the canvas paints the orange/red colormap identically to the main waterfall.
+- **Per-channel signal bars decayed too slowly.** maia's `Average` mode is a
+  per-window mean (no cross-frame decay), so the lag was structural: a ~5 Hz feed
+  re-read by a 250 ms timer → up to ~450 ms hold. Now meters update inside
+  `onSpectrum` (every frame), and the page raises the spectrometer output rate to
+  ≈ 20 Hz on load (`number_integrations` 684→171; shared with the main waterfall,
+  only ever raised). Effective latency ~450 ms → ~50 ms.
+- **Gain bounded with a clear limit.** Field stays `0–77` (matches backend) and
+  `readFrontEndForm` clamps + reflects the value (999→77, −5→0); a `range 0–77 dB`
+  hint is shown.
+- **Locked fields are now obvious.** Center frequency and sample rate render a
+  lock badge + lock icon + dashed/muted read-only styling. Center was made
+  read-only (was editable) so it can't move channels outside `[center ± Fs/2]`
+  (which the backend rejects); `plan.centerHz` round-trips the device value.
+- **Zoom less sensitive (touch/trackpad).** Wheel zoom is `exp(deltaY·0.0015)`
+  with line/page normalization and ±50 clamp (~7%/notch vs. the old fixed 20%).
+
 ## Next steps
 - **Buzz is hardware-bound** (see RE-DIAGNOSED section): pursue power-supply
   cleanup / shielding / external reference; no further HDL work will help. Keep

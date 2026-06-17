@@ -285,8 +285,17 @@ The channel plan and front-end settings can be edited from a browser instead of
 hand-editing JSON. `maia-httpd` exposes a small REST API consumed by the static
 page `maia-wasm/assets/airband.html` (served at `/airband.html`, also linked from
 the main UI). The page renders a live spectrum + waterfall from the existing
-`/waterfall` WebSocket, overlays the channel plan, and offers zoom/pan, a
-full-band minimap, per-channel signal meters, and add/remove/retune editing.
+`/waterfall` WebSocket — using the same dB color scaling as the main UI — overlays
+the channel plan, and offers zoom/pan (wheel sensitivity tuned for
+trackpads/touchscreens), a full-band minimap, and add/remove/reorder/relabel
+editing. Per-channel signal meters (peak vs. measured noise floor) refresh on
+every waterfall frame so the bars track activity in near-real time. **Center
+frequency and sample rate are presented read-only** (with a lock badge): the
+sample rate is fixed by the bitstream, and locking the center keeps saved
+channels inside the capture window. The gain field is bounded to `[0, 77] dB`. To
+keep the displays responsive the page requests a faster spectrometer output rate
+(≈ 20 Hz) on load when the device is slower; this rate is shared with the main
+`:8000` waterfall. Annotated screenshots are in `README.md` → *Web config page*.
 
 | Endpoint | Purpose |
 |---|---|

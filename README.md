@@ -246,19 +246,33 @@ http://192.168.2.1:8000/airband.html     # also linked from the main UI → sett
 
 It shows a **live spectrum + waterfall** of the captured band (fed by the same
 `/waterfall` WebSocket as the main UI) with the channel plan overlaid, so you can
-*see* whether a channel carries traffic before committing to it:
+*see* whether a channel carries traffic before committing to it. The waterfall
+uses the same dB color scaling as the main UI, so a busy band looks identical
+here:
+
+![Airband config page — live spectrum, waterfall, full-band minimap, and channel markers](docs/images/airband-overview.png)
 
 - **Add / remove / reorder / relabel** channels; drag a marker (or edit the MHz
-  field) to retune; "Add peak" snaps a new channel onto the strongest visible
-  signal. A slot counter enforces the **21**-channel limit.
-- **Zoom & pan:** type a frequency to auto-zoom to it, scroll-wheel to zoom,
-  drag to pan, or use the **full-band minimap** to jump around. Known RF spur
-  and DC bands are shaded so you can avoid placing channels on them.
-- **Per-channel signal meters** (peak vs. noise floor) update live, and a
-  suggested squelch level is derived from the noise floor.
-- **Front-end controls:** center frequency, RF bandwidth, gain, AGC mode, poll
-  interval (`samp_rate` is read-only — it is fixed by the bitstream).
+  field) to move a channel; "Add peak" snaps a new channel onto the strongest
+  visible signal. A slot counter enforces the **21**-channel limit.
+- **Zoom & pan:** type a frequency to auto-zoom to it, scroll-wheel to zoom
+  (tuned to stay gentle on trackpads/touchscreens), drag to pan, or use the
+  **full-band minimap** to jump around. Known RF spur and DC bands are shaded so
+  you can avoid placing channels on them.
+- **Per-channel signal meters** (peak vs. noise floor) refresh on every
+  waterfall frame, so the bars track activity in near-real time; a suggested
+  squelch level is derived from the noise floor.
+
+![Channel list with live per-channel signal meters](docs/images/airband-channels.png)
+
+- **Front-end controls:** RF bandwidth, gain (**0–77 dB**, bounded), AGC mode,
+  and poll interval are editable. **Center frequency and sample rate are locked**
+  (marked with a lock badge): the sample rate is fixed by the bitstream, and the
+  center is held so saved channels stay inside the capture window
+  `[center − Fs/2, center + Fs/2)`.
 - **Presets + import/export** of the JSON plan.
+
+![Front-end settings with locked center frequency and sample rate, and a bounded gain field](docs/images/airband-frontend.png)
 
 Saving **persists `/root/airband.json`** and shows a banner; click **Restart
 receiver** (or reboot) to apply — the channelizer NCOs are programmed once at
