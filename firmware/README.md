@@ -37,9 +37,23 @@ bits [63:40] per-channel sequence counter (wraps at 2**24; gap = dropped samples
 The single build script `build_firmware_full.sh` (run on the x86-64 build server)
 pulls both repos, builds **only** from committed git state, bakes the fork commit
 hash into the bitstream (USERID + USR_ACCESS), and produces **both** partitions:
-`boot.{frm,dfu}` (mtd0: FSBL + bitstream + u-boot) and `pluto.{frm,dfu}` (mtd3:
+`boot.{frm,dfu}` (mtd0: FSBL + bitstream + u-boot) and `$TARGET.{frm,dfu}` (mtd3:
 kernel + DT + rootfs). `build_bitstream.sh` is a fast, non-flashable host-Vivado
 synthesis/timing check.
+
+### Hardware variants (`TARGET`)
+
+The build defaults to `TARGET=pluto` (ADALM-Pluto, `xc7z010clg225-1`). Set
+`TARGET=plutoplus` for the **Pluto+** (the open `plutoplus/plutoplus` board):
+same XC7Z010 die, different package (`xc7z010clg400-1`), plus Gigabit Ethernet,
+microSD, and a 0.5 ppm VCTCXO. The airband design is unchanged across variants —
+the Pluto+ project shares the pluto `system_top.v` and sources its
+`system_bd.tcl` (so the airband HP0 DMA wiring carries over), and its
+`zynq-plutoplus-maiasdr.dts` `#include`s the shared `zynq-pluto-sdr-maiasdr.dtsi`
+overlay (so the airband reserved-memory + rxbuffer nodes carry over). The FIT
+image is named after the target: `plutoplus.{frm,dfu}` instead of
+`pluto.{frm,dfu}`. See `../BUILD.md` ("Pluto+ variant") for build/flash/jumper/
+Ethernet details.
 
 > **Why two partitions matter:** the **bitstream and FSBL live in `BOOT.BIN`
 > (`boot.frm`, `mtd0`)**. Flashing only `pluto.dfu` after an HDL change can leave

@@ -98,6 +98,13 @@ over USB. Full build + flash + first-boot details (incl. the u-boot env that a
 `boot.dfu` flash wipes) are in **[`BUILD.md`](BUILD.md)** and
 [`firmware/README.md`](firmware/README.md).
 
+> **Pluto+ variant.** On a [Pluto+](https://github.com/plutoplus/plutoplus)
+> (same XC7Z010 die, `clg400` package, Gigabit Ethernet + microSD + 0.5 ppm
+> VCTCXO) build with `TARGET=plutoplus` and flash `plutoplus.dfu` in place of
+> `pluto.dfu`. Set the USB-PHY-reset jumper to **MIO46**, and the audio stream is
+> reachable on the Ethernet `eth0` (DHCP) IP as well as USB. See
+> [`BUILD.md`](BUILD.md) → "Pluto+ variant".
+
 ### 2. Listen
 
 Build and run the host reader (Rust):

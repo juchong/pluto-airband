@@ -75,6 +75,31 @@ write a small host reader instead.
 - **Net effect:** front-end capability is not a project risk. The single
   feasibility gate that mattered was FPGA resource fit (§4), which passed.
 
+### 2.4 Hardware variant: Pluto+
+The receiver also targets the **Pluto+** (the open `plutoplus/plutoplus` board).
+It is the **same XC7Z010 die** as the ADALM-Pluto — a different package
+(`xc7z010clg400-1`) with a different MIO pinout, but identical FPGA resources, so
+the 21-channel design fits unchanged (no resource re-fit; build with
+`TARGET=plutoplus`, see `BUILD.md`). The Pluto+ adds three things this project
+cares about:
+
+- **Gigabit Ethernet** — a higher-bandwidth alternative to the USB link.
+  `maia-httpd` binds `0.0.0.0:30000`, so the framed-audio stream is served on
+  the Ethernet `eth0` interface (DHCP) with no firmware change; the host reader
+  just connects to the Ethernet IP. (The interface-bandwidth argument of §2.2 is
+  unchanged — we still ship only demodulated audio — but Ethernet removes the
+  USB 2.0 ceiling for future wider plans.)
+- **0.5 ppm VCTCXO** — a disciplined reference vs the ADALM-Pluto's bare,
+  uncalibrated XO, so the per-unit `ad936x_ext_refclk_override` calibration of
+  §5.2 is generally **unnecessary** (leave nominal 40 MHz; re-measure only if a
+  known carrier shows drift worth correcting).
+- **Better shielding / power** — may reduce the audible modulation of the
+  120 MHz reference-harmonic spur (§7), though the spur itself is reference-locked
+  RF; confirm on the unit with the diagnostics toolkit rather than assume.
+
+The Pluto+ requires the USB-PHY-reset jumper at **URST↔MIO46** (MIO52 carries
+Ethernet MDIO) when running this firmware.
+
 ## 3. Built on Maia SDR
 
 This receiver is built **on top of** [Maia SDR](https://maia-sdr.org/) by Daniel

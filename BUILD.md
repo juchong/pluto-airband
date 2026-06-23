@@ -280,6 +280,63 @@ Vivado. A `.bit` holds config frames, not your netlist, so grepping signal names
 (`grep cordic`) never works — the embedded UserID is the identity. USR_ACCESS
 carries the same hash and is readable at runtime for on-device confirmation.
 
+### Pluto+ variant (`TARGET=plutoplus`)
+
+The **Pluto+** (the open `plutoplus/plutoplus` board: Gigabit Ethernet, microSD,
+0.5 ppm VCTCXO) is the **same XC7Z010 die** as the ADALM-Pluto, just a different
+package (`xc7z010clg400-1` vs `clg225-1`) with a different MIO pinout. Maia SDR
+ships a `plutoplus` build target, and the airband receiver fits **identically**
+(same LUT/FF/BRAM/DSP) — there is no new FPGA project and no resource re-fit.
+
+Build and flash exactly like the ADALM-Pluto, but set `TARGET=plutoplus`:
+
+```bash
+# on the build server (pushes pulled, ~20 min)
+TARGET=plutoplus bash ~/pluto-build/airband/firmware/build_firmware_full.sh
+# artifacts: build/{boot,plutoplus}.{frm,dfu}
+scp <server>:~/pluto-build/plutosdr-fw/build/{boot,plutoplus}.dfu firmware/build/
+cd firmware/build
+dfu-util -a boot.dfu     -D boot.dfu          # mtd0: bitstream + FSBL + u-boot
+dfu-util -a firmware.dfu -D plutoplus.dfu     # mtd3: kernel + DT + rootfs
+dfu-util -a firmware.dfu -e                   # leave DFU
+```
+
+What carries over automatically (no edit needed):
+
+- **Bitstream:** `projects/plutoplus/system_project.tcl` builds the `clg400` part
+  and (after this work) bakes the same USERID/USR_ACCESS commit hash; its
+  `system_bd.tcl` just `source`s `../pluto/system_bd.tcl` (so the airband HP0
+  `m_axi_airband` DMA is wired) under a `plutoplus` flag that adds Ethernet
+  (MIO16-27 + MDIO52-53), microSD, and the USB-PHY reset on **MIO46**.
+- **Devicetree:** `zynq-plutoplus-maiasdr.dts` `#include`s the shared
+  `zynq-pluto-sdr-maiasdr.dtsi` that `apply_airband_devicetree.py` patches, so
+  the `maia_sdr_airband@19000000` reserved region + rxbuffer node are present.
+- **Init script:** `buildroot/board/plutoplus/S60maia-httpd` gets the same
+  `--airband` auto-start and TX-quiet patches (the build script now uses
+  `board/$TARGET`).
+
+Pluto+-specific operational notes:
+
+- **Jumper:** the Maia/airband firmware requires the USB-PHY-reset jumper at
+  **URST↔MIO46** (MIO52 is taken by Ethernet MDIO). With the jumper at MIO52 the
+  board only runs stock ADALM-Pluto firmware (no Ethernet).
+- **Transport (Gigabit Ethernet, DHCP):** `maia-httpd` binds `0.0.0.0:30000`
+  (and `:8000`), so the stream is reachable on the DHCP-assigned `eth0` address
+  with no code change — `airband-reader <eth0-ip>:30000`. Configure the Ethernet
+  IP via the `[USB_ETHERNET]` section of `config.txt` on the device (despite its
+  name it controls the physical Ethernet port); leave it blank for a DHCP lease,
+  which you can discover via mDNS/router/serial. Leave `ipaddrmulti` **disabled**
+  (it conflicts with the Pluto+ Ethernet IP).
+- **Reference (VCTCXO):** the Pluto+ has a 0.5 ppm VCTCXO, so it needs **no**
+  per-unit bare-XO calibration. Re-apply the u-boot env after a `boot.dfu` flash
+  with `firmware/pluto_setup_env.py --device plutoplus` (defaults the refclk
+  override to 0 = nominal 40 MHz). Only set `--refclk-hz` if
+  `diagnostics/measure_offset.py` shows it is worthwhile.
+- **Buzz spur:** the 120 MHz reference-harmonic spur (`SPEC.md` §7) is a
+  hardware/PCB property; the Pluto+'s shielding/cleaner supply may reduce the
+  audible modulation, but re-run `diagnostics/wideband_spectrum.py` on the unit
+  to confirm rather than assume.
+
 ### Running a build from an agent (launch detached + wait-and-check)
 
 The build outlives the SSH session and far outlives a single tool-call timeout,
