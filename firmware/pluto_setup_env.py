@@ -21,11 +21,26 @@ but they do **NOT** include the device-specific `fw_setenv` customizations:
                                  frequency. The value MUST be wrapped in literal
                                  angle brackets (`<...>`) or u-boot fdt set stores
                                  a string and the clock is ignored (this script
-                                 adds them). This board measured **39,999,338 Hz**
-                                 (carrier centered to <0.5 ppm vs a known AWOS at
-                                 118.050); RE-MEASURE per unit with
-                                 firmware/diagnostics/measure_offset.py and pass
-                                 --refclk-hz (0 to skip / leave default).
+                                 adds them). The ADALM-Pluto has a bare,
+                                 uncalibrated 40 MHz XO; the reference unit
+                                 measured **39,999,338 Hz** (carrier centered to
+                                 <0.5 ppm vs a known AWOS at 118.050). RE-MEASURE
+                                 per unit with diagnostics/measure_offset.py and
+                                 pass --refclk-hz (0 to skip / leave nominal).
+                                 NOTE the **Pluto+** ships a 0.5 ppm **VCTCXO**, so
+                                 it needs no per-unit override -- pass
+                                 `--device plutoplus` (refclk default becomes 0 =
+                                 leave nominal 40 MHz) and only set --refclk-hz if
+                                 a measurement shows it is worthwhile.
+
+DEVICE NOTES (Pluto+ / `--device plutoplus`)
+--------------------------------------------
+  * The Pluto+ uses the same u-boot env knobs, but its headline interface is the
+    on-board Gigabit Ethernet (`eth0`), not the USB gadget. `usb_ethernet_mode`
+    here only affects the USB `usb0` interface; it does NOT change `eth0`.
+  * Leave `ipaddrmulti` DISABLED on the Pluto+ -- per the Maia SDR docs it
+    conflicts with the Ethernet IP assignment. This script warns if you pass
+    --ipaddrmulti together with --device plutoplus.
 
 So after every `boot.dfu` flash you MUST re-apply these or you waste time
 chasing "networking is broken" / "web won't load" / "wrong transceiver". This
@@ -190,16 +205,33 @@ def main():
     ap.add_argument("--port", default=DEFAULT_PORT)
     ap.add_argument("--usb-mode", default="ncm", choices=["ncm", "ecm", "rndis"],
                     help="USB ethernet gadget mode (macOS/iOS=ncm, Android=ecm, Windows=rndis). Default ncm.")
+    ap.add_argument("--device", default="pluto", choices=["pluto", "plutoplus"],
+                    help="Target hardware. 'plutoplus' has a 0.5 ppm VCTCXO so the "
+                         "refclk override defaults to 0 (leave nominal 40 MHz); "
+                         "'pluto' (bare XO) defaults to the reference unit's measured value.")
     ap.add_argument("--ipaddrmulti", action="store_true",
-                    help="Also set ipaddrmulti=1 (bind 192.168.x.1 across subnets).")
-    ap.add_argument("--refclk-hz", type=int, default=39999338,
+                    help="Also set ipaddrmulti=1 (bind 192.168.x.1 across subnets). "
+                         "Leave OFF on the Pluto+ (conflicts with its Ethernet IP).")
+    ap.add_argument("--refclk-hz", type=int, default=None,
                     help="Per-unit 40 MHz reference calibration (ad936x_ext_refclk_override). "
                          "Measure with diagnostics/measure_offset.py. Pass 0 to skip. "
-                         "Default 39999338 = this board's measured value (carrier centered "
-                         "to <0.5 ppm vs a known AWOS).")
+                         "Default depends on --device: 39999338 for the ADALM-Pluto "
+                         "(reference unit's measured bare-XO value), 0 for the Pluto+ "
+                         "(0.5 ppm VCTCXO needs no override).")
     ap.add_argument("--check", action="store_true", help="Read-only audit; change nothing.")
     ap.add_argument("--no-reboot", action="store_true", help="Apply but do not reboot.")
     args = ap.parse_args()
+
+    # Device-dependent refclk default: the Pluto+ VCTCXO (0.5 ppm) needs no
+    # per-unit override; the bare-XO ADALM-Pluto uses the reference measurement.
+    if args.refclk_hz is None:
+        args.refclk_hz = 0 if args.device == "plutoplus" else 39999338
+    if args.device == "plutoplus":
+        print("[device] Pluto+: usb_ethernet_mode affects usb0 only (the Gigabit "
+              "eth0 is independent); leave ipaddrmulti disabled.")
+        if args.ipaddrmulti:
+            print("WARNING: --ipaddrmulti on a Pluto+ can conflict with the Ethernet "
+                  "IP assignment (Maia SDR docs) -- consider leaving it off.")
 
     # Desired state.
     desired = {

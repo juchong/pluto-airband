@@ -2,15 +2,19 @@
 #
 # FULL Pluto airband firmware build (HAVE_VIVADO=1) on the x86-64 build server.
 # This is the ONLY script that produces flashable images. It rebuilds the
-# bitstream + FSBL from our maia-sdr fork and packs BOTH firmware partitions:
-#   - build/boot.frm  / build/boot.dfu   -> BOOT.BIN (FSBL + bitstream + u-boot) -> mtd0
-#   - build/pluto.frm / build/pluto.dfu  -> FIT (kernel + DT + rootfs + bitstream) -> mtd3
+# bitstream + FSBL from our maia-sdr fork and packs BOTH firmware partitions
+# (the FIT image name follows $TARGET: pluto.* for the ADALM-Pluto,
+# plutoplus.* for the Pluto+):
+#   - build/boot.frm     / build/boot.dfu      -> BOOT.BIN (FSBL + bitstream + u-boot) -> mtd0
+#   - build/$TARGET.frm  / build/$TARGET.dfu   -> FIT (kernel + DT + rootfs + bitstream) -> mtd3
+#
+# Build for a Pluto+ with: TARGET=plutoplus bash firmware/build_firmware_full.sh
 #
 # Provenance by construction (so a stale-gateware flash cannot happen silently):
 #   1. Builds ONLY from committed git state. Both repos are `git pull`ed at the
 #      start; an uncommitted working tree aborts the build (override: FORCE_DIRTY=1).
 #   2. The fork's short commit hash is baked into the bitstream as USERID +
-#      USR_ACCESS (see maia-hdl/projects/pluto/system_project.tcl). After the
+#      USR_ACCESS (see maia-hdl/projects/$TARGET/system_project.tcl). After the
 #      build, `strings .../system_top.bit | grep -i UserID` (bare hex, e.g.
 #      "UserID=8B601CF0") MUST equal the commit you
 #      shipped -- this is the authoritative "is the right gateware in the bit"
@@ -101,15 +105,29 @@ for f in airband.html airband.js airband.css; do
 done
 
 # 3. Devicetree: reset to stock then apply the airband reserved-memory patch
-#    (idempotent, relocated to 0x19000000 to avoid the CMA collision).
+#    (idempotent, relocated to 0x19000000 to avoid the CMA collision). The patch
+#    edits the shared maia-sdr overlay (zynq-pluto-sdr-maiasdr.dtsi), which every
+#    Pluto-family .dts #includes -- including the Pluto+ (zynq-plutoplus-maiasdr.dts)
+#    -- so the airband reserved-memory + rxbuffer nodes carry to all targets.
 echo "== patching devicetree =="
 DTSI=linux/arch/arm/boot/dts/zynq-pluto-sdr-maiasdr.dtsi
 git -C linux checkout -- "arch/arm/boot/dts/zynq-pluto-sdr-maiasdr.dtsi" 2>/dev/null || true
 python3 "$AIRBAND_REPO/firmware/apply_airband_devicetree.py" "$DTSI"
+# Guard: the airband DT nodes only reach $TARGET if its .dts #includes the shared
+# overlay we just patched. Warn loudly if it does not (then the target would boot
+# without the maia_sdr_airband reserved region and the receiver could not start).
+case "$TARGET" in
+    plutoplus) TARGET_DTS="linux/arch/arm/boot/dts/zynq-plutoplus-maiasdr.dts" ;;
+    *)         TARGET_DTS="linux/arch/arm/boot/dts/zynq-pluto-sdr-maiasdr.dts" ;;
+esac
+if [ -f "$TARGET_DTS" ] && ! grep -q 'zynq-pluto-sdr-maiasdr.dtsi' "$TARGET_DTS"; then
+    echo "WARNING: $TARGET_DTS does not #include zynq-pluto-sdr-maiasdr.dtsi --"
+    echo "         the airband reserved-memory node may be MISSING from this target's DT."
+fi
 
 # 3b. Auto-start airband: append --airband to the maia-httpd init script so the
 #     receiver + audio stream come up on boot (idempotent).
-S60=buildroot/board/pluto/S60maia-httpd
+S60=buildroot/board/$TARGET/S60maia-httpd
 if [ -f "$S60" ] && ! grep -q -- '--airband' "$S60"; then
     sed -i 's#--ca-cert /mnt/jffs2/maia-sdr-ca.crt#--ca-cert /mnt/jffs2/maia-sdr-ca.crt --airband#' "$S60"
     echo "== patched $S60: maia-httpd now auto-starts with --airband =="
@@ -134,7 +152,7 @@ DOCKER_USER="${DOCKER_USER:-0:0}" TARGET="$TARGET" \
     docker compose run --rm -e GIT_HASH="$GIT_HASH" build
 
 # 5. Provenance check: the freshly built bitstream must carry our commit hash.
-BIT="$FW/maia-sdr/maia-hdl/projects/pluto/pluto.runs/impl_1/system_top.bit"
+BIT="$FW/maia-sdr/maia-hdl/projects/$TARGET/$TARGET.runs/impl_1/system_top.bit"
 echo "== bitstream provenance =="
 if [ -f "$BIT" ]; then
     # Vivado's BITSTREAM.CONFIG.USERID embeds bare uppercase hex in the .bit

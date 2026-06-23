@@ -2,7 +2,8 @@
 #
 # FAST inner-loop bitstream build (host Vivado, no Docker) for HDL iteration and
 # timing inspection. Produces a fresh system_top.xsa / system_top.bit from the
-# maia-sdr fork's `pluto` project.
+# maia-sdr fork's $TARGET project (default `pluto`; set TARGET=plutoplus for the
+# Pluto+ clg400 part).
 #
 # This does NOT produce flashable firmware. There is no FIT/BOOT.BIN/DFU here.
 # To get something you can flash, always use firmware/build_firmware_full.sh
@@ -18,8 +19,8 @@
 #   - A Python venv at $VENV with amaranth/numpy/scipy (the Verilog-gen deps).
 #   - The maia-sdr fork (pluto-airband branch) cloned at $FORK.
 #
-# Output: $FORK/maia-hdl/projects/pluto/pluto.sdk/system_top.xsa
-#         $FORK/maia-hdl/projects/pluto/pluto.runs/impl_1/system_top.bit
+# Output: $FORK/maia-hdl/projects/$TARGET/$TARGET.sdk/system_top.xsa
+#         $FORK/maia-hdl/projects/$TARGET/$TARGET.runs/impl_1/system_top.bit
 #
 set -euo pipefail
 
@@ -27,6 +28,7 @@ AIRBAND_REPO="${AIRBAND_REPO:-$HOME/pluto-build/airband}"
 FORK="${FORK:-$AIRBAND_REPO/maia-sdr}"
 VENV="${VENV:-$AIRBAND_REPO/venv}"
 VIVADO_SETTINGS="${VIVADO_SETTINGS:-/opt/Xilinx/Vivado/2023.2/settings64.sh}"
+TARGET="${TARGET:-pluto}"
 
 [ -d "$FORK/.git" ] || { echo "ERROR: fork at $FORK is not a git clone"; exit 1; }
 
@@ -60,15 +62,15 @@ grep -n "airband_address_range\|recorder_address_range" maia_hdl/config.py | hea
 
 echo "=== make -C ip clean (force IP regen from config.py) ==="
 make -C ip clean
-echo "=== make -C projects/pluto clean ==="
-make -C projects/pluto clean || true
+echo "=== make -C projects/$TARGET clean ==="
+make -C "projects/$TARGET" clean || true
 
 echo "=== START $(date) ==="
-make -C projects/pluto
+make -C "projects/$TARGET"
 echo "BITSTREAM_EXIT=$?"
 echo "=== END $(date) ==="
 
-BIT=projects/pluto/pluto.runs/impl_1/system_top.bit
-ls -la projects/pluto/pluto.sdk/system_top.xsa "$BIT" 2>&1
+BIT="projects/$TARGET/$TARGET.runs/impl_1/system_top.bit"
+ls -la "projects/$TARGET/$TARGET.sdk/system_top.xsa" "$BIT" 2>&1
 echo "=== embedded provenance (must equal 0x$GIT_HASH) ==="
 strings "$BIT" 2>/dev/null | grep -oiE 'UserID=0x[0-9A-Fa-f]+' | head -1 || true
