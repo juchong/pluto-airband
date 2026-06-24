@@ -10,8 +10,7 @@ name = "airband-reader"
 path = "src/main.rs"
 
 [dependencies]
+airband-dsp = { path = "../airband-dsp" }
 anyhow = "1.0"
 clap = { version = "4", features = ["derive"] }
-
-[profile.release]
-lto = true
+mp3lame-encoder = "0.2.4"

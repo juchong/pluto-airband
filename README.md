@@ -107,47 +107,86 @@ over USB. Full build + flash + first-boot details (incl. the u-boot env that a
 
 ### 2. Listen
 
-Build and run the host reader (Rust):
+The host tools are a Cargo workspace (`host/`): two binaries (`airband-reader`,
+`airband-listen`) over a shared DSP library (`airband-dsp`). Build everything at
+once:
 
 ```bash
-cargo build --release --manifest-path host/airband-reader/Cargo.toml
-BIN=host/airband-reader/target/release/airband-reader
+cargo build --release --manifest-path host/Cargo.toml
+BIN=host/target/release/airband-reader
 
-# live link health: per-channel sample rate, dropped samples, peak level
+# live link health + stats: sample rate, drops, level/floor (dBFS), transmissions
 $BIN 192.168.2.1:30000
 
-# record one WAV per channel (16-bit, 15625 sps)
+# record one WAV per *transmission* (squelch-gated, timestamped, no dead air)
 $BIN 192.168.2.1:30000 --mode wav --out-dir caps
 
+# one continuous WAV per channel instead (no squelch)
+$BIN 192.168.2.1:30000 --mode wav --no-split --squelch off
+
 # raw s16le per channel (chNN.s16) to pipe into an encoder/feeder
-$BIN 192.168.2.1:30000 --mode raw --out-dir pcm
+$BIN 192.168.2.1:30000 --mode raw --no-agc --shift 6
 ```
 
-`--shift` scales the 24-bit demod sample into 16-bit: **positive right-shifts
-(attenuate), negative left-shifts (makeup gain)**. Airband AM audio is quiet
-(often only tens of LSB at 24-bit), so the default is **`-6`** (≈ +36 dB makeup).
-Make it more negative if voice is too quiet, less negative (toward `0`, then
-positive) if loud signals clip.
+**Shared DSP chain** (in `airband-dsp`, ported from RTLSDR-Airband and adapted to
+the FPGA's already-demodulated, DC-blocked audio): per-channel **squelch**
+(noise-floor tracking, mutes inter-transmission static), a 300–3400 Hz voice
+**band-pass**, an optional **notch**, and an **AGC** that normalizes loudness and
+soft-clips peaks. Defaults: squelch `auto` (`--squelch-snr 9` dB), band-pass on,
+AGC on.
 
-`--filter` (default **off**) applies a 300–3400 Hz voice band-pass. It only
-**masks** out-of-voice-band artifacts and also degrades voice, so leave it off in
-normal use. (The residual on-air "buzz" is an RF hardware spur, not a DSP issue —
-see [Status & known limitations](#status--known-limitations).)
+Because the FPGA DC-blocks the audio before the host sees it, there is **no
+carrier** to key on; the squelch works on voice energy (VOX) and uses a **hang
+time** (`--squelch-hang-ms`, default 1000 ms) to ride over the pauses in
+continuous speech (AWOS/ATIS). RTLSDR-Airband's carrier-loss fast-close is
+therefore disabled here — with no carrier it would just re-introduce chatter.
+Lower the hang for snappier closes on push-to-talk traffic; raise it if a feed
+still chatters between words.
+
+- `--squelch off|auto|manual` (`--squelch-snr`, `--squelch-level` dBFS,
+  `--squelch-hang-ms`) — gating and hang time.
+- `--no-filter`, `--notch <Hz>` / `--notch-q` — band-pass / notch.
+- `--no-agc` falls back to fixed-gain output, where `--shift` scales the 24-bit
+  sample to 16-bit (**positive = attenuate, negative = makeup gain**; airband AM
+  is quiet so a negative value is usual).
+- Recording defaults to **split-on-transmission** (one timestamped file per keyed
+  transmission); `--no-split` writes one continuous file, `--min-transmission-ms`
+  discards blips.
+
+**Live outputs** (any mode, independent of recording):
+
+```bash
+# Icecast MP3 feed for LiveATC.net (16 kbps mono 22050 Hz by default)
+$BIN 192.168.2.1:30000 --icecast-channel 0 \
+  --icecast-host feed.example.net --icecast-port 8000 \
+  --icecast-mount /KXXX.mp3 --icecast-password secret
+
+# UDP s16le PCM of one channel to another host
+$BIN 192.168.2.1:30000 --udp-channel 0 --udp-dest 10.0.0.5:7355
+
+# Prometheus metrics (per-channel samples/drops/transmissions/level/floor/open)
+$BIN 192.168.2.1:30000 --metrics-port 9100   # scrape http://host:9100/metrics
+```
 
 ### Audition channels live (testing)
 
 To listen to a channel on your speakers and flip between frequencies in real time:
 
 ```bash
-cargo build --release --manifest-path host/airband-listen/Cargo.toml
-host/airband-listen/target/release/airband-listen 192.168.2.1:30000
+cargo build --release --manifest-path host/Cargo.toml
+host/target/release/airband-listen 192.168.2.1:30000
 ```
 
-Interactive keys: `↑/↓` (or `j`/`k`, `[`/`]`) step channels, type a number then
-`Enter` to jump, `+`/`-` adjust gain (airband audio is quiet — start by raising it),
-`m` mutes, `f` toggles the diagnostic voice band-pass (off by default; see
-`--filter`), `q` quits. The display shows a live level meter and cumulative dropped
-samples per channel, so it doubles as a quick link-health check.
+`airband-listen` runs the same `airband-dsp` chain on the played channel (squelch
++ band-pass + AGC by default), and runs the squelch on *every* channel so the
+meter shows which frequencies are active. Interactive keys: `↑/↓` (or `j`/`k`,
+`[`/`]`) step channels, type a number then `Enter` to jump, `+`/`-` adjust volume,
+`m` mutes, `s` toggles squelch, `a` toggles AGC, `f` toggles the band-pass, `n`
+toggles a configured notch, `F` toggles **follow** (scanner) mode, `q` quits.
+`--monitor single|follow|mix` selects single-channel, scanner, or sum-of-open-
+channels playback. The display shows a per-channel dBFS meter, a squelch-open dot,
+the selected channel's squelch state, and cumulative dropped samples, so it
+doubles as a quick link-health check.
 
 ### Audio output interface (write your own client)
 
@@ -309,8 +348,10 @@ the request/response schema.
 | `hdl/` | Amaranth HDL DSP blocks (channelizer, AM demod, framer) + sims; see `hdl/README.md` |
 | `firmware/` | build scripts, devicetree patch, channel-plan template, image notes (`firmware/README.md`) |
 | `firmware/diagnostics/` | RF diagnostic toolkit + the buzz root-cause analysis (`firmware/diagnostics/README.md`) |
-| `host/airband-reader/` | Rust host reader: demux, drop detection, WAV/raw output |
-| `host/airband-listen/` | Rust interactive listener: play one channel live, switch on the fly |
+| `host/` | Rust host workspace (shared DSP + two client binaries) |
+| `host/airband-dsp/` | shared DSP library: voice band-pass, notch, squelch, AM AGC, dBFS |
+| `host/airband-reader/` | host reader: demux, drop detection, DSP, split recording, Icecast/UDP/metrics |
+| `host/airband-listen/` | interactive listener: live DSP playback, scanner/mix modes, per-channel meters |
 | `maia-sdr/` | our Maia SDR fork (gitignored here; the airband HDL + `maia-httpd` integration) |
 | `plutosdr-fw/` | Pluto firmware assembler (gitignored; pinned upstream) |
 

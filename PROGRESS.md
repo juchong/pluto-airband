@@ -18,8 +18,8 @@ what is left).
 | 5. AM demod block | **done** (envelope mag + DC-block + audio decimate, chain verified) |
 | 6. Single-channel end-to-end | **done** (verified on hardware as part of the 21-ch stream) |
 | 7. Multi-channel | **done** — 21 channels live on hardware, gap-free TCP stream, auto-start |
-| 8. Pi streamer | host reader done (`host/airband-reader`); LiveATC feeder integration pending |
-| 9. Hardening | not started |
+| 8. Pi streamer | host reader + built-in Icecast(LAME)/UDP source clients done (`host/airband-reader`); live LiveATC mount validation + supervision pending |
+| 9. Hardening | host DSP done (squelch/AGC/band-pass/notch in `host/airband-dsp`); 24/7 soak + feed supervision not started |
 
 ## Done
 
@@ -702,6 +702,59 @@ carrier with a 4 M-pt FFT + parabolic interpolation (3.3 Hz bins, 46 dB SNR).
   automatically) to re-apply after a `boot.dfu` flash. Docs: `SPEC.md` §5.2,
   `firmware/diagnostics/README.md`. **Per unit** — re-measure for a different Pluto.
 
+### Host DSP, recording, and streaming — DONE (2026-06-24)
+Brought the audio-quality and feeder pieces of RTLSDR-Airband into the host tools,
+restructured as a Cargo workspace (`host/Cargo.toml`).
+- **New shared crate `host/airband-dsp`** (lib), ported from RTLSDR-Airband and
+  adapted to the FPGA's already-demodulated, DC-blocked audio (no IQ/de-emphasis
+  on the host). Units, all in raw 24-bit magnitude with dBFS metering:
+  - `Squelch` — EWMA noise-floor tracking (decay 0.97, updated only while shut so a
+    held transmission can't pull the floor up), SNR/manual threshold, full
+    CLOSED→OPENING→OPEN→CLOSING state machine + fast LOW_SIGNAL_ABORT; delays in ms.
+  - `VoiceFilter` (4th-order Butterworth band-pass, moved out of the two binaries)
+    and `Notch` (2nd-order band-stop, ported from `NotchFilter`).
+  - `Agc` — loudness normalization seeded on squelch-open, trained only on
+    above-threshold samples, with a bounded tanh **soft-clip** (can't clip the
+    16-bit output) and a click-free fade on close.
+  - 11 unit tests (filter response, squelch convergence/open/close, AGC
+    normalization/limit/fade, dBFS round-trip).
+- **`airband-listen`**: runs the chain on the played channel and the squelch on
+  *every* channel for activity meters; per-channel **dBFS meters** + squelch-open
+  dot; `s`/`a`/`f`/`n` live toggles; `--monitor single|follow|mix` (scanner via
+  `F`, or sum-of-open-channels). Band-pass/squelch/AGC on by default; sink volume
+  default 1.5 with AGC (audio is pre-normalized) or 25000 with `--no-agc`.
+- **`airband-reader`**: shared DSP chain; **split-on-transmission** recording (one
+  timestamped WAV/raw per keyed transmission, `--no-split`/`--min-transmission-ms`);
+  dependency-free UTC timestamps; stats now report level/floor dBFS + transmission
+  counts. Live outputs (any mode): **Icecast** MP3 (`mp3lame-encoder`/LAME, classic
+  `SOURCE` protocol, linear resampler 15625→22050, 16 kbps mono for LiveATC,
+  auto-reconnect, back-pressure drop), **UDP** s16 PCM, and a dependency-free
+  **Prometheus** `/metrics` endpoint.
+- **Verified live** against `10.0.16.183`: 21 ch @ ~15.7k sps, 0 drops; squelch
+  opened on 118.050 AWOS (`tx` counted) while quiet channels stayed shut; split
+  recording wrote one valid WAV per AWOS transmission (mono 15625 Hz, AGC-leveled
+  rms ≈ 11.5k) and nothing for silent channels. 18 tests pass, clippy clean,
+  release build (LTO) clean. Docs: `README.md`, `SPEC.md` §6.4.
+
+### Squelch hang — fixed AWOS chatter (2026-06-17)
+Live listening on 118.050 AWOS chattered (squelch repeatedly opened/closed within
+a single broadcast). **Root cause:** the FPGA DC-blocks the audio (§6.2) *before*
+the host sees it, so there is no AM carrier on the link — the host squelch can
+only act on voice energy. RTLSDR-Airband can use a ~25 ms close delay because it
+squelches on the carrier (which persists through speech pauses); our copy of those
+defaults (close 24.6 ms + 11 ms `low_signal_abort`) closed on every word gap.
+- **Fix (host-only, no FPGA rebuild):** `airband-dsp::Squelch` now defaults to a
+  **1 s hang** (`close_delay`) that rides over intra-transmission gaps, and the
+  carrier-loss **`low_signal_abort` is disabled by default** (without a carrier it
+  just re-introduces chatter). New `--squelch-hang-ms` (default 1000) on both
+  `airband-listen` and `airband-reader`; `SquelchConfig::with_hang_ms`.
+- A true carrier squelch would need the FPGA to ship the per-channel carrier-DC it
+  discards in the DC-block stage, but the 64-bit audio frame (§6.3) has no spare
+  field; the host hang gives equivalent no-chatter behavior without a protocol or
+  bitstream change. (Documented as the rationale in `SPEC.md` §6.4.)
+- 13 `airband-dsp` tests pass (added `hang_bridges_short_gaps`,
+  `abort_disabled_by_default`); clippy + release build clean.
+
 ## Next steps
 - **Buzz is hardware-bound** (see RE-DIAGNOSED section): pursue power-supply
   cleanup / shielding / external reference; no further HDL work will help. Keep
@@ -710,10 +763,10 @@ carrier with a 4 M-pt FFT + parabolic interpolation (3.3 Hz bins, 46 dB SNR).
   host `--shift -6` → live AWOS (ch0) recovers as clean voice at ~ −19 dBFS. Still
   to do: a better antenna for weaker fields, and per-site tuning of `gain_db` /
   `--shift` (lower gain if a strong local signal ever overloads the front-end).
-- **LiveATC feeder integration** (`SPEC.md` §9): wire `host/airband-reader`
-  per-channel audio into the LiveATC mountpoint convention (server, codec/bitrate
-  still open).
-- **Hardening** (`SPEC.md` §9): squelch/AGC placement, front-end BPF + FM notch
-  hygiene, reconnection/feed supervision.
+- **LiveATC feeder validation** (`SPEC.md` §9): the Icecast source client is built
+  (`airband-reader --icecast-*`); remaining is validating against a real LiveATC
+  mount and adding multi-mount/per-feed supervision.
+- **Hardening** (`SPEC.md` §9): host squelch/AGC/band-pass/notch are done
+  (`airband-dsp`); remaining is 24/7 soak and reconnection/feed supervision.
 - **Optional:** add the deferred 133.65 MHz outlier (needs Fs≈20 MHz / 8 lanes /
   recentered LO — a separate window decision, `SPEC.md` §5).

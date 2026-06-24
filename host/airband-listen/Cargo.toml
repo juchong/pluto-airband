@@ -10,10 +10,8 @@ name = "airband-listen"
 path = "src/main.rs"
 
 [dependencies]
+airband-dsp = { path = "../airband-dsp" }
 anyhow = "1.0"
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.28"
 rodio = { version = "0.19", default-features = false }
-
-[profile.release]
-lto = true

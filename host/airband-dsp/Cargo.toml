@@ -1,0 +1,10 @@
+[package]
+name = "airband-dsp"
+version = "0.1.0"
+edition = "2021"
+description = "Shared DSP (filters, notch, squelch, AGC) for the Pluto airband host tools"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "airband_dsp"
+path = "src/lib.rs"

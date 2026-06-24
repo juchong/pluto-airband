@@ -476,13 +476,12 @@ LSB** (i.e. ~ −90 to −100 dBFS at 24-bit). Two things were eating it:
    (The Pluto's dropbear has no `sftp-server`, so `scp` fails — pipe over `ssh`,
    or `scp -O`.)
 
-2. **The host reader needs makeup gain.** `airband-reader --shift` scales the
-   24-bit sample into 16-bit; it is **signed** — positive right-shifts
-   (attenuate), negative left-shifts (gain). The default is `-6` (≈ +36 dB). With
-   manual 71 dB + `--shift -6`, ch0 lands at ~ −19 dBFS, no clipping, ~60 % of
-   energy in the 300–3400 Hz voice band, ~22 dB above the idle-channel floor.
-   `airband-listen` has the same need: its `--gain` default is 3000 (adjust live
-   with `+`/`-`).
+2. **Audio level.** With the AGC on (default), `airband-reader`/`airband-listen`
+   normalize loudness automatically — no manual makeup needed. Only with `--no-agc`
+   does `airband-reader --shift` apply: it scales the 24-bit sample into 16-bit and
+   is **signed** — positive right-shifts (attenuate), negative left-shifts (gain),
+   default `-6` (≈ +36 dB). `airband-listen`'s `--gain` is the sink volume (default
+   1.5 with AGC, 25000 with `--no-agc`; adjust live with `+`/`-`).
 
 To confirm audio is *real voice* (not a carrier spike), record a few seconds and
 check the voice-band energy fraction, e.g. with numpy on `chNN.wav`: a live AWOS
@@ -637,7 +636,8 @@ busybox devmem 0x7C400000                                   # 0x6169616D ("maia"
 Then from the host, confirm a live, gap-free 21-channel stream:
 
 ```bash
-host/airband-reader/target/release/airband-reader 192.168.2.1:30000
+cargo build --release --manifest-path host/Cargo.toml
+host/target/release/airband-reader 192.168.2.1:30000
 # expect: 21 channels, ~15625 sps each, 0 dropped samples
 ```
 

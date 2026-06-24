@@ -35,7 +35,7 @@ off-device.
 | Pluto firmware exposing many independently-tuned AM channels | **Done — 21 channels, mono, 24-bit, 15625 sps** |
 | Demodulated audio reaches a host over the Pluto link, within USB 2.0 | **Done — framed audio over TCP `:30000`, well under USB 2.0** |
 | 24/7 stability at an antenna site | **Partially — gap-free + auto-start on boot; long soak pending** |
-| Pi-side daemon encodes each channel and pushes to liveatc Icecast | **Not yet built** (see §9) |
+| Pi-side daemon encodes each channel and pushes to liveatc Icecast | **Done — `airband-reader` has a built-in LAME→Icecast source client (16 kbps mono 22050 Hz); soak pending** |
 
 **Non-goals:** replicating RTLSDR-Airband's CPU FFT-channelizer; transmitting;
 non-airband modes (NFM is a possible future per-channel option, not implemented).
@@ -150,11 +150,11 @@ the airband channelizer generalizes by time-multiplexing.
                                          ▼
    ┌───────────────────────────────────────────────────────────────┐
    │  Host (PC now; Raspberry Pi at the tower in production)         │
-   │   airband-reader (Rust): demux by channel, drop detection,      │
-   │     24→16-bit scale, WAV / raw / live link stats                │
-   │   airband-listen (Rust): play one channel live, switch on the   │
-   │     fly                                                          │
-   │   [future] encode (LAME) → Icecast source client → liveatc      │
+   │   airband-dsp (Rust lib): squelch, voice band-pass, notch, AGC  │
+   │   airband-reader (Rust): demux, drop detection, DSP chain,      │
+   │     split-on-transmission WAV/raw, Icecast(LAME)/UDP/metrics    │
+   │   airband-listen (Rust): live DSP playback, scanner/mix modes,  │
+   │     per-channel dBFS meters                                      │
    └───────────────────────────────────────────────────────────────┘
 ```
 
@@ -231,9 +231,9 @@ The receiver reads `/root/airband.json` at startup (template:
   118.05–128.5 MHz; every channel sits inside the central ~80% of the band, clear
   of the filter skirts. (Channel selection and the LO choice — placing the zero-IF
   DC/LO-leakage spur in a guard gap — are derived in `hdl/capture_window.py`.)
-- **Gain:** one shared RX gain serves all 21 channels (no per-channel AGC); fixed
-  **manual gain** (the AD9361 AGC modes settle on wideband power and starve weak
-  channels). The default is **48 dB** — the highest gain that does *not* overload
+- **Gain:** one shared RX gain serves all 21 channels (no per-channel *RF* AGC;
+  per-channel audio AGC is done on the host, §6.4); fixed **manual gain** (the
+  AD9361 AGC modes settle on wideband power and starve weak channels). The default is **48 dB** — the highest gain that does *not* overload
   the wideband ADC. The original 71 dB was chosen for weak-signal sensitivity but
   drove the ADC into **hard clipping ~13 % of samples**; that broadband intermod —
   not a real noise floor — raised the displayed floor to ~−6 dBFS and sprayed
@@ -368,15 +368,44 @@ buffer to all connected TCP clients on `0.0.0.0:30000`. Clients that fall more t
 256 buffers behind are lagged (and see a sequence jump). The stream is therefore
 **raw 64-bit records**, not per-channel sockets.
 
-### 6.4 Host reader
-`host/airband-reader` (Rust) connects to `:30000`, demuxes records by the channel
-byte, and uses the per-channel sequence counter to count dropped samples. It scales
-the 24-bit sample to 16-bit via `--shift` (positive = right-shift/attenuate,
-negative = left-shift/makeup gain; default **−6** ≈ +36 dB, since airband AM audio
-is quiet). Modes: `stats` (live link health, default), `wav` (one WAV/channel), and
-`raw` (`chNN.s16` per channel for piping into an encoder). `host/airband-listen`
-plays one channel live and switches on the fly. Neither applies the voice band-pass
-by default; it only masks artifacts (see §7).
+### 6.4 Host tools and shared DSP
+The host side is a Cargo workspace (`host/`): two binaries over a shared DSP
+library `host/airband-dsp` (Rust). The DSP is ported from RTLSDR-Airband and
+adapted to the fact that the FPGA already AM-demodulates and DC-blocks the audio
+(§6.1-6.2), so there is no IQ/de-emphasis stage on the host. The chain per channel
+is: **squelch** (EWMA noise-floor tracking → SNR/manual threshold, with an
+open-delay/hang state machine; mutes inter-transmission static) → **voice
+band-pass** (4th-order Butterworth, 300-3400 Hz) → optional
+**notch** (2nd-order band-stop for a tonal spur) → **AM AGC** (loudness
+normalization with a bounded soft-clip and click-free fade on close). All units
+work in raw 24-bit sample magnitude; level metering is reported in dBFS.
+
+Because the FPGA DC-blocks the audio (§6.2) before the host sees it, there is **no
+AM carrier** on the link to key the squelch on — it can only act on voice energy
+(VOX). To keep that from chattering on continuous speech (AWOS/ATIS), the squelch
+uses a **hang time** (`--squelch-hang-ms`, default 1000 ms) that rides over the
+pauses between words/phrases, and RTLSDR-Airband's carrier-loss fast-close
+(`low_signal_abort`) is **disabled by default** — without a carrier it would fire
+on every speech gap. A true carrier squelch would require the FPGA to also ship
+the per-channel carrier-DC level it currently discards in the DC-block stage,
+which the 64-bit audio frame (§6.3) has no room for; the host-side hang achieves
+equivalent no-chatter behavior without a protocol/bitstream change.
+
+`host/airband-reader` connects to `:30000`, demuxes records by the channel byte,
+and uses the per-channel sequence counter to count dropped samples. Defaults:
+squelch `auto` (`--squelch-snr 9` dB), band-pass on, AGC on. Modes: `stats` (live
+link health + level/floor dBFS + transmission counts, default), `wav`, and `raw`.
+Recording defaults to **split-on-transmission** (one timestamped file per keyed
+transmission, gated by the squelch — no dead air); `--no-split` writes one
+continuous file. With `--no-agc`, fixed-gain output is scaled to 16-bit via
+`--shift` (positive = attenuate, negative = makeup gain; airband AM is quiet).
+Independently of the recording mode it can also stream live: **Icecast** MP3 (LAME
+source client, classic `SOURCE` protocol, 16 kbps mono 22050 Hz for LiveATC),
+**UDP** s16 PCM, and a **Prometheus** `/metrics` endpoint. `host/airband-listen`
+runs the same chain on the played channel (and the squelch on every channel for
+activity meters), with `single`/`follow` (scanner)/`mix` monitor modes and live
+toggles. The voice band-pass is now on by default but does not remove the RF spur
+"buzz" (see §7).
 
 ### 6.5 Web config API and page
 The channel plan and front-end settings can be edited from a browser instead of
@@ -438,13 +467,13 @@ are in **`BUILD.md`**; image contents and addressing invariants in
 
 ## 9. Remaining work
 
-- **Pi-side liveatc streamer:** the host reader produces per-channel PCM/WAV; the
-  daemon that encodes (LAME) and pushes each channel to liveatc's Icecast as a
-  source client is not yet built. See `PROGRESS.md` → Next steps.
 - **Long-duration soak** for 24/7 antenna-site stability (USB/TCP streaming,
-  thermal/power, watchdog/restart, monitoring).
-- **Squelch/AGC:** none currently. A coarse power-squelch could move into the FPGA
-  later; finer AGC/level is better iterated on the host first.
+  thermal/power, watchdog/restart, monitoring). The Icecast source client itself is
+  built (§6.4); what remains is unattended hardening (multi-mount feeds, service
+  supervision) and field validation against a live LiveATC mount.
+- **Squelch/AGC:** implemented on the host (`airband-dsp`, §6.4). A coarse
+  power-squelch could still move into the FPGA later to cut link bandwidth, but the
+  host chain already gates audio and normalizes level.
 - **Optional NFM mode** (CORDIC arctan-differentiator) if ever needed.
 
 ## 10. Licensing / legal
