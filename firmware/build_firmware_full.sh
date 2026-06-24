@@ -125,6 +125,23 @@ if [ -f "$TARGET_DTS" ] && ! grep -q 'zynq-pluto-sdr-maiasdr.dtsi' "$TARGET_DTS"
     echo "         the airband reserved-memory node may be MISSING from this target's DT."
 fi
 
+# 3a. Pin a deterministic Ethernet MAC on the Pluto+ (the &gem0 / GEM node).
+#     Without a local-mac-address property the Zynq macb driver invents a NEW
+#     RANDOM MAC on every boot, so the DHCP lease -- and the device's IP --
+#     churns constantly. Baking the MAC into the OS devicetree (this FIT, mtd3)
+#     is the durable fix: the kernel reads it natively at probe, with no u-boot
+#     env dependency and no in-place FDT growth (which corrupts the FIT and
+#     drops the board into DFU). Only the Pluto+ has the Ethernet GEM; the
+#     USB-only ADALM-Pluto targets have no gem0 node to patch. Reset to stock
+#     first so the value tracks $PLUTO_MAC across rebuilds. Software-only (DT)
+#     change -> reflash $TARGET.dfu only; boot.dfu/env untouched.
+if [ "$TARGET" = "plutoplus" ] && [ -f "$TARGET_DTS" ]; then
+    echo "== pinning Pluto+ Ethernet MAC (${PLUTO_MAC:-02:0a:35:00:01:22}) =="
+    git -C linux checkout -- "arch/arm/boot/dts/zynq-plutoplus-maiasdr.dts" 2>/dev/null || true
+    python3 "$AIRBAND_REPO/firmware/apply_mac_devicetree.py" \
+        "$TARGET_DTS" "${PLUTO_MAC:-02:0a:35:00:01:22}"
+fi
+
 # 3b. Auto-start airband: append --airband to the maia-httpd init script so the
 #     receiver + audio stream come up on boot (idempotent).
 S60=buildroot/board/$TARGET/S60maia-httpd
