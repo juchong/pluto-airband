@@ -144,9 +144,14 @@ carrier it would just re-introduce chatter. Lower the hang for snappier closes o
 push-to-talk traffic; raise it if a feed still chatters between words.
 
 A bitstream built from the current `hdl/` also ships a per-channel **carrier
-level** in each audio frame; with it, `--squelch carrier` keys on carrier power
-instead of voice energy, opening/closing cleanly on the transmission with no hang
-and no chatter (the new bitstream and host tools must be deployed together).
+level** in each audio frame; with it, `--squelch carrier` gates on carrier power
+instead of voice energy. All channels of one receiver see the same wideband
+noise, so the host takes a high percentile (75th) of the live per-channel carrier
+levels as a shared **noise reference** and opens any channel whose carrier sits
+`--squelch-snr` dB above it. Because that threshold comes from the *other*
+channels' noise (not a channel's own level), it holds a continuous carrier
+(AWOS/ATIS) open with no hang and no chatter, while empty channels stay shut. The
+new bitstream and host tools must be deployed together.
 
 - `--squelch off|auto|manual|carrier` (`--squelch-snr`, `--squelch-level` dBFS,
   `--squelch-hang-ms`) — gating, threshold, and hang time.

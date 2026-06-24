@@ -130,10 +130,14 @@ impl Squelch {
     pub fn new(cfg: SquelchConfig) -> Squelch {
         let (enabled, manual_level, snr_ratio) = match cfg.mode {
             SquelchMode::Off => (false, None, 1.0),
-            SquelchMode::AutoSnr { snr_db } | SquelchMode::Carrier { snr_db } => {
-                (true, None, 10f32.powf(snr_db / 20.0))
-            }
+            SquelchMode::AutoSnr { snr_db } => (true, None, 10f32.powf(snr_db / 20.0)),
             SquelchMode::ManualDbfs(dbfs) => (true, Some(dbfs_to_level(dbfs)), 1.0),
+            // Carrier mode is driven by a *fixed* threshold derived from a
+            // cross-channel noise estimate and pushed in via `set_threshold`. It
+            // starts effectively closed (huge threshold) until the first update,
+            // because an adaptive per-channel floor can't hold a continuous
+            // carrier (e.g. AWOS) open.
+            SquelchMode::Carrier { .. } => (true, Some(f32::MAX), 1.0),
         };
         let ms_to_samples = |ms: f32| ((ms / 1000.0) * cfg.rate as f32).round().max(1.0) as u32;
         let abort_enabled = cfg.low_signal_abort_ms > 0.0;
@@ -167,6 +171,14 @@ impl Squelch {
     #[inline]
     pub fn threshold(&self) -> f32 {
         self.manual_level.unwrap_or(self.snr_ratio * self.noise_floor)
+    }
+
+    /// Overrides the fixed (manual) threshold at runtime. Used by carrier-power
+    /// squelch, whose threshold tracks a cross-channel noise estimate
+    /// ([`carrier_noise_threshold`]) rather than a per-channel adaptive floor.
+    #[inline]
+    pub fn set_threshold(&mut self, level: f32) {
+        self.manual_level = Some(level);
     }
 
     /// Tracked noise floor in raw sample units.
@@ -298,6 +310,33 @@ impl Squelch {
     }
 }
 
+/// Computes the shared open/close threshold for carrier-power squelch from the
+/// most-recent per-channel carrier levels.
+///
+/// All channels of one receiver see the same wideband noise, so the bulk of the
+/// per-channel carrier levels are noise and a channel carrying a station is a
+/// large outlier. We take a high percentile of the population (robust to a few
+/// active channels) as the *noise* reference and place the threshold `snr_ratio`
+/// above it. Because the threshold is derived from the *other* channels' noise,
+/// it stays put under a continuous carrier — so AWOS/ATIS stays open instead of
+/// being learned away by a per-channel adaptive floor.
+///
+/// `percentile` is in `0.0..=1.0` (e.g. `0.75`). Returns `f32::MAX` (always shut)
+/// if there are no samples.
+pub fn carrier_noise_threshold(carriers: &[f32], percentile: f32, snr_ratio: f32) -> f32 {
+    if carriers.is_empty() {
+        return f32::MAX;
+    }
+    let mut v: Vec<f32> = carriers.to_vec();
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let p = percentile.clamp(0.0, 1.0);
+    let idx = (((v.len() - 1) as f32) * p).round() as usize;
+    let noise = v[idx.min(v.len() - 1)];
+    // Never collapse to zero (a fully-silent channel set) — keep a tiny floor so
+    // the threshold stays meaningful and the squelch stays shut on pure silence.
+    (noise.max(NOISE_EPSILON)) * snr_ratio
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -407,5 +446,37 @@ mod tests {
             }
         }
         assert!(opened);
+    }
+
+    #[test]
+    fn carrier_threshold_separates_station_from_noise() {
+        // 20 noise channels (spread 27e6..168e6) + one station at 1.48e9, like
+        // the measured AWOS case. Threshold must land between them.
+        let mut c = vec![
+            27e6, 33e6, 37e6, 37e6, 46e6, 46e6, 50e6, 50e6, 58e6, 67e6, 75e6, 100e6, 125e6,
+            134e6, 134e6, 150e6, 150e6, 150e6, 150e6, 168e6,
+        ];
+        c.push(1.476e9);
+        let thr = carrier_noise_threshold(&c, 0.75, 10f32.powf(9.0 / 20.0));
+        assert!(thr > 168e6, "threshold {thr} must clear the noisiest empty channel");
+        assert!(thr < 1.476e9, "threshold {thr} must stay below the station carrier");
+    }
+
+    #[test]
+    fn carrier_squelch_opens_on_station_only() {
+        let rate = 15625;
+        let mut shut = Squelch::new(SquelchConfig::new(SquelchMode::Carrier { snr_db: 9.0 }, rate));
+        let mut open = Squelch::new(SquelchConfig::new(SquelchMode::Carrier { snr_db: 9.0 }, rate));
+        // starts effectively closed before any threshold update
+        assert!(!shut.is_open());
+        let thr = 423e6; // between noise (<=168e6) and station (1.48e9)
+        shut.set_threshold(thr);
+        open.set_threshold(thr);
+        for _ in 0..4000 {
+            shut.process(150e6); // noisy empty channel
+            open.process(1.476e9); // station carrier (continuous)
+        }
+        assert!(!shut.is_open(), "empty channel must stay shut");
+        assert!(open.is_open(), "continuous station carrier must stay open");
     }
 }

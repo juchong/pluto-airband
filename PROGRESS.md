@@ -786,8 +786,41 @@ FPGA changes that ride along in the next bitstream):
   that gates AGC and denoise noise-learning. HDL sims (`audio_framer`,
   `am_backend_tdm` incl. new `_verify_carrier`, `receiver_top`) and 24 host tests
   pass; clippy clean.
-- **Pending:** Vivado build of the new bitstream (Phases A+B) → flash → live verify
-  of the narrow FIR and `--squelch carrier` on hardware.
+- **Built + flashed + verified on hardware (2026-06-24, Pluto+):**
+  `TARGET=plutoplus build_firmware_full.sh` on `xilinx-builder` — Vivado
+  `write_bitstream completed successfully`, **timing met** (Post-Route WNS
+  +0.518 ns, WHS +0.012 ns, 0 failing), provenance **OK** (embedded
+  `UserID=FF6363F1` == fork HEAD `ff6363f`). Flashed `boot.dfu` (mtd0) +
+  `plutoplus.dfu` (mtd3) over USB DFU; u-boot env verified already correct
+  (`ncm`/`ad9364`/`1r1t`, UIO bootargs 3/3). Live check: 21 ch @ ~15.6 ksps,
+  **0 drops**; ch0 (118.050 AWOS) active at −74 dBFS. `--squelch carrier`
+  opens on ch0/ch11 carriers (tx>0), confirming the carrier byte is populated
+  by the new gateware (a zero carrier would never open) and the new 24-bit
+  audio + carrier-byte frame layout demuxes correctly.
+
+### Carrier squelch — fixed "all channels open" (2026-06-24)
+First on-hardware test of `--squelch carrier` opened **every** channel. Root cause
+was the algorithm, not the gateware: the carrier byte cleanly separates a station
+from noise (measured: 20 empty channels at bytes 203-227 → 27-168 Me6 decoded, ch0
+AWOS at byte 251 → 1.48e9), but the host reused the per-channel **adaptive-SNR**
+floor, which (a) inits far below the carrier scale so all channels latch open, and
+(b) fundamentally cannot hold a **continuous** carrier (AWOS) open — once the floor
+learns the steady level the channel closes.
+- **Fix (host-only, no reflash):** carrier mode now uses a **fixed** threshold
+  derived from a robust **cross-channel** noise estimate
+  (`airband_dsp::carrier_noise_threshold`): all channels of one receiver see the
+  same wideband noise, so the 75th percentile of the per-channel carrier levels is
+  the noise reference and a station is a large outlier above it. Threshold =
+  `pct75 * 10^(snr_db/20)`, recomputed every 8192 frames and pushed to each
+  channel's squelch via `Squelch::set_threshold`. Because the threshold comes from
+  the *other* channels' noise, it stays put under a continuous carrier, so AWOS
+  stays open while empty channels stay shut. `SquelchMode::Carrier` now starts at a
+  huge (shut) threshold until the first cross-channel update.
+- Both tools wired (reader `run_session`, listen `reader_loop`). 18 `airband-dsp`
+  tests pass (added `carrier_threshold_separates_station_from_noise`,
+  `carrier_squelch_opens_on_station_only`); clippy clean.
+- **Verified live (Pluto+, 10.0.16.55):** `--squelch carrier` → ch0 (AWOS) tx=1,
+  all 20 other channels tx=0, 0 drops.
 
 ## Next steps
 - **Buzz is hardware-bound** (see RE-DIAGNOSED section): pursue power-supply

@@ -14,7 +14,9 @@ mod squelch;
 pub use agc::Agc;
 pub use denoise::Denoise;
 pub use filter::{Notch, VoiceFilter};
-pub use squelch::{Squelch, SquelchConfig, SquelchMode, SquelchState};
+pub use squelch::{
+    carrier_noise_threshold, Squelch, SquelchConfig, SquelchMode, SquelchState,
+};
 
 #[cfg(test)]
 mod carrier_tests {

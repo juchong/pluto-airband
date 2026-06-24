@@ -35,9 +35,14 @@ mod icecast;
 mod metrics;
 
 use airband_dsp::{
-    decode_carrier, level_to_dbfs, Agc, Denoise, Notch, Squelch, SquelchConfig, SquelchMode,
-    VoiceFilter, SAMPLE_SCALE,
+    carrier_noise_threshold, decode_carrier, level_to_dbfs, Agc, Denoise, Notch, Squelch,
+    SquelchConfig, SquelchMode, VoiceFilter, SAMPLE_SCALE,
 };
+
+/// Carrier-squelch: population percentile used as the cross-channel noise
+/// reference, and how often (in frames) the shared threshold is recomputed.
+const CARRIER_NOISE_PCT: f32 = 0.75;
+const CARRIER_UPDATE_FRAMES: u64 = 8192;
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use icecast::IcecastConfig;
@@ -621,9 +626,30 @@ fn run_session(
     let mut frame = [0u8; FRAME_BYTES];
     let interval = Duration::from_secs(args.stats_interval.max(1));
 
+    // Carrier-squelch: track the latest carrier per channel and periodically push
+    // a shared, cross-channel-derived threshold to every channel's squelch.
+    let carrier_mode = matches!(cfg.squelch_mode, SquelchMode::Carrier { .. });
+    let carrier_snr_ratio = 10f32.powf(args.squelch_snr / 20.0);
+    let mut last_carrier = vec![0f32; channels.len()];
+    let mut since_carrier_update: u64 = 0;
+
     loop {
         reader.read_exact(&mut frame)?;
         let (seq, chan, sample, carrier) = unpack(u64::from_le_bytes(frame));
+        if carrier_mode {
+            if let Some(c) = last_carrier.get_mut(usize::from(chan)) {
+                *c = decode_carrier(carrier);
+            }
+            since_carrier_update += 1;
+            if since_carrier_update >= CARRIER_UPDATE_FRAMES {
+                let thr =
+                    carrier_noise_threshold(&last_carrier, CARRIER_NOISE_PCT, carrier_snr_ratio);
+                for ch in channels.iter_mut() {
+                    ch.squelch.set_threshold(thr);
+                }
+                since_carrier_update = 0;
+            }
+        }
         if let Some(ch) = channels.get_mut(usize::from(chan)) {
             ch.push(seq, sample, carrier, cfg)?;
         }

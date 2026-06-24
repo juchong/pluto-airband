@@ -36,8 +36,8 @@
 //!   q                   quit
 
 use airband_dsp::{
-    decode_carrier, level_to_dbfs, Agc, Denoise, Notch, Squelch, SquelchConfig, SquelchMode,
-    SquelchState, VoiceFilter, SAMPLE_SCALE,
+    carrier_noise_threshold, decode_carrier, level_to_dbfs, Agc, Denoise, Notch, Squelch,
+    SquelchConfig, SquelchMode, SquelchState, VoiceFilter, SAMPLE_SCALE,
 };
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
@@ -379,6 +379,17 @@ impl ChannelDsp {
 /// state and running the DSP chain (selected channel, or all channels in mix
 /// mode).
 fn reader_loop(shared: Arc<Shared>, addr: String, n: usize, cfg: DspCfg, mix: bool) {
+    // Carrier-squelch: cross-channel noise percentile + recompute cadence.
+    const CARRIER_NOISE_PCT: f32 = 0.75;
+    const CARRIER_UPDATE_FRAMES: u64 = 8192;
+    let carrier_mode = matches!(cfg.squelch_mode, SquelchMode::Carrier { .. });
+    let carrier_snr_ratio = match cfg.squelch_mode {
+        SquelchMode::Carrier { snr_db } => 10f32.powf(snr_db / 20.0),
+        _ => 1.0,
+    };
+    let mut last_carrier = vec![0f32; n];
+    let mut since_carrier_update: u64 = 0;
+
     let mut last_seq = vec![u32::MAX; n];
     let mut squelches: Vec<Squelch> = (0..n)
         .map(|_| {
@@ -426,6 +437,21 @@ fn reader_loop(shared: Arc<Shared>, addr: String, n: usize, cfg: DspCfg, mix: bo
                     let seq = ((w >> 40) & 0xff_ffff) as u32;
                     if chan >= n {
                         continue;
+                    }
+                    if carrier_mode {
+                        last_carrier[chan] = decode_carrier(carrier);
+                        since_carrier_update += 1;
+                        if since_carrier_update >= CARRIER_UPDATE_FRAMES {
+                            let thr = carrier_noise_threshold(
+                                &last_carrier,
+                                CARRIER_NOISE_PCT,
+                                carrier_snr_ratio,
+                            );
+                            for sq in squelches.iter_mut() {
+                                sq.set_threshold(thr);
+                            }
+                            since_carrier_update = 0;
+                        }
                     }
                     shared.records.fetch_add(1, Ordering::Relaxed);
 

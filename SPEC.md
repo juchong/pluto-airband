@@ -398,18 +398,33 @@ below the speech-present threshold, so broadband hiss under the voice is
 attenuated without warbling the speech. It is on by default (`--no-denoise` to
 disable, `--denoise-floor-db` to bound the cut).
 
-Two squelch strategies exist. By default the FPGA DC-blocks the audio (§6.2)
-before the host sees it, so the squelch acts on voice energy (**VOX**): to keep
-that from chattering on continuous speech (AWOS/ATIS) it uses a **hang time**
-(`--squelch-hang-ms`, default 1000 ms) that rides over the pauses between
-words/phrases, and RTLSDR-Airband's carrier-loss fast-close (`low_signal_abort`)
-is **disabled by default**. With a bitstream that ships the per-channel carrier
-byte (§6.2), `--squelch carrier` keys instead on the decoded **carrier power**,
-which is steady through speech pauses — so it opens/closes cleanly on the
-transmission with no hang and no chatter. In carrier mode the audio-energy VOX is
-retained internally purely to drive the speech-present flag that gates AGC gain
-and denoise noise-learning (the carrier alone can't distinguish speech from
-inter-word silence within an open transmission).
+Two squelch strategies exist.
+
+**VOX (default).** The FPGA DC-blocks the audio (§6.2) before the host sees it, so
+the squelch acts on voice energy. To keep that from chattering on continuous
+speech (AWOS/ATIS) it uses a **hang time** (`--squelch-hang-ms`, default 1000 ms)
+that rides over the pauses between words/phrases, and RTLSDR-Airband's
+carrier-loss fast-close (`low_signal_abort`) is **disabled by default** (without a
+carrier on the link it would fire on every speech gap).
+
+**Carrier power (`--squelch carrier`).** With a bitstream that ships the
+per-channel carrier byte (§6.2), the squelch gates on carrier level instead. A
+per-channel adaptive-SNR floor is *not* usable here: it can't tell a continuous
+AWOS carrier from a high steady noise floor, so it learns the carrier away and
+closes. Instead the host derives a **shared, fixed threshold from a cross-channel
+noise estimate** — all channels of one receiver see the same wideband noise, so
+the 75th percentile of the live per-channel carrier levels is the noise reference
+and a station is a large outlier above it. The threshold is
+`pct75 × 10^(--squelch-snr/20)`, recomputed every 8192 frames
+(`airband-dsp::carrier_noise_threshold`) and applied to every channel via
+`Squelch::set_threshold`. Because it tracks the *other* channels' noise rather
+than a channel's own level, it holds a continuous carrier open (no hang, no
+chatter) while empty channels stay shut. The frame's carrier byte is decoded with
+`airband-dsp::decode_carrier`; channels start shut until the first cross-channel
+update. In carrier mode the audio-energy VOX is retained internally only to drive
+the speech-present flag that gates AGC gain and denoise noise-learning (the
+carrier alone can't distinguish speech from inter-word silence within an open
+transmission).
 
 `host/airband-reader` connects to `:30000`, demuxes records by the channel byte,
 and uses the per-channel sequence counter to count dropped samples. Defaults:
