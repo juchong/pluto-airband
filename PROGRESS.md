@@ -822,6 +822,49 @@ learns the steady level the channel closes.
 - **Verified live (Pluto+, 10.0.16.55):** `--squelch carrier` → ch0 (AWOS) tx=1,
   all 20 other channels tx=0, 0 drops.
 
+### Precise clock calibration vs LTE — DONE (2026-06-24)
+The AWOS calibration (`measure_offset.py`) is limited to ~1 ppm by the 25 kHz AM
+channel. Added a GPS-disciplined calibrator that closes that gap by ~100×.
+- **`firmware/diagnostics/lte_calibrate.py`:** tunes to an LTE downlink center and
+  measures the carrier frequency offset by **cyclic-prefix (CP) autocorrelation** —
+  every OFDM symbol repeats its tail one FFT length earlier (128 samples @ the
+  1.92 Msps central-6-RB rate), so `r[n]·conj(r[n+128])` carries phase
+  `−2π·CFO·128/fs` at every CP sample; summed over a 0.15 s capture the CP samples
+  add coherently → CFO to ~10 Hz, unambiguous over ±7.5 kHz (±10 ppm @ 750 MHz).
+  eNodeBs hold ±0.05 ppm (3GPP TS 36.104), so the cell is absolute truth, and the
+  high RF (~750 MHz) gives leverage a 19 kHz FM pilot / 24 kHz AM audio can't.
+- An initial **PSS** estimator was too noisy/biased (±200 Hz); replaced with CP
+  autocorrelation. Added `--selftest` (synthesizes LTE-like OFDM, no hardware),
+  band auto-scan (restarts `maia-httpd` per band to survive the Pluto's 96 MB RAM),
+  and `find_true_center` to disambiguate the 15 kHz raster (probe candidate centers,
+  pick the smallest |CFO|). `--apply` programs the override, reboots, re-measures.
+- Investigated and rejected **NWR** (unreachable) and the **broadcast-FM 19 kHz
+  pilot** (too low-frequency for sub-ppm) before settling on LTE; their probe
+  scripts were removed.
+- **Applied on hardware (Pluto+):** override `ad936x_ext_refclk_override=<40000064>`.
+  Docs: `SPEC.md` §5.2, `firmware/diagnostics/README.md`. Removed the superseded
+  AWOS closed-loop wrapper `calibrate_clock.py` (coarse `measure_offset.py` +
+  precise `lte_calibrate.py` cover it).
+
+### Deterministic Ethernet MAC (Pluto+) — DONE (2026-06-24)
+The Pluto+ pulled a new IP on every reboot. **Root cause:** the Zynq `macb` driver
+invents a **random MAC** when its DT node has no `local-mac-address`, and u-boot's
+auto-fixup can't help (the board's `ethernet0` alias resolves to a path the fixup
+doesn't match), so every boot → new MAC → new DHCP lease → new IP.
+- **First attempt (rejected): u-boot env.** Patching `adi_loadvals` to
+  `fdt set /amba/ethernet@e000b000 local-mac-address […]` failed two ways — the
+  initial path used `/axi/…` (the live node is `/amba/…`; the broken alias misled
+  it), and even corrected, *adding a new property* forces an in-place FDT grow that
+  overran the adjacent kernel image in the FIT → `bootm` fail → **DFU**. Recovered
+  by reading `uboot-env.dfu` over DFU (`dfu-util -U`), deleting the bad command,
+  fixing the env's 4-byte CRC32 header, writing back, and `-a firmware.dfu -e`.
+- **Fix (devicetree bake):** `firmware/apply_mac_devicetree.py` (idempotent, wired
+  into `build_firmware_full.sh`, plutoplus only) inserts `local-mac-address` into
+  the `&gem0` node, so the kernel reads a stable MAC natively at probe — no FDT
+  growth, no env dependency. Locally-administered `02:0a:35:00:01:22`, override via
+  `PLUTO_MAC`. **Software-only DT change → reflash `plutoplus.dfu` only.** Docs:
+  `BUILD.md` ("Deterministic Ethernet MAC").
+
 ## Next steps
 - **Buzz is hardware-bound** (see RE-DIAGNOSED section): pursue power-supply
   cleanup / shielding / external reference; no further HDL work will help. Keep

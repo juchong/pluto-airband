@@ -337,6 +337,39 @@ Pluto+-specific operational notes:
   audible modulation, but re-run `diagnostics/wideband_spectrum.py` on the unit
   to confirm rather than assume.
 
+### Deterministic Ethernet MAC (Pluto+)
+
+The Zynq `macb` (Cadence GEM) driver invents a **random MAC at every boot** when
+its devicetree node has no `local-mac-address`. The stock Pluto+ DT ships without
+one, so each reboot pulls a new DHCP lease and the device's IP churns. The build
+fixes this at the source: `firmware/apply_mac_devicetree.py` (wired into
+`build_firmware_full.sh`, plutoplus target only) bakes a fixed
+`local-mac-address` into the `&gem0` node of the OS devicetree, so the kernel
+reads a stable MAC natively at probe.
+
+```bash
+# default MAC is 02:0a:35:00:01:22 (locally administered). Override per unit:
+PLUTO_MAC=02:0a:35:00:01:23 TARGET=plutoplus bash firmware/build_firmware_full.sh
+```
+
+This is a **devicetree (FIT) change** → reflash `plutoplus.dfu` **only**; `boot.dfu`
+and the u-boot env (clock override, USB mode) are untouched. Verify after boot:
+`cat /sys/class/net/eth0/address` (must equal the pinned MAC; a `b2:…`/`be:…`-style
+value means the random fallback is still in play).
+
+> **Do not** try to pin the MAC from u-boot instead (`fdt set … local-mac-address`
+> in `adi_loadvals`): adding a *new* property forces an in-place FDT grow, which
+> overruns the adjacent kernel image in the FIT, fails `bootm`, and drops the
+> board into DFU. (Recovery: read `uboot-env.dfu` via `dfu-util -U`, remove the
+> offending command, fix the 4-byte CRC32 header, write back, `dfu-util -a
+> firmware.dfu -e`.) The devicetree bake above avoids the FDT entirely — the MAC
+> is part of the image the kernel already parses. A baked-in MAC is shared by
+> every device flashed with the image, so set `PLUTO_MAC` per unit for a fleet.
+
+> **The `0x02` first-octet bit** marks the address locally administered, so it
+> can never collide with a globally assigned vendor MAC. For a router DHCP
+> reservation, key it to the pinned MAC — now that it is stable across reboots.
+
 ### Running a build from an agent (launch detached + wait-and-check)
 
 The build outlives the SSH session and far outlives a single tool-call timeout,

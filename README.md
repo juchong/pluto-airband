@@ -75,6 +75,12 @@ branch). The Maia base (spectrometer/recorder/DDC) is preserved.
   nearby radios. The firmware now powers down the TX LO and floors TX attenuation at
   boot (`firmware/patch_tx_quiet.py` → `S60maia-httpd`); RX is unaffected (the
   in-band noise floor is identical with TX on/off — measured). See `SPEC.md` §5.1.
+- **Reference-oscillator calibration is per unit.** The ADALM-Pluto's bare 40 MHz
+  XO has a ppm error that shifts every channel (the Pluto+'s 0.5 ppm VCTCXO drifts
+  far less). Correct it once with the `ad936x_ext_refclk_override` u-boot var:
+  measure coarsely against a known AM carrier
+  ([`measure_offset.py`](firmware/diagnostics/README.md)), then precisely against an
+  LTE downlink (`lte_calibrate.py`, ~0.01 ppm, GPS-disciplined). See `SPEC.md` §5.2.
 - **LiveATC feeder integration** is still pending — see `PROGRESS.md` → Next steps.
 
 ## Quick start
@@ -102,8 +108,10 @@ over USB. Full build + flash + first-boot details (incl. the u-boot env that a
 > (same XC7Z010 die, `clg400` package, Gigabit Ethernet + microSD + 0.5 ppm
 > VCTCXO) build with `TARGET=plutoplus` and flash `plutoplus.dfu` in place of
 > `pluto.dfu`. Set the USB-PHY-reset jumper to **MIO46**, and the audio stream is
-> reachable on the Ethernet `eth0` (DHCP) IP as well as USB. See
-> [`BUILD.md`](BUILD.md) → "Pluto+ variant".
+> reachable on the Ethernet `eth0` (DHCP) IP as well as USB. The firmware pins a
+> **deterministic Ethernet MAC** in the devicetree (stock Pluto+ invents a random
+> one each boot, churning the DHCP lease/IP); override per unit with `PLUTO_MAC`.
+> See [`BUILD.md`](BUILD.md) → "Pluto+ variant" and "Deterministic Ethernet MAC".
 
 ### 2. Listen
 

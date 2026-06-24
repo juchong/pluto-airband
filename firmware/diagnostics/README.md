@@ -66,7 +66,8 @@ Supporting facts established along the way:
 | `samplerate_spur_test.py` | Sweeps the AD9361 sample rate and checks whether in-band spurs move (clock alias) or stay (physical). | gain + LO + Fs |
 | `gain_sweep.py` | Sweeps RX gain; reports ADC RMS/peak/clip% and low-freq wideband AM. | gain |
 | `floor_sweep.py` | Sweeps RX gain; per gain reports clip%, wideband PSD noise floor (median dBFS), SFDR (worst in-band spur above floor), and strong-peak count. Used to set the manual gain just below ADC clipping (the 71→48 dB change). | gain |
-| `measure_offset.py` | Measures a known carrier's frequency error (e.g. a commissioned AWOS) and derives the 40 MHz reference ppm error + the `ad936x_ext_refclk_override` value to calibrate it out. | recorder only |
+| `measure_offset.py` | **Coarse clock calibration.** Measures a known AM carrier's frequency error (e.g. a commissioned AWOS) and derives the 40 MHz reference ppm error + the `ad936x_ext_refclk_override` value. ~1 ppm (limited by the 25 kHz channel) — a bring-up step before `lte_calibrate.py`. | recorder only |
+| `lte_calibrate.py` | **Precise clock calibration (~0.01 ppm).** Tunes to an LTE downlink center and measures the carrier frequency offset by cyclic-prefix autocorrelation (eNodeBs are GPS-disciplined to ±0.05 ppm). `--selftest` validates the estimator with no hardware; omit `--freq` to auto-scan US bands; `--apply` programs the override, reboots, and re-measures to convergence. | gain + LO |
 | `lo_band_am.py` | At a fixed clean gain, compares wideband level + low-freq AM across LO bands (internal vs external test). | gain + LO |
 | `iq_envelope.py` | Raw-IQ level/clipping, slow power-envelope AM (buzz signature), impulsive-glitch detection. Captures live or reads a `.sigmf-data` file. | recorder only |
 | `buzz_meter.py` | Connects to the decoded audio stream, demuxes channels, reports per-channel buzz metrics (comb%, 7625 Hz tone, etc.). A/B tool. | read-only stream |
@@ -87,4 +88,20 @@ $PY wideband_spectrum.py
 
 # 3. The spurs are physical/fixed (don't move with the internal clock):
 $PY samplerate_spur_test.py
+```
+
+## Clock calibration
+
+Correct the reference-oscillator ppm error (see `SPEC.md` §5.2). Coarse first
+(brings the unit within the LTE capture range), then precise:
+
+```bash
+cd firmware/diagnostics
+PY=../../.venv/bin/python
+export PLUTO_HOST=<device-ip>
+
+$PY lte_calibrate.py --selftest          # validate the estimator (no hardware)
+$PY measure_offset.py                     # coarse, against AWOS 118.050 MHz
+$PY lte_calibrate.py --freq <cell_MHz>    # precise (omit --freq to auto-scan)
+$PY lte_calibrate.py --freq <cell_MHz> --apply   # program override + reboot + verify
 ```

@@ -278,41 +278,50 @@ it becomes power-cycle-persistent at the next firmware flash.
 
 ### 5.2 Reference-oscillator calibration (per unit)
 
-The Pluto's 40 MHz reference is an uncalibrated oscillator; its ppm error shifts
-every tuned frequency proportionally. Measured against a known-accurate carrier
-(a freshly commissioned **AWOS at 118.050 MHz**), a true 118.050 MHz signal landed
-~1.6 kHz high. Calibration uses the u-boot env var **`ad936x_ext_refclk_override`**
-— the `adi_loadvals` boot script does `fdt set /clocks/clock@0 clock-frequency
-<value>`, so the AD9361 driver computes its PLL/decimation from the *true* reference
-and the nominal 123.438 MHz LO / 14 MHz Fs are hit exactly (all 21 channels
-corrected together; the channelizer NCO math is unchanged). `/clocks/clock@0` is the
-`ad9364_ext_refclk` the transceiver runs on.
+The Pluto's 40 MHz reference is an uncalibrated oscillator (the ADALM-Pluto's bare
+XO; the Pluto+ has a 0.5 ppm VCTCXO that drifts far less). Its ppm error shifts
+every tuned frequency proportionally, so it is corrected once per unit via the
+u-boot env var **`ad936x_ext_refclk_override`**: the `adi_loadvals` boot script does
+`fdt set /clocks/clock@0 clock-frequency <value>`, so the AD9361 driver computes its
+PLL/decimation from the *true* reference and the nominal 123.438 MHz LO / 14 MHz Fs
+are hit exactly (all 21 channels corrected together; the channelizer NCO math is
+unchanged). `/clocks/clock@0` is the `ad9364_ext_refclk` the transceiver runs on.
 
 Two gotchas, both learned on hardware:
 - **Angle brackets are mandatory.** `fdt set ... clock-frequency <N>` needs the
   literal `<>` (an integer cell); a bare decimal is stored as a *string* and
   silently ignored, leaving the baked DTB value. Set it as
-  `fw_setenv ad936x_ext_refclk_override "<39999338>"`.
-- **The value is the absolute true XO, not 40 MHz×(1+ppm).** The booted DTB on this
-  unit bakes a non-nominal clock (39,999,891 Hz), and the displayed carrier scales
-  as `f_true·(believed_ref / true_xo)`. So the override = the *current* believed
+  `fw_setenv ad936x_ext_refclk_override "<40000064>"`.
+- **The value is the absolute true XO, not 40 MHz×(1+ppm).** The booted DTB bakes a
+  non-nominal clock, and the displayed carrier scales as
+  `f_true·(believed_ref / true_xo)`. So the override = the *current* believed
   reference × (true/displayed), i.e. derived from the measured error against the
-  live clock — **not** from nominal 40 MHz. This board: **39,999,338 Hz**.
+  **live** clock — not from nominal 40 MHz. The diagnostics compute this for you.
 
-Result: carrier error **+1671 Hz → +51 Hz** at apply, and after the unit warmed up
-(~75 min) it settles to **≈ −43 Hz (+0.36 ppm)** — i.e. the 39,999,338 Hz setting
-holds within **±0.4 ppm across the cold→warm swing**. The remaining error is
-ordinary XO thermal drift (the bare-XO Pluto cannot do better without a TCXO/GPSDO),
-and ±0.4 ppm (~±50 Hz at 118 MHz) is negligible for 25 kHz AM channels.
+**Calibration procedure** (two references, coarse → precise):
 
-- **Measure:** `firmware/diagnostics/measure_offset.py [true_MHz]` — recorder-only;
-  reads the live believed reference (via SSH) and prints the exact bracketed
-  `fw_setenv` command. Iterate (apply → reboot → re-measure) if residual >~1 ppm.
-- **Apply:** `fw_setenv ad936x_ext_refclk_override "<hz>"` then reboot. Persistent
-  in the env partition; a `boot.dfu` flash resets the env, after which
-  `firmware/pluto_setup_env.py --refclk-hz <hz>` re-applies it (brackets added
-  automatically; default carries this board's value). **Per unit** — re-measure for
-  a different Pluto.
+1. **Coarse — known AM carrier (gets within the LTE capture range, ±10 ppm).**
+   `firmware/diagnostics/measure_offset.py [true_MHz]` measures a commissioned
+   **AWOS/ASOS** (default 118.050 MHz) against the live believed reference and
+   prints the bracketed `fw_setenv`. Recorder-only. Accuracy is limited by the
+   25 kHz AM channel (~1 ppm), so it is a bring-up step, not the final word.
+2. **Precise — LTE downlink (GPS-disciplined, ~0.01 ppm).**
+   `firmware/diagnostics/lte_calibrate.py --freq <MHz>` tunes to a cell's downlink
+   center and measures the carrier frequency offset by **cyclic-prefix (CP)
+   autocorrelation**: every LTE OFDM symbol repeats its tail one FFT length (128
+   samples @ 1.92 Msps) earlier, so `r[n]·conj(r[n+128])` carries phase
+   `−2π·CFO·128/fs` at every CP sample; summed over a 0.15 s capture the CP samples
+   add coherently and yield CFO to ~10 Hz, unambiguous over ±7.5 kHz. eNodeBs hold
+   ±0.05 ppm by 3GPP TS 36.104, so the cell is absolute truth — and at ~750 MHz the
+   high-RF leverage beats a 19 kHz FM pilot or 24 kHz AM audio by orders of
+   magnitude. Run `--selftest` (no hardware) to validate the estimator; omit
+   `--freq` to auto-scan common US bands. `--apply` programs the override, reboots,
+   and re-measures until the residual converges.
+
+**Apply / persist:** the override lives in the env partition and survives reboot,
+but a `boot.dfu` flash resets the env — re-apply with
+`firmware/pluto_setup_env.py --refclk-hz <hz>` (brackets added automatically;
+default carries this board's value). **Per unit** — re-measure for a different Pluto.
 
 ## 6. Control plane and data plane
 
