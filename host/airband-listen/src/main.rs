@@ -54,6 +54,11 @@ const SAMPLE_SCALE: f32 = 8_388_608.0;
 /// NCO tuning. Pass --rate to override for an older bitstream.)
 const DEFAULT_RATE: u32 = 15625;
 
+/// Default TCP port of the maia-httpd airband stream, appended when the address
+/// argument omits an explicit `:port` (so `10.0.16.183` works like
+/// `10.0.16.183:30000`).
+const DEFAULT_PORT: u16 = 30000;
+
 /// Default channel plan (MHz), matching `firmware/airband.json`.
 const FREQS_MHZ: [f64; 21] = [
     118.050, 119.200, 119.900, 120.100, 120.400, 120.950, 121.500, 121.600, 121.700, 122.275,
@@ -64,7 +69,7 @@ const FREQS_MHZ: [f64; 21] = [
 #[derive(Parser, Debug)]
 #[command(version, about)]
 struct Args {
-    /// Pluto airband stream address (host:port)
+    /// Pluto airband stream address (host[:port]; port defaults to 30000)
     #[arg(default_value = "192.168.2.1:30000")]
     addr: String,
     /// Number of channels in the stream
@@ -77,7 +82,7 @@ struct Args {
     #[arg(long, default_value_t = DEFAULT_RATE)]
     rate: u32,
     /// Initial playback gain (linear; airband audio is quiet, adjust with +/-)
-    #[arg(long, default_value_t = 3000.0)]
+    #[arg(long, default_value_t = 25000.0)]
     gain: f32,
     /// Start with the voice band-pass filter ON (OFF by default; toggle with 'f').
     ///
@@ -245,6 +250,20 @@ fn reader_loop(shared: Arc<Shared>, addr: String, n: usize, rate: u32, lo: f64, 
     }
 }
 
+/// Normalizes the user-supplied address: if it has no `:port`, appends the
+/// default airband port. This makes `airband-listen 10.0.16.183` behave like
+/// `airband-listen 10.0.16.183:30000` instead of failing to resolve (a bare
+/// host is not a valid `host:port` for `TcpStream::connect`, so the connect
+/// loop would otherwise spin forever showing "connecting…").
+fn normalize_addr(addr: &str) -> String {
+    if addr.contains(':') {
+        // Already has a port (or is a bracketed/explicit host:port) — leave it.
+        addr.to_string()
+    } else {
+        format!("{addr}:{DEFAULT_PORT}")
+    }
+}
+
 fn freq_label(ch: usize) -> String {
     FREQS_MHZ
         .get(ch)
@@ -352,7 +371,7 @@ fn main() -> Result<()> {
 
     let reader = {
         let shared = Arc::clone(&shared);
-        let addr = args.addr.clone();
+        let addr = normalize_addr(&args.addr);
         let (rate, lo, hi) = (args.rate, args.filter_low, args.filter_high);
         thread::spawn(move || reader_loop(shared, addr, n, rate, lo, hi))
     };
@@ -428,4 +447,21 @@ fn main() -> Result<()> {
     shared.running.store(false, Ordering::Relaxed);
     let _ = reader.join();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_addr_appends_default_port() {
+        assert_eq!(normalize_addr("10.0.16.183"), "10.0.16.183:30000");
+        assert_eq!(normalize_addr("pluto.local"), "pluto.local:30000");
+    }
+
+    #[test]
+    fn normalize_addr_keeps_explicit_port() {
+        assert_eq!(normalize_addr("10.0.16.183:30000"), "10.0.16.183:30000");
+        assert_eq!(normalize_addr("192.168.2.1:40000"), "192.168.2.1:40000");
+    }
 }
