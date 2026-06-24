@@ -295,11 +295,12 @@ Build and flash exactly like the ADALM-Pluto, but set `TARGET=plutoplus`:
 TARGET=plutoplus bash ~/pluto-build/airband/firmware/build_firmware_full.sh
 # artifacts: build/{boot,plutoplus}.{frm,dfu}
 scp <server>:~/pluto-build/plutosdr-fw/build/{boot,plutoplus}.dfu firmware/build/
-cd firmware/build
-dfu-util -a boot.dfu     -D boot.dfu          # mtd0: bitstream + FSBL + u-boot
-dfu-util -a firmware.dfu -D plutoplus.dfu     # mtd3: kernel + DT + rootfs
-dfu-util -a firmware.dfu -e                   # leave DFU
 ```
+
+Then flash per **[Flashing over DFU — the reliable procedure](#flashing-over-dfu--the-reliable-procedure-do-this)**
+(use `plutoplus.dfu` as the `firmware.dfu` image). A full HDL build is a both-
+partition flash; a devicetree/rootfs-only rebuild (e.g. the MAC pin below) is
+**`firmware.dfu`-only** and preserves the u-boot env.
 
 What carries over automatically (no edit needed):
 
@@ -401,24 +402,89 @@ neither affects the build because it runs under `nohup`). Pattern that works:
    embedded UserID equals the committed fork HEAD (the build prints an `OK`/
    `WARNING` line; see "Verify bitstream provenance"). Both must pass.
 
-### Flashing + first-boot expectations (for unattended reflash)
+### Flashing over DFU — the reliable procedure (do this)
 
-Enter DFU mode (`device_reboot sf` over ssh/serial, or power-cycle holding the
-DFU button) until `dfu-util -l` shows `alt=0 boot.dfu` … `alt=1 firmware.dfu`,
-then flash **both** partitions and detach:
+Reflashing only goes wrong when one of the four facts below is ignored. Follow
+this and it works the first time. (The other flash snippets in this doc defer to
+this section.)
+
+**1. Flash only what changed — never flash `boot.dfu` "just in case."**
+
+| What changed | Flash | Why |
+|---|---|---|
+| Devicetree / kernel / rootfs / `--airband` host-side (a **FIT-only** build): MAC pin, channel plan, gain default, the front-end lock, etc. | **`firmware.dfu` only** (`pluto.dfu` / `plutoplus.dfu`) | Leaves `mtd0` **and the u-boot env untouched** → the clock calibration (`ad936x_ext_refclk_override`), `usb_ethernet_mode`, and AD9364 attrs all survive. No re-apply step, no env risk. |
+| HDL / bitstream / block-design / address-map | **both** `boot.dfu` **and** `firmware.dfu` | The PL bitstream lives in `BOOT.BIN` (`mtd0`); flashing only the FIT leaves **stale gateware**. `boot.dfu` then **wipes the env** → re-apply afterward (step 5). |
+
+Rule of thumb: a change under `maia-hdl/` (gateware) is a `boot.dfu` change;
+anything else (devicetree, rootfs, host tools) is **`firmware.dfu`-only**. When in
+doubt, do the FIT-only flash first and re-check — an unnecessary `boot.dfu` flash
+only costs you the env re-apply.
+
+**2. Enter DFU and wait for the five alts.** On a running device, over serial or
+ssh:
 
 ```bash
-scp administrator@10.0.16.36:'~/pluto-build/plutosdr-fw/build/{boot,pluto}.dfu' firmware/build/
-dfu-util -a boot.dfu     -D firmware/build/boot.dfu     # mtd0 (~2 s)
-dfu-util -a firmware.dfu -D firmware/build/pluto.dfu    # mtd3 (~100 s, 19 MB)
-dfu-util -a firmware.dfu -e || true                     # detach -> boot (plain `-e` errors with >1 alt)
+device_reboot sf      # Serial-Flash DFU; no power-cycle / button needed
 ```
 
-> **MANDATORY after any `boot.dfu` flash:** it re-defaults the u-boot env, wiping
+> The USB **re-enumerates**, so the serial console (`/dev/cu.usbmodem*`) vanishes
+> and any in-flight serial read throws **`OSError: [Errno 6] Device not
+> configured`**. **That is the reboot succeeding — not an error.** Then poll until
+> the DFU interface appears:
+
+```bash
+until dfu-util -l 2>/dev/null | grep -q 'alt='; do sleep 1; done
+dfu-util -l | grep alt=     # expect alt=0 boot.dfu … alt=1 firmware.dfu … alt=4 spare.dfu
+```
+
+(If you can't reach the device to issue `device_reboot sf`, power-cycle holding
+the DFU button.)
+
+**3. Write the image in the foreground, logged to a file — do NOT pipe to `tail`
+or background it.** You must see the `Download done.` / `Done!` line; piping or
+backgrounding swallows it and you can't distinguish success from a hang. Budget
+**≥4 min** for the ~19 MB FIT (the write itself runs ~100–200 s):
+
+```bash
+cd firmware/build
+# bitstream change ONLY: flash mtd0 first (~2 s) —
+# dfu-util -a boot.dfu -D boot.dfu > /tmp/dfu-boot.log 2>&1; echo "exit=$?"; tail -4 /tmp/dfu-boot.log
+# always (FIT, ~19 MB) — use pluto.dfu on ADALM-Pluto, plutoplus.dfu on Pluto+:
+dfu-util -a firmware.dfu -D plutoplus.dfu > /tmp/dfu.log 2>&1; echo "exit=$?"
+tail -4 /tmp/dfu.log    # MUST end: "Download done." → dfuMANIFEST → dfuIDLE → "Done!"
+```
+
+Success = that `Done!` line **and** `exit=0`. Nothing else counts as confirmation.
+
+**4. A second `-D` to the same alt failing at "0 % / 0 bytes / `dfuERROR`" means
+the FIRST write already SUCCEEDED — not that it failed.** After a good download
+the partition manifests and refuses another write in the same DFU session, so a
+"verify by re-flashing" reflex looks like a failure when it is the opposite. Judge
+success only by step 3. (If you *must* genuinely rewrite, just run `-D` again:
+dfu-util auto-issues `CLRSTATUS` and proceeds normally.)
+
+**5. Detach to boot, then verify.** The alt **must** be named — bare `dfu-util -e`
+errors with "More than one DFU capable USB device" / ">1 alt":
+
+```bash
+dfu-util -a firmware.dfu -e
+```
+
+Serial returns in ~15 s; full boot (sshd/maia-httpd) takes longer (see below).
+Confirm the change took:
+
+```bash
+cat /sys/class/net/eth0/address        # Pluto+: the pinned MAC, NOT a random be:/b2:… one
+fw_printenv ad936x_ext_refclk_override # clock cal still present (proves the env survived a FIT-only flash)
+```
+
+> **After a `boot.dfu` flash ONLY:** it re-defaults the u-boot env, wiping
 > `usb_ethernet_mode=ncm` (→ macOS loses `usb0`, "web is dead") and the AD9364
-> attrs. Re-apply over serial — `.venv/bin/python firmware/pluto_setup_env.py`
-> (`--check` to audit). See [u-boot environment](#critical-the-u-boot-environment-reset-by-every-bootdfu-flash).
-> `pluto.dfu`-only reflashes don't touch the env.
+> attrs. Re-apply — `.venv/bin/python firmware/pluto_setup_env.py` (`--check` to
+> audit; `--device plutoplus` for the Pluto+). **FIT-only reflashes skip this.**
+> See [u-boot environment](#critical-the-u-boot-environment-reset-by-every-bootdfu-flash).
+
+### First-boot expectations (for unattended reflash)
 
 First boot after a flash is **slow**: the device answers ping within ~30 s
 (kernel + USB-ethernet gadget up) but `sshd`/`maia-httpd` (`:22` / `:30000`)
@@ -601,18 +667,12 @@ These are set in `maia-sdr/maia-hdl/maia_hdl/config.py` (`airband_address_range`
 start/end addresses are **baked into the bitstream** (`DmaStreamWrite`), so
 changing them requires a bitstream rebuild (`boot.dfu`), not just a DT edit.
 
-### Flash both partitions over DFU
+### Flash over DFU
 
-Put the Pluto in DFU mode (`device_reboot sf`), then flash **both** images
-(order: boot first) and re-apply the u-boot env:
-
-```bash
-dfu-util -a boot.dfu     -D plutosdr-fw/build/boot.dfu
-dfu-util -a firmware.dfu -D plutosdr-fw/build/pluto.dfu
-dfu-util -a firmware.dfu -e          # leave DFU (plain `dfu-util -e` errors: >1 alt)
-# boot.dfu reset the u-boot env -> re-apply over serial (see u-boot env section):
-.venv/bin/python firmware/pluto_setup_env.py
-```
+Follow **[Flashing over DFU — the reliable procedure](#flashing-over-dfu--the-reliable-procedure-do-this)**.
+A bitstream rebuild (address-map change) is a both-partition flash (`boot.dfu`
+first, then `firmware.dfu`), after which you must re-apply the wiped u-boot env
+(`.venv/bin/python firmware/pluto_setup_env.py`).
 
 ## Reproduce the build pipeline from scratch (end-to-end)
 
@@ -629,13 +689,15 @@ bash ~/pluto-build/airband/firmware/build_firmware_full.sh
 # --- copy artifacts to the machine with the Pluto -------------------------
 scp <server>:~/pluto-build/plutosdr-fw/build/{boot,pluto}.dfu firmware/build/
 
-# --- flash (Pluto in DFU mode: `device_reboot sf`) ------------------------
+# --- flash: follow the reliable procedure ---------------------------------
+# See "Flashing over DFU — the reliable procedure". In short (full bitstream build):
 cd firmware/build
-dfu-util -a boot.dfu     -D boot.dfu      # mtd0: bitstream + FSBL + u-boot
-dfu-util -a firmware.dfu -D pluto.dfu     # mtd3: kernel + DT + rootfs
-dfu-util -a firmware.dfu -e               # leave DFU (plain `-e` errors: >1 alt)
+device_reboot sf                          # over serial/ssh; wait for `dfu-util -l` alts
+dfu-util -a boot.dfu     -D boot.dfu  > /tmp/dfu-boot.log 2>&1; echo "exit=$?"  # mtd0
+dfu-util -a firmware.dfu -D pluto.dfu > /tmp/dfu.log      2>&1; echo "exit=$?"  # mtd3 (~19 MB)
+dfu-util -a firmware.dfu -e               # leave DFU (named alt; plain `-e` errors: >1 alt)
 
-# --- if boot.dfu was flashed, re-apply the wiped u-boot env (over serial) -
+# --- boot.dfu was flashed, so re-apply the wiped u-boot env (over serial) -
 cd ../.. && .venv/bin/python firmware/pluto_setup_env.py
 ```
 
