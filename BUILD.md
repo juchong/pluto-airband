@@ -494,12 +494,15 @@ LSB** (i.e. ~ −90 to −100 dBFS at 24-bit). Two things were eating it:
    | **manual 71 dB** | **71 dB** | **~280** |
 
    Fixed **manual gain near max (71 dB)** wins by ~5× for weak-signal recovery
-   and is the default. Caveat (found later, see `firmware/diagnostics/`): at
-   strong-signal sites 71 dB clips the *wideband* ADC (~15% of samples); lower
-   `gain_db` if you hear distortion. Note this does not remove the fixed RF-spur
-   "buzz". This is the default in `firmware/airband.json` and the `maia-httpd` built-in
-   (`AirbandConfig::default`). To apply without reflashing, drop the config on the
-   device and restart:
+   and is the **shipped built-in default** (`maia-httpd` `AirbandConfig::default`,
+   what runs when `/root/airband.json` is absent). Caveat (found later, see
+   `firmware/diagnostics/`): at strong-signal sites 71 dB clips the *wideband* ADC
+   (~13–15% of samples); lower `gain_db` if you hear distortion. Note this does not
+   remove the fixed RF-spur "buzz". Two site-dependent adjustments: behind an
+   **external selective filter** the band is quiet enough to run the **73 dB**
+   AD9361 ceiling (what the `firmware/airband.json` template sets); on a **bare**
+   front end at a strong site drop to **~48 dB** (the highest that doesn't overload).
+   To apply a config without reflashing, drop it on the device and restart:
 
    ```sh
    cat firmware/airband.json | ssh root@192.168.2.1 'cat > /root/airband.json'

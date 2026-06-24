@@ -233,15 +233,17 @@ The receiver reads `/root/airband.json` at startup (template:
   DC/LO-leakage spur in a guard gap — are derived in `hdl/capture_window.py`.)
 - **Gain:** one shared RX gain serves all 21 channels (no per-channel *RF* AGC;
   per-channel audio AGC is done on the host, §6.4); fixed **manual gain** (the
-  AD9361 AGC modes settle on wideband power and starve weak channels). The default is **48 dB** — the highest gain that does *not* overload
-  the wideband ADC. The original 71 dB was chosen for weak-signal sensitivity but
-  drove the ADC into **hard clipping ~13 % of samples**; that broadband intermod —
-  not a real noise floor — raised the displayed floor to ~−6 dBFS and sprayed
-  spurs across the band. A measured gain sweep (`firmware/diagnostics/floor_sweep.py`)
-  showed clipping vanishes by ~48 dB, dropping the floor ~19 dB with **no SNR loss**
-  (signal and noise scale together until the noise/quantization-limited region far
-  below). Raise toward 55–71 dB only at a quieter site / with a better antenna
-  (watch clip %); lower if a strong local signal still overloads. The residual
+  AD9361 AGC modes settle on wideband power and starve weak channels). The shipped
+  built-in default is **71 dB**, near the AD9361 manual ceiling, for best weak-signal
+  recovery. The trade-off is the wideband ADC: at a strong-signal site 71 dB drives
+  it into **hard clipping ~13–15 % of samples**; that broadband intermod — not a
+  real noise floor — raises the displayed floor to ~−6 dBFS and sprays spurs across
+  the band. Two site-dependent fixes: an **external selective filter** quiets the
+  band so the **73 dB** ceiling is safe (the `firmware/airband.json` template), or on
+  a **bare** front end drop to **~48 dB** — a measured gain sweep
+  (`firmware/diagnostics/floor_sweep.py`) shows clipping vanishes by ~48 dB, dropping
+  the floor ~19 dB with **no SNR loss** (signal and noise scale together until the
+  noise/quantization-limited region far below). The residual
   in-band spur comb (120 MHz = 40 MHz reference 3rd harmonic, §7) is gain-invariant
   hardware RF, not addressed by gain.
 
