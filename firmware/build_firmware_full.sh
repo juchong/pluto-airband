@@ -161,6 +161,18 @@ if [ -f "$S60" ]; then
     python3 "$AIRBAND_REPO/firmware/patch_tx_quiet.py" "$S60"
 fi
 
+# 3d. Self-heal maia-httpd on a tight-memory boot. The kernel reserves ~416 MB of
+#     the 512 MB for the maia-sdr DMA regions, leaving userspace ~96 MB; maia-httpd's
+#     startup footprint sits near that edge, so a transient spike on the FIRST boot
+#     after a flash can let the OOM killer take it -- and `start-stop-daemon -b` never
+#     respawns, leaving web :8000 / audio :30000 dead until a manual restart. This
+#     injects a BOUNDED (~90 s) boot-time retry that relaunches it if it died, then
+#     exits (so it never fights the web-UI / lte_calibrate `S60maia-httpd restart`).
+#     Idempotent (airband-respawn marker). Software-only init-script change.
+if [ -f "$S60" ]; then
+    python3 "$AIRBAND_REPO/firmware/patch_maia_respawn.py" "$S60"
+fi
+
 # 4. Full build inside the maia-sdr-devel container (Vivado from /opt/Xilinx
 #    volume -> HAVE_VIVADO=1). GIT_HASH is exported into the container so the
 #    Vivado flow bakes it into the bitstream (USERID + USR_ACCESS).
