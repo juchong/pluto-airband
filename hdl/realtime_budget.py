@@ -153,7 +153,7 @@ def _stress(cpl=3, lane_decim=64, ntaps=63, audio_decim=4, n_channels=6,
     # frame is missing per channel.
     per = {c: [] for c in range(n_channels)}
     for w in words:
-        _, chan, sample = AudioFramer.unpack(w)
+        _, chan, sample, _carrier = AudioFramer.unpack(w)
         per[chan].append(sample)
     ref = dut.model(samples, freqs)
     bit_ok = True

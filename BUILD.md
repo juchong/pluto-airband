@@ -611,6 +611,17 @@ that path caused stale-gateware flashes and was removed). What to flash:
 | Any HDL / block-design / address-map change | `boot.dfu` **and** `pluto.dfu` | **`pluto_setup_env.py`** (boot flash wiped the env) |
 | Software only (`maia-httpd` / devicetree / channel plan / init script) | `pluto.dfu` only (bitstream logic unchanged) | nothing (env untouched) |
 
+> **Audio-frame format changed (carrier byte).** The current `hdl/` ships a
+> per-channel carrier level in audio-frame bits `[31:24]`, narrowing the audio
+> sample to bits `[23:0]` (`SPEC.md` §6.2). This is a **breaking** wire change:
+> flash the new bitstream **and** rebuild/redeploy the host tools
+> (`cargo build --release --manifest-path host/Cargo.toml`) together. An old host
+> against the new bitstream misreads the framing; a new host against an old
+> bitstream reads carrier `0` and silently falls back to VOX squelch (`--squelch
+> carrier` then has no effect). After the new bitstream is live, verify the narrow
+> cleanup FIR (cleaner inter-transmission noise) and `--squelch carrier` on
+> 118.050 AWOS.
+
 ### Verify on hardware
 
 After boot (default `192.168.2.1`, ssh `root` / `analog`):

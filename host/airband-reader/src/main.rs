@@ -35,7 +35,8 @@ mod icecast;
 mod metrics;
 
 use airband_dsp::{
-    level_to_dbfs, Agc, Notch, Squelch, SquelchConfig, SquelchMode, VoiceFilter, SAMPLE_SCALE,
+    decode_carrier, level_to_dbfs, Agc, Denoise, Notch, Squelch, SquelchConfig, SquelchMode,
+    VoiceFilter, SAMPLE_SCALE,
 };
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
@@ -51,7 +52,8 @@ use std::{
 };
 
 const FRAME_BYTES: usize = 8;
-const SAMPLE_FIELD: u32 = 32;
+const AUDIO_FIELD: u32 = 24;
+const CARRIER_FIELD: u32 = 8;
 const CHAN_FIELD: u32 = 8;
 const SEQ_FIELD: u32 = 24;
 const SEQ_MOD: u32 = 1 << SEQ_FIELD;
@@ -71,6 +73,8 @@ enum SquelchArg {
     Off,
     Auto,
     Manual,
+    /// Carrier-power squelch (needs a bitstream that ships the carrier byte).
+    Carrier,
 }
 
 #[derive(Parser, Debug)]
@@ -120,6 +124,12 @@ struct Args {
     /// Disable the AGC (use raw, band-passed audio scaled by --shift).
     #[arg(long)]
     no_agc: bool,
+    /// Disable the spectral noise reducer (on by default).
+    #[arg(long)]
+    no_denoise: bool,
+    /// Noise-reducer spectral floor in dB (more negative = more aggressive cut).
+    #[arg(long, default_value_t = -18.0, allow_hyphen_values = true)]
+    denoise_floor_db: f32,
     /// Disable the voice band-pass (on by default; 300-3400 Hz).
     #[arg(long)]
     no_filter: bool,
@@ -188,6 +198,8 @@ struct Config {
     min_samples: u64,
     agc_on: bool,
     filter_on: bool,
+    denoise_on: bool,
+    denoise_floor_db: f32,
     notch_freq: Option<f64>,
     notch_q: f64,
     low: f64,
@@ -223,11 +235,15 @@ impl UdpOut {
 }
 
 /// Decodes one 64-bit framed record into (seq, channel, sample).
-fn unpack(word: u64) -> (u32, u8, i32) {
-    let sample = (word & ((1u64 << SAMPLE_FIELD) - 1)) as u32 as i32;
-    let chan = ((word >> SAMPLE_FIELD) & ((1u64 << CHAN_FIELD) - 1)) as u8;
-    let seq = ((word >> (SAMPLE_FIELD + CHAN_FIELD)) & ((1u64 << SEQ_FIELD) - 1)) as u32;
-    (seq, chan, sample)
+fn unpack(word: u64) -> (u32, u8, i32, u8) {
+    // audio occupies bits [23:0], sign-extend from 24 to 32 bits
+    let raw = (word & ((1u64 << AUDIO_FIELD) - 1)) as u32;
+    let sample = ((raw << (32 - AUDIO_FIELD)) as i32) >> (32 - AUDIO_FIELD);
+    let carrier = ((word >> AUDIO_FIELD) & ((1u64 << CARRIER_FIELD) - 1)) as u8;
+    let chan = ((word >> (AUDIO_FIELD + CARRIER_FIELD)) & ((1u64 << CHAN_FIELD) - 1)) as u8;
+    let seq = ((word >> (AUDIO_FIELD + CARRIER_FIELD + CHAN_FIELD)) & ((1u64 << SEQ_FIELD) - 1))
+        as u32;
+    (seq, chan, sample, carrier)
 }
 
 /// Formats a UTC timestamp `YYYYmmdd_HHMMSS` for a filename (no extra deps).
@@ -353,13 +369,21 @@ impl Recorder {
     }
 }
 
+/// STFT frame size for the spectral denoiser (~16 ms at 15625 sps).
+const DENOISE_FRAME: usize = 256;
+
 /// All per-channel state: drop tracking, DSP, recorder, and stats.
 struct Channel {
     index: usize,
     last_seq: Option<u32>,
     squelch: Squelch,
+    /// Audio-energy VOX used only in carrier-squelch mode to drive the `above`
+    /// (speech-present) flag for AGC/denoise; the main squelch then keys on the
+    /// carrier, whose units don't match the audio sample magnitude.
+    audio_gate: Option<Squelch>,
     vf: VoiceFilter,
     notch: Option<Notch>,
+    denoise: Denoise,
     agc: Agc,
     recorder: Option<Recorder>,
     udp: Option<UdpOut>,
@@ -385,10 +409,18 @@ impl Channel {
             squelch: Squelch::new(
                 SquelchConfig::new(cfg.squelch_mode, cfg.rate).with_hang_ms(cfg.squelch_hang_ms),
             ),
+            audio_gate: match cfg.squelch_mode {
+                SquelchMode::Carrier { snr_db } => Some(Squelch::new(SquelchConfig::new(
+                    SquelchMode::AutoSnr { snr_db },
+                    cfg.rate,
+                ))),
+                _ => None,
+            },
             vf: VoiceFilter::new(cfg.rate as f64, cfg.low, cfg.high),
             notch: cfg
                 .notch_freq
                 .map(|f| Notch::new(f, cfg.rate as f64, cfg.notch_q)),
+            denoise: Denoise::new(DENOISE_FRAME, cfg.denoise_floor_db),
             agc: Agc::new(),
             recorder,
             udp: None,
@@ -423,16 +455,21 @@ impl Channel {
                 v = n.process(v);
             }
         }
+        let mut vn = (v / SAMPLE_SCALE as f64) as f32;
+        if cfg.denoise_on {
+            // Learn the noise model from below-threshold (non-speech) samples.
+            vn = self.denoise.process(vn, !above);
+        }
         if cfg.agc_on {
-            let y = self.agc.process((v / SAMPLE_SCALE as f64) as f32, true, just_opened, above);
+            let y = self.agc.process(vn, true, just_opened, above);
             (y as f64 * 32767.0).round().clamp(i16::MIN as f64, i16::MAX as f64) as i16
         } else {
-            let scaled = v * 2f64.powi(-cfg.shift);
+            let scaled = vn as f64 * SAMPLE_SCALE as f64 * 2f64.powi(-cfg.shift);
             scaled.round().clamp(i16::MIN as f64, i16::MAX as f64) as i16
         }
     }
 
-    fn push(&mut self, seq: u32, sample: i32, cfg: &Config) -> Result<()> {
+    fn push(&mut self, seq: u32, sample: i32, carrier: u8, cfg: &Config) -> Result<()> {
         if let Some(prev) = self.last_seq {
             let expected = (prev + 1) % SEQ_MOD;
             if seq != expected {
@@ -444,13 +481,27 @@ impl Channel {
         self.interval_count += 1;
         self.interval_peak = self.interval_peak.max(sample.abs());
 
-        let mag = sample.unsigned_abs() as f32;
-        self.squelch.process(mag);
+        // Carrier-power squelch keys on the FPGA carrier level; all others on the
+        // audio magnitude. (Carrier is 0 on bitstreams that don't ship it.)
+        let level = if matches!(cfg.squelch_mode, SquelchMode::Carrier { .. }) {
+            decode_carrier(carrier)
+        } else {
+            sample.unsigned_abs() as f32
+        };
+        self.squelch.process(level);
         let gated = !matches!(cfg.squelch_mode, SquelchMode::Off);
         let open = !gated || self.squelch.is_open();
         let just_opened = gated && self.squelch.just_opened();
         let just_closed = gated && self.squelch.just_closed();
-        let above = mag >= self.squelch.threshold();
+        // Speech-present flag for AGC/denoise is always audio-energy based.
+        let mag = sample.unsigned_abs() as f32;
+        let above = match self.audio_gate.as_mut() {
+            Some(g) => {
+                g.process(mag);
+                mag >= g.threshold()
+            }
+            None => mag >= self.squelch.threshold(),
+        };
 
         if !self.needs_audio() {
             return Ok(());
@@ -572,9 +623,9 @@ fn run_session(
 
     loop {
         reader.read_exact(&mut frame)?;
-        let (seq, chan, sample) = unpack(u64::from_le_bytes(frame));
+        let (seq, chan, sample, carrier) = unpack(u64::from_le_bytes(frame));
         if let Some(ch) = channels.get_mut(usize::from(chan)) {
-            ch.push(seq, sample, cfg)?;
+            ch.push(seq, sample, carrier, cfg)?;
         }
         if last_report.elapsed() >= interval {
             let elapsed = last_report.elapsed().as_secs_f64();
@@ -613,6 +664,9 @@ fn main() -> Result<()> {
             snr_db: args.squelch_snr,
         },
         SquelchArg::Manual => SquelchMode::ManualDbfs(args.squelch_level),
+        SquelchArg::Carrier => SquelchMode::Carrier {
+            snr_db: args.squelch_snr,
+        },
     };
     let cfg = Config {
         mode: args.mode,
@@ -625,6 +679,8 @@ fn main() -> Result<()> {
         min_samples: (args.min_transmission_ms * args.rate as u64) / 1000,
         agc_on: !args.no_agc,
         filter_on: !args.no_filter,
+        denoise_on: !args.no_denoise,
+        denoise_floor_db: args.denoise_floor_db,
         notch_freq: args.notch,
         notch_q: args.notch_q,
         low: args.filter_low,
@@ -718,10 +774,22 @@ mod tests {
 
     #[test]
     fn unpack_roundtrip() {
-        let word = (0x00ABCDEFu64 << 40) | (0x07u64 << 32) | (0x0012_3456u64 & 0xffff_ffff);
-        let (seq, chan, sample) = unpack(word);
+        // layout: seq[63:40] | chan[39:32] | carrier[31:24] | audio[23:0]
+        let word =
+            (0x00ABCDEFu64 << 40) | (0x07u64 << 32) | (0x05u64 << 24) | (0x12_3456u64);
+        let (seq, chan, sample, carrier) = unpack(word);
         assert_eq!(seq, 0x00ABCDEF & 0xff_ffff);
         assert_eq!(chan, 7);
-        assert_eq!(sample, 0x0012_3456);
+        assert_eq!(carrier, 0x05);
+        assert_eq!(sample, 0x12_3456); // positive 24-bit value
+    }
+
+    #[test]
+    fn unpack_sign_extends_negative_audio() {
+        // audio 0x80_0000 is the most-negative 24-bit value (-2^23).
+        let word = (0x05u64 << 24) | 0x80_0000u64;
+        let (_, _, sample, carrier) = unpack(word);
+        assert_eq!(carrier, 0x05);
+        assert_eq!(sample, -(1 << 23));
     }
 }

@@ -31,12 +31,13 @@
 //!   a                   AGC toggle
 //!   f                   voice band-pass toggle
 //!   n                   notch toggle (only if --notch was given)
+//!   d                   spectral noise reducer toggle
 //!   F                   follow (scanner) toggle
 //!   q                   quit
 
 use airband_dsp::{
-    level_to_dbfs, Agc, Notch, Squelch, SquelchConfig, SquelchMode, SquelchState, VoiceFilter,
-    SAMPLE_SCALE,
+    decode_carrier, level_to_dbfs, Agc, Denoise, Notch, Squelch, SquelchConfig, SquelchMode,
+    SquelchState, VoiceFilter, SAMPLE_SCALE,
 };
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
@@ -88,6 +89,8 @@ enum SquelchArg {
     Auto,
     /// Fixed threshold at `--squelch-level` dBFS.
     Manual,
+    /// Carrier-power squelch (needs a bitstream that ships the carrier byte).
+    Carrier,
 }
 
 /// Monitor mode selector for the CLI.
@@ -136,6 +139,12 @@ struct Args {
     /// Disable the AGC (play raw, band-passed audio scaled by the sink volume).
     #[arg(long)]
     no_agc: bool,
+    /// Disable the spectral noise reducer (on by default; toggle with 'd').
+    #[arg(long)]
+    no_denoise: bool,
+    /// Noise-reducer spectral floor in dB (more negative = more aggressive cut).
+    #[arg(long, default_value_t = -18.0, allow_hyphen_values = true)]
+    denoise_floor_db: f32,
     /// Disable the voice band-pass (on by default; 300-3400 Hz, toggle with 'f').
     #[arg(long)]
     no_filter: bool,
@@ -169,6 +178,7 @@ struct DspCfg {
     squelch_hang_ms: f32,
     notch_freq: Option<f64>,
     notch_q: f64,
+    denoise_floor_db: f32,
 }
 
 /// State shared between the network reader thread, the audio source, and the UI.
@@ -194,6 +204,7 @@ struct Shared {
     squelch_on: AtomicBool,
     agc_on: AtomicBool,
     notch_on: AtomicBool,
+    denoise_on: AtomicBool,
 }
 
 impl Shared {
@@ -213,6 +224,7 @@ impl Shared {
             squelch_on: AtomicBool::new(toggles.squelch),
             agc_on: AtomicBool::new(toggles.agc),
             notch_on: AtomicBool::new(toggles.notch),
+            denoise_on: AtomicBool::new(toggles.denoise),
         }
     }
 }
@@ -223,6 +235,7 @@ struct Toggles {
     squelch: bool,
     agc: bool,
     notch: bool,
+    denoise: bool,
 }
 
 /// Per-sample DSP toggle snapshot handed to [`ChannelDsp::process`].
@@ -231,6 +244,7 @@ struct ChainOpts {
     filter: bool,
     notch: bool,
     agc: bool,
+    denoise: bool,
 }
 
 fn state_code(s: SquelchState) -> u8 {
@@ -311,8 +325,12 @@ impl Source for ChannelSource {
 struct ChannelDsp {
     vf: VoiceFilter,
     notch: Option<Notch>,
+    denoise: Denoise,
     agc: Agc,
 }
+
+/// STFT frame size for the spectral denoiser (~16 ms at 15625 sps).
+const DENOISE_FRAME: usize = 256;
 
 impl ChannelDsp {
     fn new(cfg: &DspCfg) -> ChannelDsp {
@@ -321,6 +339,7 @@ impl ChannelDsp {
             notch: cfg
                 .notch_freq
                 .map(|f| Notch::new(f, cfg.rate as f64, cfg.notch_q)),
+            denoise: Denoise::new(DENOISE_FRAME, cfg.denoise_floor_db),
             agc: Agc::new(),
         }
     }
@@ -343,7 +362,11 @@ impl ChannelDsp {
                 v = nf.process(v);
             }
         }
-        let vn = (v / SAMPLE_SCALE as f64) as f32;
+        let mut vn = (v / SAMPLE_SCALE as f64) as f32;
+        if opt.denoise {
+            // Learn the noise model from below-threshold (non-speech) samples.
+            vn = self.denoise.process(vn, !above);
+        }
         if opt.agc {
             self.agc.process(vn, true, just_opened, above)
         } else {
@@ -362,6 +385,17 @@ fn reader_loop(shared: Arc<Shared>, addr: String, n: usize, cfg: DspCfg, mix: bo
             Squelch::new(
                 SquelchConfig::new(cfg.squelch_mode, cfg.rate).with_hang_ms(cfg.squelch_hang_ms),
             )
+        })
+        .collect();
+    // In carrier-squelch mode the main squelch keys on the carrier; this
+    // audio-energy VOX drives the `above` (speech-present) flag for AGC/denoise.
+    let mut audio_gates: Vec<Option<Squelch>> = (0..n)
+        .map(|_| match cfg.squelch_mode {
+            SquelchMode::Carrier { snr_db } => Some(Squelch::new(SquelchConfig::new(
+                SquelchMode::AutoSnr { snr_db },
+                cfg.rate,
+            ))),
+            _ => None,
         })
         .collect();
     let mut dsps: Vec<ChannelDsp> = (0..n).map(|_| ChannelDsp::new(&cfg)).collect();
@@ -384,7 +418,10 @@ fn reader_loop(shared: Arc<Shared>, addr: String, n: usize, cfg: DspCfg, mix: bo
                         break;
                     }
                     let w = u64::from_le_bytes(buf);
-                    let sample = (w & 0xffff_ffff) as u32 as i32;
+                    // layout: seq[63:40] | chan[39:32] | carrier[31:24] | audio[23:0]
+                    let raw = (w & 0xff_ffff) as u32;
+                    let sample = ((raw << 8) as i32) >> 8; // sign-extend 24->32
+                    let carrier = ((w >> 24) & 0xff) as u8;
                     let chan = ((w >> 32) & 0xff) as usize;
                     let seq = ((w >> 40) & 0xff_ffff) as u32;
                     if chan >= n {
@@ -404,22 +441,37 @@ fn reader_loop(shared: Arc<Shared>, addr: String, n: usize, cfg: DspCfg, mix: bo
                     let mag = sample.unsigned_abs() as f32;
                     atomic_max_f32(&shared.peak[chan], mag);
 
+                    // Carrier mode keys the squelch on the FPGA carrier level;
+                    // all other modes key on the audio magnitude.
+                    let sq_level = match cfg.squelch_mode {
+                        SquelchMode::Carrier { .. } => decode_carrier(carrier),
+                        _ => mag,
+                    };
                     // Squelch runs on every channel so the meter shows activity.
                     let sq = &mut squelches[chan];
-                    let st = sq.process(mag);
+                    let st = sq.process(sq_level);
                     shared.sq_open[chan].store(sq.is_open(), Ordering::Relaxed);
 
                     let filter_on = shared.filter_on.load(Ordering::Relaxed);
                     let notch_on = shared.notch_on.load(Ordering::Relaxed);
                     let squelch_on = shared.squelch_on.load(Ordering::Relaxed);
                     let agc_on = shared.agc_on.load(Ordering::Relaxed);
+                    let denoise_on = shared.denoise_on.load(Ordering::Relaxed);
                     let open = !squelch_on || sq.is_open();
                     let just_opened = squelch_on && sq.just_opened();
-                    let above = mag >= sq.threshold();
+                    // Speech-present flag is always audio-energy based.
+                    let above = match audio_gates[chan].as_mut() {
+                        Some(g) => {
+                            g.process(mag);
+                            mag >= g.threshold()
+                        }
+                        None => mag >= sq.threshold(),
+                    };
                     let opt = ChainOpts {
                         filter: filter_on,
                         notch: notch_on,
                         agc: agc_on,
+                        denoise: denoise_on,
                     };
 
                     if mix {
@@ -504,10 +556,11 @@ fn render(shared: &Shared, n: usize, gain: f32, muted: bool, monitor: Monitor, e
         "SQ off"
     };
     let flags = format!(
-        "{} {} {}",
+        "{} {} {} {}",
         if shared.agc_on.load(Ordering::Relaxed) { "AGC" } else { "agc" },
         if shared.filter_on.load(Ordering::Relaxed) { "BPF" } else { "bpf" },
         if shared.notch_on.load(Ordering::Relaxed) { "NOTCH" } else { "notch" },
+        if shared.denoise_on.load(Ordering::Relaxed) { "NR" } else { "nr" },
     );
     queue!(
         out,
@@ -516,7 +569,7 @@ fn render(shared: &Shared, n: usize, gain: f32, muted: bool, monitor: Monitor, e
             "Pluto airband live listener — {status} — {vol} — sq:{sq} — {flags} — {mode} — {records} recs\r\n"
         )),
         ResetColor,
-        Print("↑/↓ select  0-9+Enter jump  +/- vol  m mute  s squelch  a agc  f bpf  n notch  F follow  q quit\r\n\r\n"),
+        Print("↑/↓ select  0-9+Enter jump  +/- vol  m mute  s squelch  a agc  f bpf  n notch  d nr  F follow  q quit\r\n\r\n"),
     )?;
 
     for ch in 0..n {
@@ -573,6 +626,9 @@ fn main() -> Result<()> {
             snr_db: args.squelch_snr,
         },
         SquelchArg::Manual => SquelchMode::ManualDbfs(args.squelch_level),
+        SquelchArg::Carrier => SquelchMode::Carrier {
+            snr_db: args.squelch_snr,
+        },
     };
     let agc_on = !args.no_agc;
     let toggles = Toggles {
@@ -580,6 +636,7 @@ fn main() -> Result<()> {
         squelch: !matches!(args.squelch, SquelchArg::Off),
         agc: agc_on,
         notch: args.notch.is_some(),
+        denoise: !args.no_denoise,
     };
     let cfg = DspCfg {
         rate: args.rate,
@@ -589,6 +646,7 @@ fn main() -> Result<()> {
         squelch_hang_ms: args.squelch_hang_ms,
         notch_freq: args.notch,
         notch_q: args.notch_q,
+        denoise_floor_db: args.denoise_floor_db,
     };
 
     // ~0.4 s of queued audio caps playback latency on channel switches.
@@ -711,6 +769,10 @@ fn main() -> Result<()> {
                     KeyCode::Char('n') => {
                         let now = !shared.notch_on.load(Ordering::Relaxed);
                         shared.notch_on.store(now, Ordering::Relaxed);
+                    }
+                    KeyCode::Char('d') => {
+                        let now = !shared.denoise_on.load(Ordering::Relaxed);
+                        shared.denoise_on.store(now, Ordering::Relaxed);
                     }
                     KeyCode::Char('F') => {
                         // Toggle scanner; mix is fixed at startup (reader-side).

@@ -35,6 +35,12 @@ pub enum SquelchMode {
     AutoSnr { snr_db: f32 },
     /// Manual: fixed threshold at the given dBFS level.
     ManualDbfs(f32),
+    /// Carrier-power: identical SNR machinery to [`SquelchMode::AutoSnr`], but the
+    /// caller feeds the per-channel AM **carrier** level (from the FPGA's DC-block
+    /// estimate) instead of the audio magnitude. The carrier is steady through
+    /// speech pauses, so this never chatters and needs no hang time. Requires a
+    /// bitstream that ships the carrier byte (see `hdl/audio_framer.py`).
+    Carrier { snr_db: f32 },
 }
 
 /// Squelch configuration.
@@ -124,7 +130,9 @@ impl Squelch {
     pub fn new(cfg: SquelchConfig) -> Squelch {
         let (enabled, manual_level, snr_ratio) = match cfg.mode {
             SquelchMode::Off => (false, None, 1.0),
-            SquelchMode::AutoSnr { snr_db } => (true, None, 10f32.powf(snr_db / 20.0)),
+            SquelchMode::AutoSnr { snr_db } | SquelchMode::Carrier { snr_db } => {
+                (true, None, 10f32.powf(snr_db / 20.0))
+            }
             SquelchMode::ManualDbfs(dbfs) => (true, Some(dbfs_to_level(dbfs)), 1.0),
         };
         let ms_to_samples = |ms: f32| ((ms / 1000.0) * cfg.rate as f32).round().max(1.0) as u32;

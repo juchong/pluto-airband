@@ -755,6 +755,40 @@ defaults (close 24.6 ms + 11 ms `low_signal_abort`) closed on every word gap.
 - 13 `airband-dsp` tests pass (added `hang_bridges_short_gaps`,
   `abort_disabled_by_default`); clippy + release build clean.
 
+### Hiss reduction — host NR + narrow FIR + carrier squelch (2026-06-17)
+Follow-up to the squelch hang: once the squelch is open, AWOS still carries
+audible broadband hiss. Implemented the three-pronged plan (host-side fix plus two
+FPGA changes that ride along in the next bitstream):
+- **Host spectral noise reduction (`airband-dsp::Denoise`):** STFT denoiser using
+  the decision-directed Wiener gain (Ephraim-Malah), 256-pt frames at 50% overlap
+  with a sqrt-Hann window (COLA, exact reconstruction at unity gain). Per-bin noise
+  power is learned only while the channel is below the speech-present threshold, so
+  speech never leaks into the noise model; a spectral floor (`--denoise-floor-db`)
+  bounds the cut to avoid musical noise. Wired into both `airband-listen` (`d`
+  toggle, `--no-denoise`) and `airband-reader` between notch and AGC; on by
+  default. `rustfft` is the only new dep. Tests: `improves_snr_on_tone_in_noise`,
+  `passes_clean_signal_when_no_noise_learned`. Biggest single hiss win, no reflash.
+- **FPGA A — narrowed cleanup FIR:** the channelizer's CIC-compensation FIR was
+  re-designed to a narrower passband (`fp=0.11`, `fs=0.20`, 63 taps, out_shift 18)
+  in `maia_sdr.py` `_AIRBAND_FIR_COEFFS`. This trims the pre-detection bandwidth to
+  ~±5-6 kHz, cutting the broadband noise power that reaches the AM detector by
+  ~3-4 dB at no extra FPGA cost (same tap count). `receiver_top` bit-exact and
+  `realtime_budget` re-run clean.
+- **FPGA B — per-channel carrier level → true carrier squelch:** `am_backend_tdm`
+  now encodes the DC-block's carrier running-mean as an 8-bit log **minifloat**
+  (`[exp(5)|mant(3)]`) and exports it; `audio_framer` carries it in frame bits
+  `[31:24]` (audio narrowed 32→24 bits, which already held all the content), wired
+  through `receiver_top`. **Breaking frame change** — bitstream + host deploy
+  together (`SPEC.md` §6.2). Host decodes it (`airband-dsp::decode_carrier`) and
+  adds `--squelch carrier`, which keys on carrier power: steady through speech
+  pauses, so it opens/closes on the transmission with no hang and no chatter. In
+  carrier mode an internal audio-energy VOX still drives the speech-present flag
+  that gates AGC and denoise noise-learning. HDL sims (`audio_framer`,
+  `am_backend_tdm` incl. new `_verify_carrier`, `receiver_top`) and 24 host tests
+  pass; clippy clean.
+- **Pending:** Vivado build of the new bitstream (Phases A+B) → flash → live verify
+  of the narrow FIR and `--squelch carrier` on hardware.
+
 ## Next steps
 - **Buzz is hardware-bound** (see RE-DIAGNOSED section): pursue power-supply
   cleanup / shielding / external reference; no further HDL work will help. Keep

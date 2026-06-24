@@ -347,10 +347,21 @@ into the PL `sync` domain by a `RegisterCDC`:
 little-endian record**:
 
 ```
-bits [31:0]  audio sample (signed, sign-extended to 32 bits; 24-bit content)
+bits [23:0]  audio sample (signed, 24-bit; host sign-extends to 32 bits)
+bits [31:24] carrier level (8-bit minifloat [exp(5)|mant(3)] of the DC-block
+             carrier estimate; 0 = none / pre-carrier bitstream)
 bits [39:32] channel index (0..20)
 bits [63:40] per-channel sequence counter (wraps at 2**24; gap = dropped samples)
 ```
+
+The audio sample narrowed from 32 to 24 bits to free byte `[31:24]` for the
+per-channel **carrier level** the DC-block stage (§6.2) would otherwise discard:
+the FPGA encodes the carrier-DC running mean as an 8-bit log minifloat
+(`am_backend_tdm.py`) so the host can run a true **carrier-power squelch** (§6.4).
+The audio content was already only 24 bits, so no precision is lost. This is a
+**breaking frame change**: the new bitstream and host tools must be deployed
+together (old hosts misread the new framing; new hosts read carrier `0` from old
+bitstreams and silently fall back to VOX squelch).
 
 A **cyclic** `DmaStreamWrite` (`width=64`) streams these over an AXI-HP port into a
 **16 MiB DDR ring** at `0x19000000`, organized as **256 × 64 KiB** slots
@@ -380,16 +391,25 @@ band-pass** (4th-order Butterworth, 300-3400 Hz) → optional
 normalization with a bounded soft-clip and click-free fade on close). All units
 work in raw 24-bit sample magnitude; level metering is reported in dBFS.
 
-Because the FPGA DC-blocks the audio (§6.2) before the host sees it, there is **no
-AM carrier** on the link to key the squelch on — it can only act on voice energy
-(VOX). To keep that from chattering on continuous speech (AWOS/ATIS), the squelch
-uses a **hang time** (`--squelch-hang-ms`, default 1000 ms) that rides over the
-pauses between words/phrases, and RTLSDR-Airband's carrier-loss fast-close
-(`low_signal_abort`) is **disabled by default** — without a carrier it would fire
-on every speech gap. A true carrier squelch would require the FPGA to also ship
-the per-channel carrier-DC level it currently discards in the DC-block stage,
-which the 64-bit audio frame (§6.3) has no room for; the host-side hang achieves
-equivalent no-chatter behavior without a protocol/bitstream change.
+An optional STFT **spectral noise reduction** stage (`airband-dsp::Denoise`,
+decision-directed Wiener gain, 256-pt frames at 50% overlap) sits between the
+notch and the AGC. It learns the per-bin noise floor only while the channel is
+below the speech-present threshold, so broadband hiss under the voice is
+attenuated without warbling the speech. It is on by default (`--no-denoise` to
+disable, `--denoise-floor-db` to bound the cut).
+
+Two squelch strategies exist. By default the FPGA DC-blocks the audio (§6.2)
+before the host sees it, so the squelch acts on voice energy (**VOX**): to keep
+that from chattering on continuous speech (AWOS/ATIS) it uses a **hang time**
+(`--squelch-hang-ms`, default 1000 ms) that rides over the pauses between
+words/phrases, and RTLSDR-Airband's carrier-loss fast-close (`low_signal_abort`)
+is **disabled by default**. With a bitstream that ships the per-channel carrier
+byte (§6.2), `--squelch carrier` keys instead on the decoded **carrier power**,
+which is steady through speech pauses — so it opens/closes cleanly on the
+transmission with no hang and no chatter. In carrier mode the audio-energy VOX is
+retained internally purely to drive the speech-present flag that gates AGC gain
+and denoise noise-learning (the carrier alone can't distinguish speech from
+inter-word silence within an open transmission).
 
 `host/airband-reader` connects to `:30000`, demuxes records by the channel byte,
 and uses the per-channel sequence counter to count dropped samples. Defaults:
