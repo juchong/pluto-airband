@@ -31,6 +31,7 @@
 //!   airband-reader 192.168.2.1:30000 --mode raw --no-agc --shift 6
 //! ```
 
+mod feeds;
 mod icecast;
 mod metrics;
 
@@ -45,7 +46,7 @@ const CARRIER_NOISE_PCT: f32 = 0.75;
 const CARRIER_UPDATE_FRAMES: u64 = 8192;
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
-use icecast::IcecastConfig;
+use icecast::{IcecastConfig, TlsMode};
 use metrics::Metrics;
 use std::{
     fs::{self, File},
@@ -162,7 +163,13 @@ struct Args {
     /// UDP destination host:port for --udp-channel.
     #[arg(long)]
     udp_dest: Option<String>,
+    /// Stream many channels to one or more Icecast servers from a JSON feeds
+    /// file (see README). Use this to feed all configured channels at once;
+    /// combinable with the single-stream --icecast-* flags below.
+    #[arg(long)]
+    feeds: Option<PathBuf>,
     /// Stream this channel to an Icecast mount (needs --icecast-host/password).
+    /// A single-stream shortcut; for many channels/servers use --feeds.
     #[arg(long)]
     icecast_channel: Option<usize>,
     /// Icecast server host.
@@ -189,6 +196,20 @@ struct Args {
     /// Icecast stream name.
     #[arg(long, default_value = "Pluto airband")]
     icecast_name: String,
+    /// Icecast ICY genre tag (optional).
+    #[arg(long)]
+    icecast_genre: Option<String>,
+    /// Icecast ICY description tag (optional).
+    #[arg(long)]
+    icecast_description: Option<String>,
+    /// TLS mode to the Icecast server: disabled, transport, auto, auto_no_plain,
+    /// or upgrade (default disabled = plain TCP).
+    #[arg(long, default_value = "disabled")]
+    icecast_tls: String,
+    /// Testing only: accept invalid/self-signed TLS certs and hostname
+    /// mismatches (disables MITM protection; never use for a public feed).
+    #[arg(long)]
+    icecast_tls_insecure: bool,
 }
 
 /// Resolved, immutable runtime configuration.
@@ -392,7 +413,8 @@ struct Channel {
     agc: Agc,
     recorder: Option<Recorder>,
     udp: Option<UdpOut>,
-    icecast: Option<SyncSender<i16>>,
+    /// Icecast feeds for this channel (fan-out: one sender per destination).
+    icecast: Vec<SyncSender<i16>>,
     // stats since last report
     interval_count: u64,
     interval_peak: i32,
@@ -429,7 +451,7 @@ impl Channel {
             agc: Agc::new(),
             recorder,
             udp: None,
-            icecast: None,
+            icecast: Vec::new(),
             interval_count: 0,
             interval_peak: 0,
             total: 0,
@@ -439,7 +461,7 @@ impl Channel {
 
     /// True when some consumer needs the processed audio for this sample.
     fn needs_audio(&self) -> bool {
-        self.recorder.is_some() || self.udp.is_some() || self.icecast.is_some()
+        self.recorder.is_some() || self.udp.is_some() || !self.icecast.is_empty()
     }
 
     /// Produces the gated/processed 16-bit sample for this input sample.
@@ -519,7 +541,7 @@ impl Channel {
         if let Some(u) = self.udp.as_mut() {
             u.push(pcm);
         }
-        if let Some(tx) = self.icecast.as_ref() {
+        for tx in &self.icecast {
             let _ = tx.try_send(pcm); // drop on back-pressure rather than block
         }
 
@@ -733,12 +755,16 @@ fn main() -> Result<()> {
         eprintln!("udp: streaming channel {ch} PCM to {dest}");
     }
 
-    // Optional Icecast MP3 source.
+    // Icecast feeds: a JSON feeds file (many channels / many servers) and/or the
+    // single-stream --icecast-* flags. Both produce IcecastConfig entries that
+    // are attached to their channel (a channel may have several = fan-out).
+    let mut feed_cfgs: Vec<IcecastConfig> = Vec::new();
+    if let Some(path) = args.feeds.as_ref() {
+        feed_cfgs.extend(feeds::load(path, cfg.rate, channels.len())?);
+    }
     if let Some(ch) = args.icecast_channel {
-        let target = channels
-            .get_mut(ch)
-            .with_context(|| format!("--icecast-channel {ch} out of range"))?;
-        let icfg = IcecastConfig {
+        let tls = TlsMode::parse(&args.icecast_tls).map_err(|e| anyhow::anyhow!(e))?;
+        feed_cfgs.push(IcecastConfig {
             host: args.icecast_host.clone(),
             port: args.icecast_port,
             mount: args.icecast_mount.clone(),
@@ -748,9 +774,24 @@ fn main() -> Result<()> {
             out_rate: args.icecast_samplerate,
             in_rate: cfg.rate,
             name: args.icecast_name.clone(),
+            genre: args.icecast_genre.clone(),
+            description: args.icecast_description.clone(),
+            tls,
+            tls_insecure: args.icecast_tls_insecure,
             channel: ch,
-        };
-        target.icecast = Some(icecast::spawn(icfg));
+        });
+    }
+    for icfg in feed_cfgs {
+        let ch = icfg.channel;
+        let target = channels
+            .get_mut(ch)
+            .with_context(|| format!("icecast feed channel {ch} out of range"))?;
+        let scheme = if icfg.tls == TlsMode::Disabled { "icecast" } else { "icecast+tls" };
+        eprintln!(
+            "icecast: feed ch{ch} -> {scheme}://{}:{}{}",
+            icfg.host, icfg.port, icfg.mount
+        );
+        target.icecast.push(icecast::spawn(icfg));
     }
 
     // Optional Prometheus metrics endpoint.

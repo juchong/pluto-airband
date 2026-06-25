@@ -184,12 +184,76 @@ $BIN 192.168.2.1:30000 --icecast-channel 0 \
   --icecast-host feed.example.net --icecast-port 8000 \
   --icecast-mount /KXXX.mp3 --icecast-password secret
 
+# stream ALL configured channels to one or more servers (see "Icecast feeds")
+$BIN 192.168.2.1:30000 --feeds feeds.json
+
 # UDP s16le PCM of one channel to another host
 $BIN 192.168.2.1:30000 --udp-channel 0 --udp-dest 10.0.0.5:7355
 
 # Prometheus metrics (per-channel samples/drops/transmissions/level/floor/open)
 $BIN 192.168.2.1:30000 --metrics-port 9100   # scrape http://host:9100/metrics
 ```
+
+### Icecast feeds (stream every channel; one or more servers)
+
+The single `--icecast-channel` flags above feed exactly one channel to one
+mount. To feed **many channels** — and optionally the **same channel to several
+servers** — pass a JSON **feeds file** with `--feeds feeds.json`. Each entry
+binds one channel index to one mount on one server; repeat a `channel` to fan it
+out to a backup/second server, and list every channel to feed them all. A feeds
+file and the `--icecast-*` flags can be used together (the flags add one more
+feed). Each feed runs its own encoder + auto-reconnecting source thread, and
+falls behind (drops audio) rather than blocking the others if a server stalls.
+
+```jsonc
+{
+  "feeds": [
+    // 118.050 AWOS (channel 0) to the primary LiveATC server, plain source port
+    { "channel": 0, "server": "feed.liveatc.net", "port": 8000,
+      "mountpoint": "/KXXX_AWOS.mp3", "username": "source", "password": "secret",
+      "name": "KXXX AWOS 118.050", "genre": "ATC", "description": "KXXX AWOS" },
+
+    // same channel mirrored to a private server over TLS
+    { "channel": 0, "server": "icecast.example.net", "port": 8443,
+      "mountpoint": "/KXXX_AWOS.mp3", "password": "secret2", "tls": "transport" },
+
+    // tower (channel 13) to the primary server
+    { "channel": 13, "server": "feed.liveatc.net", "port": 8000,
+      "mountpoint": "/KXXX_TWR.mp3", "password": "secret", "name": "KXXX Tower" }
+  ]
+}
+```
+
+Per-feed options (defaults in parentheses):
+
+| Key | Meaning |
+|---|---|
+| `channel` | **Required.** Channel index `0..N-1` into the receiver's channel plan (the order in `channels_hz`). |
+| `server` | **Required.** Icecast server hostname. |
+| `port` | Server port (`8000`). |
+| `mountpoint` | **Required.** Mount path, e.g. `/KXXX.mp3`. |
+| `username` | Source username (`"source"`). |
+| `password` | Source password (`""`). |
+| `name` | ICY stream name shown in directories (`"Pluto airband chN"`). |
+| `genre` | ICY genre tag (unset). |
+| `description` | ICY description tag (unset). |
+| `bitrate` | MP3 bitrate in kbps (`16`; LiveATC uses 16). |
+| `samplerate` | MP3 output sample rate in Hz (`22050`; the 15625 sps audio is resampled to this). |
+| `tls` | TLS negotiation (`"disabled"`): `disabled` plain TCP; `transport` implicit TLS (a TLS-only listener); `upgrade` RFC 2817 in-band upgrade; `auto` try TLS then fall back to plain; `auto_no_plain` TLS only, no fallback. |
+| `tls_insecure` | **Testing only** (`false`): accept invalid/self-signed certs and hostname mismatches. This disables protection against man-in-the-middle interception (which can capture your source password) — never set it for a public feed. |
+
+The same options exist as single-stream flags: `--icecast-host`, `--icecast-port`,
+`--icecast-mount`, `--icecast-user`, `--icecast-password`, `--icecast-name`,
+`--icecast-genre`, `--icecast-description`, `--icecast-bitrate`,
+`--icecast-samplerate`, `--icecast-tls`, `--icecast-tls-insecure`.
+
+**Plain vs. TLS.** Icecast's native source port speaks plain HTTP, so the
+default `tls: "disabled"` is correct for a direct source port (e.g. `8000`, or a
+dedicated source port). If your server is only reachable through an HTTPS reverse
+proxy that accepts the `SOURCE` method, use `tls: "transport"` against the
+HTTPS port. If the source connection is rejected (wrong password, bad mount,
+etc.) the reader now logs the server's HTTP status and reconnects, rather than
+silently going quiet.
 
 ### Audition channels live (testing)
 

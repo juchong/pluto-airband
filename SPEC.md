@@ -447,7 +447,14 @@ continuous file. With `--no-agc`, fixed-gain output is scaled to 16-bit via
 `--shift` (positive = attenuate, negative = makeup gain; airband AM is quiet).
 Independently of the recording mode it can also stream live: **Icecast** MP3 (LAME
 source client, classic `SOURCE` protocol, 16 kbps mono 22050 Hz for LiveATC),
-**UDP** s16 PCM, and a **Prometheus** `/metrics` endpoint. `host/airband-listen`
+**UDP** s16 PCM, and a **Prometheus** `/metrics` endpoint. The Icecast feeder
+takes a JSON **feeds file** (`--feeds`) that maps any number of channels to one
+or more servers (a channel may fan out to several servers), with per-feed
+`name`/`genre`/`description`, `bitrate`/`samplerate`, and `tls`
+(`disabled`/`transport`/`upgrade`/`auto`/`auto_no_plain`, plus a testing-only
+`tls_insecure`); the handshake response is checked so a rejected source
+reconnects instead of going silently quiet. A single `--icecast-*` flag set is
+the one-channel shortcut. `host/airband-listen`
 runs the same chain on the played channel (and the squelch on every channel for
 activity meters), with `single`/`follow` (scanner)/`mix` monitor modes and live
 toggles. The voice band-pass is now on by default but does not remove the RF spur
