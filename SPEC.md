@@ -518,9 +518,9 @@ all at fixed *absolute* frequencies, none on the switcher rail. Input power
 switcher↔bulk-cap bead do **not** help; the effective levers are **lower RX gain**
 (≈40–48 dB, which also removes the 71 dB ADC clipping intermod), **frequency
 planning** (keep channels off the fixed lines — the shipped plan already places them
-in guard gaps), and an **external clean reference** (removes the 120 MHz line). Full
-analysis and the diagnostic toolkit (`band_snapshot.py`, `term_tests.py`,
-`clock_shift_test.py`, `lo_track_test.py`) are in `firmware/diagnostics/README.md`.
+in guard gaps), and an **external clean reference** (removes the 120 MHz line). The
+full investigation with plots is in `SPUR-INVESTIGATION.md`; the diagnostic toolkit
+is in `firmware/diagnostics/README.md`.
 
 (The CORDIC magnitude detector replaced an earlier alpha-max-beta-min estimator
 that added its own ~−30 dBc demod spurs from angle-dependent gain ripple. CORDIC
