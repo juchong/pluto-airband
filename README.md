@@ -22,6 +22,7 @@ This README is the hub. Each topic has a single home:
 | Build firmware, flash, set up the dev/build env, troubleshoot | **[`BUILD.md`](BUILD.md)** |
 | Know what each FPGA/DSP block does | **[`hdl/README.md`](hdl/README.md)** |
 | Diagnose audio artifacts / understand the channel "buzz" | **[`firmware/diagnostics/README.md`](firmware/diagnostics/README.md)** |
+| Read the full spur/"buzz" root-cause investigation (with plots) | **[`SPUR-INVESTIGATION.md`](SPUR-INVESTIGATION.md)** |
 | Know the firmware image contents + DDR addressing invariants | **[`firmware/README.md`](firmware/README.md)** |
 | See the engineering history and decisions | **[`PROGRESS.md`](PROGRESS.md)** |
 
@@ -59,20 +60,28 @@ branch). The Maia base (spectrometer/recorder/DDC) is preserved.
 ## Status & known limitations
 
 - **Live on hardware:** 21 channels, gap-free TCP stream, auto-start on boot.
-- **Channel "buzz" is an RF hardware spur — not fixable in firmware.** A spur comb
-  phase-locked to the Pluto's 40 MHz reference (3rd harmonic at **120.000 MHz**)
-  falls inside some channels' passbands. It is independent of the HDL/DSP, the
-  demod, and the gain. Remedies are hardware (clean power, shielding, external
-  reference, channel triage). Full root-cause analysis and a diagnostic toolkit:
+- **Channel "buzz" is an internal (conducted) spur comb — not fixable in firmware
+  or by antenna-side filtering.** Proven by capturing with the RX input terminated
+  (**50 Ω, antenna disconnected**): a dense band-wide comb of on-board harmonics
+  (the 120.000 MHz = 40 MHz-reference 3rd harmonic is one tooth) remains. It is
+  independent of the HDL/DSP/demod, so an external enclosure, an antenna band-pass,
+  and a notch on the strong local carrier do **not** remove it — but it **is**
+  amplified by RX gain. Fs/LO-shift tests pin each tooth: the **dominant (126.000 MHz)
+  is the 9th harmonic of the 14 MHz ADC sample clock**, plus a **125 MHz GbE clock**
+  (Pluto+) and the **120 MHz reference 3rd harmonic** — all at fixed *absolute*
+  frequencies. Effective levers: **lower RX gain**, **frequency planning** (keep
+  channels off those fixed lines — the shipped plan already does), and an **external
+  reference** (for the 120 MHz line); input power, enclosure shielding, and a switcher
+  bead do not help. Full root-cause analysis and a diagnostic toolkit:
   [`firmware/diagnostics/README.md`](firmware/diagnostics/README.md).
 - **Single shared front-end:** one RX gain serves all 21 channels (no per-channel
-  AGC). The shipped default is fixed manual **71 dB** (the AD9361 AGC modes settle
-  on *wideband* power and starve weak narrowband channels, so near-max fixed gain
-  recovers weak voice best). At a strong-signal site this can clip the wideband ADC
-  (~13–15% of samples → broadband intermod that looks like a poor noise floor) — add
-  an external selective filter (then you can run the **73 dB** ceiling, as in the
-  `firmware/airband.json` template) or lower toward **48 dB** (the highest a bare
-  front end tolerates). See [Channel plan](#channel-plan).
+  AGC; the AD9361 AGC modes settle on *wideband* power and starve weak narrowband
+  channels, so fixed manual gain is used). The shipped default is now fixed manual
+  **48 dB** — the bare-front-end clipping knee: **71 dB** clips the wideband ADC
+  (~13–15% of samples → broadband intermod that looks like a poor noise floor) and
+  also amplifies the conducted spur comb. Raise toward the **73 dB** ceiling only
+  behind an external selective filter at a quiet site (max weak-signal sensitivity);
+  drop toward ~40 dB to suppress the comb further. See [Channel plan](#channel-plan).
 - **Transmitter quieted on boot.** This is a pure receiver, but the Pluto powers up
   in FDD with the TX LO running (2.45 GHz, ~10 dB attenuation) — radiated EMI to
   nearby radios. The firmware now powers down the TX LO and floors TX attenuation at
@@ -341,15 +350,15 @@ the airband band no matter what the browser does.
 
 The receiver reads `/root/airband.json` on the Pluto at startup; if absent it uses
 the `maia-httpd` **built-in defaults** shown below. A ready-to-copy template is at
-`firmware/airband.json` (identical except it sets `gain_db: 73` for a front end with
-an external selective filter — see **Gain** below):
+`firmware/airband.json` (identical to these built-in defaults; raise `gain_db`
+toward 71–73 only behind an external selective filter — see **Gain** below):
 
 ```jsonc
 {
   "center_hz":   123438000,   // AD9361 RX LO (capture center) — keep within the built window
   "samp_rate":   14000000,    // MUST stay 14 MHz (the rate the channelizer was built for)
   "rf_bandwidth":14000000,
-  "gain_db":     71.0,        // used when agc = "manual"; built-in default (see Gain)
+  "gain_db":     48.0,        // used when agc = "manual"; built-in default (see Gain)
   "agc":         "manual",    // "manual" | "slow_attack" | "fast_attack" | "hybrid"
   "poll_ms":     20,
   "channels_hz": [ 118050000, 119200000, /* … up to 21 … */ 128500000 ]
@@ -364,19 +373,19 @@ Rules:
 - Changing `center_hz` re-tunes the whole window; keep all desired channels inside it.
 - **Gain:** one shared RX gain serves all 21 channels; fixed `agc: "manual"` (the
   AD9361 AGC modes settle on *wideband* power and starve weak channels — measured
-  ch0 peak ~5× lower than fixed max). The shipped built-in default is
-  **`gain_db: 71.0`**, near the AD9361 manual ceiling, chosen to recover weak/distant
-  voice. The trade-off is the **wideband** ADC: at a strong-signal site (e.g. a local
-  118.050 transmitter) 71 dB clips ~13–15% of samples, and that broadband intermod —
-  not real noise — is what makes the floor look terrible (effective ~−6 dBFS) and
-  scatters spurs. Two ways to fix that, by site:
+  ch0 peak ~5× lower than fixed max). The shipped default is now **`gain_db: 48.0`**,
+  the bare-front-end clipping knee: a measured sweep
+  ([`firmware/diagnostics/floor_sweep.py`](firmware/diagnostics/floor_sweep.py))
+  shows the **71 dB** AD9361 near-ceiling clips ~13–15% of the *wideband* ADC at a
+  strong-signal site (broadband intermod that makes the floor look terrible,
+  effective ~−6 dBFS, and scatters spurs), with clipping gone by ~48 dB and the
+  floor ~19 dB lower at no SNR loss. 48 dB also **lowers the conducted spur comb**,
+  which is amplified by RX gain (`term_tests.py`). Per site:
   - **External selective filter** (attenuates the strong local carrier): the band
-    goes quiet and you can run the **73 dB** AD9361 ceiling for maximum sensitivity
-    (0 clipping). This is what the `firmware/airband.json` template ships.
-  - **Bare front end** (no filter) at a strong site: drop to **~48 dB**, the highest
-    gain that doesn't overload — a measured sweep
-    ([`firmware/diagnostics/floor_sweep.py`](firmware/diagnostics/floor_sweep.py))
-    shows clipping gone by ~48 dB and the floor ~19 dB lower with no SNR loss.
+    goes quiet, so you can raise toward the **73 dB** AD9361 ceiling for maximum
+    weak-signal sensitivity (0 clipping).
+  - **Bare front end** at a strong site: keep **~48 dB** (or drop toward ~40 to
+    suppress the comb further, trading weak-signal sensitivity).
 
   Gain does **not** remove the fixed-frequency channel "buzz" (the 120 MHz
   reference-harmonic spur; see

@@ -234,18 +234,18 @@ The receiver reads `/root/airband.json` at startup (template:
 - **Gain:** one shared RX gain serves all 21 channels (no per-channel *RF* AGC;
   per-channel audio AGC is done on the host, §6.4); fixed **manual gain** (the
   AD9361 AGC modes settle on wideband power and starve weak channels). The shipped
-  built-in default is **71 dB**, near the AD9361 manual ceiling, for best weak-signal
-  recovery. The trade-off is the wideband ADC: at a strong-signal site 71 dB drives
-  it into **hard clipping ~13–15 % of samples**; that broadband intermod — not a
-  real noise floor — raises the displayed floor to ~−6 dBFS and sprays spurs across
-  the band. Two site-dependent fixes: an **external selective filter** quiets the
-  band so the **73 dB** ceiling is safe (the `firmware/airband.json` template), or on
-  a **bare** front end drop to **~48 dB** — a measured gain sweep
-  (`firmware/diagnostics/floor_sweep.py`) shows clipping vanishes by ~48 dB, dropping
-  the floor ~19 dB with **no SNR loss** (signal and noise scale together until the
-  noise/quantization-limited region far below). The residual
-  in-band spur comb (120 MHz = 40 MHz reference 3rd harmonic, §7) is gain-invariant
-  hardware RF, not addressed by gain.
+  default is now **48 dB**, the bare-front-end clipping knee. A measured gain sweep
+  (`firmware/diagnostics/floor_sweep.py`) shows the **71 dB** near-ceiling drives the
+  wideband ADC into **hard clipping ~13–15 % of samples** at a strong-signal site —
+  broadband intermod (not a real noise floor) that raises the displayed floor to
+  ~−6 dBFS and sprays spurs — with clipping vanishing by ~48 dB and the floor
+  ~19 dB lower at **no SNR loss** (signal and noise scale together until the
+  noise/quantization-limited region far below). Behind an **external selective
+  filter** the band is quiet enough to raise toward the **73 dB** ceiling for
+  maximum sensitivity. Lower gain *also* reduces the conducted in-band spur comb
+  (§7) which — contrary to an earlier claim — **is amplified by RX gain**
+  (`firmware/diagnostics/term_tests.py`), though a clean supply / external reference
+  is its real fix.
 
 While `maia-httpd` runs with `--airband`, the AD9361 front-end is **locked
 read-only** (`/api/ad9361` is a no-op and the web UI disables RF controls) so the
@@ -337,8 +337,8 @@ On boot with `--airband`, `maia-httpd` reads `/root/airband.json` (or built-in
 defaults) and:
 1. Sets the AD9361 **sampling frequency** (14 MHz), **RX RF bandwidth** (= Fs),
    and **RX LO** (123.438 MHz).
-2. Sets the gain: `agc: "manual"` → manual gain mode + `gain_db` (71 dB); otherwise
-   the named AGC mode.
+2. Sets the gain: `agc: "manual"` → manual gain mode + `gain_db` (48 dB default);
+   otherwise the named AGC mode.
 3. Computes each channel's 24-bit NCO word `round(((f − LO)/Fs)·2^24)` and writes
    it to the FPGA, rejecting any channel outside `±Fs/2`.
 4. Enables the receiver and starts the cyclic DMA.
@@ -492,21 +492,39 @@ restart is pending. Optional per-channel labels are stored in a
 `channel_labels` array parallel to `channels_hz`; they are cosmetic (used only
 by the web UI) and ignored by the receiver.
 
-## 7. Known limitation: the channel "buzz" is an RF hardware spur
+## 7. Known limitation: the channel "buzz" is an internal (conducted) spur comb
 
-A persistent audible buzz on several channels was root-caused to a **physical,
-fixed-frequency RF spur**, *not* a DSP/HDL/gain problem. A ~485 kHz spur comb
-phase-locked to **120.000 MHz** — exactly the **3rd harmonic of the Pluto's 40 MHz
-reference** — falls inside some channels' passbands. The spurs are invariant to
-sample rate, LO, and gain (confirming reference-locked physical RF, not digital
-aliases or clipping intermod), and a spur inside a 25 kHz channel cannot be removed
-by the per-channel NCO/CIC/FIR/AM chain. Remedies are **hardware** (clean power,
-shielding, external reference, channel triage). Full analysis and the diagnostic
-toolkit are in `firmware/diagnostics/README.md`.
+A persistent audible buzz on several channels was root-caused to an **internally
+generated spur comb in the ADC samples** — *not* a DSP/HDL problem and *not* RF
+arriving through the antenna. The decisive test (Pluto+, **50 Ω termination on the
+RX input, antenna disconnected**): the comb is **still present** — a dense,
+band-wide comb of discrete teeth (up to ~40 dB over the floor) across the whole
+14 MHz capture. It is therefore generated on the board (power/clock/oscillator
+harmonics coupling into the front end). The **120.000 MHz** tooth is the 40 MHz
+reference's 3rd harmonic, but it is just one line of the comb; a tooth inside a
+25 kHz channel cannot be removed by the per-channel NCO/CIC/FIR/AM chain.
+
+Because the comb is conducted, **antenna-side filtering, an external enclosure, and
+a notch on the strong local carrier do not remove it** (all three were tried on
+hardware with no effect). The comb **is** amplified by the RX gain (a terminated-
+input gain sweep: strongest tooth −28 dBFS @71 dB → −86 dBFS @15 dB; comb-to-floor
+~36 dB @71 → ~17 dB @30), A 2026-06-24 test series (power, reference, Fs and LO
+shifts; see `firmware/diagnostics/README.md`) pins each wideband tooth: the
+**dominant (126.000 MHz) is the 9th harmonic of the 14 MHz ADC sample clock** (fixed
+absolute under LO shift; moves to other n·Fs under Fs shift), plus a **125 MHz
+Gigabit-Ethernet PHY clock** (Pluto+) and the **120 MHz reference 3rd harmonic** —
+all at fixed *absolute* frequencies, none on the switcher rail. Input power
+(USB/battery/benchtop identical), enclosure shielding, an antenna band-pass, and a
+switcher↔bulk-cap bead do **not** help; the effective levers are **lower RX gain**
+(≈40–48 dB, which also removes the 71 dB ADC clipping intermod), **frequency
+planning** (keep channels off the fixed lines — the shipped plan already places them
+in guard gaps), and an **external clean reference** (removes the 120 MHz line). Full
+analysis and the diagnostic toolkit (`band_snapshot.py`, `term_tests.py`,
+`clock_shift_test.py`, `lo_track_test.py`) are in `firmware/diagnostics/README.md`.
 
 (The CORDIC magnitude detector replaced an earlier alpha-max-beta-min estimator
 that added its own ~−30 dBc demod spurs from angle-dependent gain ripple. CORDIC
-is the correct, artifact-free detector — but it is not the fix for the RF spur.)
+is the correct, artifact-free detector — but it is not the fix for the spur comb.)
 
 ## 8. Development and build stack
 

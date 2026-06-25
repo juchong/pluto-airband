@@ -865,10 +865,121 @@ doesn't match), so every boot → new MAC → new DHCP lease → new IP.
   `PLUTO_MAC`. **Software-only DT change → reflash `plutoplus.dfu` only.** Docs:
   `BUILD.md` ("Deterministic Ethernet MAC").
 
+### Audio buzz — confirmed INTERNAL conducted spur comb (2026-06-24)
+Re-tested the buzz from the hardware side after a clean front end, a notch on the
+strong 118.050 carrier, and a metal enclosure all failed to help. New diagnostics:
+`firmware/diagnostics/band_snapshot.py` (host-parametrized FFT + comb detect) and
+`term_tests.py` (LO cross-correlation + gain sweep, with auto-restart of maia-httpd
+on OOM). Run on the Pluto+ (`10.0.16.100`) with the **antenna disconnected and a
+50 Ω load on the RX input**:
+- **Decisive: the comb is present with the input terminated.** 15 discrete teeth up
+  to ~40 dB over the floor plus a finer comb, across the whole 14 MHz capture, with
+  no antenna → the source is **on the board** (conducted), not antenna-borne RF.
+  This is why the enclosure, an antenna band-pass, and the carrier notch did
+  nothing.
+- **Band-wide comb of on-board harmonics**, not a lone line. The 120.000 MHz tooth
+  (40 MHz ref 3rd harmonic) is real but is one tooth of the comb.
+- **Gain-dependent** (terminated gain sweep): strongest tooth −28 dBFS @71 dB → −43
+  @50 → −73 @30 → −86 @15; comb-to-floor ~36 dB @71 → ~17 dB @30. The comb is
+  amplified by the front-end gain, so **lowering RX gain is a real mitigation**
+  (~19 dB comb-to-floor at 30 dB), on top of removing the 71 dB clipping intermod.
+- **Fixed-absolute vs baseband:** a large-shift (2.5 MHz) LO cross-correlation leans
+  toward the teeth being at fixed *absolute* RF frequencies (on-board oscillator/
+  clock/switcher harmonics into the front end), though only partially rigid. A small
+  ±330 kHz LO shift is unreliable here (dense comb aliases the tooth-matcher — the
+  verdict flipped between runs); use `term_tests.py corr`.
+- **Correction to the earlier RE-DIAGNOSED write-up:** this *confirms and refines*
+  the "fixed-frequency RF spur" finding (it is internal RF) but corrects two points
+  — it is a **band-wide comb** (not just 120 MHz) and it is **not gain-invariant**.
+- **Research (ADI Pluto hardware notes + Pluto+):** a classic conducted-spur
+  problem. ADI fixed bad Pluto RF performance with a dedicated ultra-low-noise LDO
+  (ADM7160ACPZN1.8) on the 40 MHz oscillator, a series power choke (DLW5BSM801TQ2L),
+  synchronized switchers, and USB common-mode chokes (DLW21HN900SQ2L). The Pluto+
+  also exposes an external-clock input (EXCLK→GND, feed a TCXO/GPSDO via IPEX).
+  Remedies ranked in `firmware/diagnostics/README.md`.
+- **Op note:** this Pluto+ exposes only **96 MB** to Linux (~13 MB free, the rest
+  reserved for the maia-sdr DMA regions); repeated IQ recordings OOM-killed
+  `maia-httpd`. A **bounded boot-time respawn** already exists
+  (`firmware/patch_maia_respawn.py`, commit `7db25ed`) for the first-boot OOM race,
+  but steady-state OOM from heavy diagnostic recording is intentionally out of its
+  scope, so it did not fire; the diagnostic auto-restarts `maia-httpd` over ssh to
+  compensate.
+- **Default gain lowered 71 → 48 dB** (built-in `AirbandConfig::default` in the fork
+  + the `firmware/airband.json` template) given the gain-amplified comb and the 71 dB
+  clipping; 48 dB is the measured clipping knee. Raise toward 71–73 dB only behind an
+  external selective filter at a quiet site. Docs aligned (README, SPEC §5/§6.1/§7,
+  BUILD, firmware/diagnostics/README).
+
+### Buzz mitigation A/B: power source + external reference (2026-06-24)
+Controlled tests on the Pluto+ (`10.0.16.100`), **50 Ω termination** on the RX
+input, gain fixed at **48 dB**, captured with `band_snapshot.py` (labeled,
+non-overwriting PNGs in `firmware/diagnostics/out/`).
+- **Input power ruled out.** Identical comb (same teeth, same amplitudes, peak
+  excursion ~37.5 dB) on **USB**, a **battery**, and a **benchtop lab PSU**. The
+  conducted comb is generated on the Pluto's own PCB (its DC-DC regulation), not the
+  input supply — clean external power does **not** help.
+- **External reference partitions the comb.** Fed a **29 MHz** sine (AWG) with the
+  internal VCTCXO disabled (EXCLK→GND, `ad936x_ext_refclk_override=<29000000>`,
+  reboot; AD9361 re-derived 123.438 MHz / 14 MHz from 29 MHz):
+  - The **120.000 MHz** tooth **disappeared** → it was the 40 MHz reference 3rd
+    harmonic. A clean external reference removes that one line.
+  - **Every other tooth, including the loudest (126.000 MHz, ~38 dB), was
+    unchanged** → the dominant comb is the **on-board switching regulator**,
+    independent of the reference. A clean reference does **not** fix the buzz.
+  - The AWG added its own spurs (119.438, 130.000 MHz) → an AWG is not a clean
+    reference; a low-spur OCXO is needed for a real reference.
+- **Net ranking:** (1) lower RX gain (removes clipping intermod + lowers comb
+  prominence; now 48 dB), (2) on-board power decoupling / LDO rework at the
+  regulators + RF rails (ADI ADM7160-on-oscillator + DLW5BSM801TQ2L choke) — the
+  only lever that touches the switcher comb, (3) external clean reference (removes
+  the 120 MHz line only), (4) channel-plan around the fixed switcher teeth. Input
+  power and the reference are each **necessary-but-not-sufficient**.
+- Captures: `band_50ohm-term_gain71_2026-06-24.png` (baseline),
+  `band_{50ohm-term,battery-50ohmterm,benchtop-50ohmterm,ext-29mhz-50ohmterm}_gain48_2026-06-24.png`,
+  `localization_loshift-gainsweep_gain71_2026-06-24.png`.
+- Tooling: `band_snapshot.py` + `term_tests.py` now self-heal `maia-httpd` over ssh
+  on OOM (96 MB Pluto+) and re-apply gain after a restart. The `ad936x_ext_refclk_override`
+  persists in u-boot env — to return to the internal VCTCXO, un-ground EXCLK **and**
+  reset the override to `<40000064>` before reboot.
+
+### Buzz spur taxonomy: Fs/LO shifts pin each source (2026-06-24)
+Followed the power/reference A/Bs with a digital-clock (Fs) sweep and an LO sweep
+(terminated, gain 48, internal VCTCXO): `clock_shift_test.py` (alias + digital
+solvers; non-commensurate Fs via `PLUTO_FS` to break the LCM alias ambiguity) and
+`lo_track_test.py`. **This corrects the earlier "dominant comb = on-board switcher"
+inference** — the power/ref A/Bs held Fs fixed and could not see it. Each dominant
+wideband tooth now has a source:
+- **126.000 MHz (~36 dB, dominant) = the 9th harmonic of the 14 MHz ADC sample
+  clock (9×14).** Fixed ABSOLUTE under LO shift (stays at 126.000 as LO moves
+  ±0.5 MHz); moves to other n·Fs under Fs shift (10×12.3=123.0, 14×9.1=127.4); LO-
+  and reference-independent → internal to the AD9361 sample clock. NOT a switcher
+  tone, NOT an external aggressor, NOT a single ∝Fs fraction (digital- and
+  alias-solves both correctly excluded the simple hypotheses).
+- **125.004 MHz (~20 dB) = the Gigabit-Ethernet 125 MHz PHY clock (Pluto+ only).**
+  Fixed absolute across LO and Fs; 125/14 non-integer → not a sample-clock harmonic.
+- **120.000 MHz (~13 dB) = 40 MHz reference 3rd harmonic.** Fixed absolute; removed
+  by the external-reference test.
+- **122.182 MHz (~12 dB)** unidentified fixed board source; **~LO+1.0 MHz (124.434,
+  ~12 dB)** tracks the LO → an ADC/baseband DC-region spur.
+- **Mitigation by source:** the sample-clock 9th harmonic, GbE clock, and reference
+  harmonic are all at fixed ABSOLUTE frequencies, so **frequency planning** (LO /
+  channel placement) dodges them — and the shipped plan already keeps them in guard
+  gaps (126.000 between ch15 125.9 and ch16 126.25; 120.000 ~100 kHz off ch3). A
+  switcher↔bulk-cap bead is **not indicated** for any of them; the external reference
+  helps only the 120 MHz line; the GbE clock is a Pluto+ decouple/triage item (or
+  feed audio over USB).
+- Figures: `clock_shift_intVCTCXO_14-11-8MHz_*` (commensurate; 616 MHz LCM artifact),
+  `clock_shift_intVCTCXO_14.0-12.3-9.1MHz_*` (non-commensurate; clean),
+  `lo_track_intVCTCXO_gain48_*`.
+
 ## Next steps
-- **Buzz is hardware-bound** (see RE-DIAGNOSED section): pursue power-supply
-  cleanup / shielding / external reference; no further HDL work will help. Keep
-  the CORDIC magnitude (it is the correct demod regardless and improves accuracy).
+- **Buzz spurs are characterized** (see "Buzz spur taxonomy", 2026-06-24): the
+  dominant 126.000 MHz tooth is the AD9361 sample-clock 9th harmonic (9×14 MHz), plus
+  a 125 MHz GbE clock (Pluto+) and the 120 MHz reference 3rd harmonic — all fixed
+  absolute. Levers: lower RX gain (done, 48 dB), frequency planning (keep channels off
+  those lines; the plan already does), and an external OCXO reference (for 120 MHz).
+  Input power, enclosure shielding, antenna filtering, and a switcher↔bulk-cap bead do
+  not help; no HDL work will. Keep the CORDIC magnitude (the correct demod regardless).
 - **Signal-quality tuning on real RF:** front-end locked on-band, manual 71 dB,
   host `--shift -6` → live AWOS (ch0) recovers as clean voice at ~ −19 dBFS. Still
   to do: a better antenna for weaker fields, and per-site tuning of `gain_db` /
