@@ -73,7 +73,7 @@ impl SquelchConfig {
         SquelchConfig {
             mode,
             rate,
-            open_delay_ms: 24.6,
+            open_delay_ms: 5.0,
             close_delay_ms: 1000.0,
             low_signal_abort_ms: 0.0,
         }

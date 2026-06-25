@@ -62,11 +62,9 @@ use std::{
 };
 
 /// Per-channel audio rate: the channelizer is fed IQ at Fs = 14 Msps and
-/// decimates by 896 (128 lane CIC * 7 audio) -> 15625 sps. (The pre-fix
-/// bitstream silently halved the lane input rate to ~7 Msps -> 7813 sps; the
-/// pipelined-lane fix processes every input, restoring 15625 sps and correct
-/// NCO tuning. Pass --rate to override for an older bitstream.)
-const DEFAULT_RATE: u32 = 15625;
+/// decimates by 640 (128 lane CIC * 5 audio) -> 21875 sps. (Older bitstreams used
+/// audio_decim 7 -> 15625 sps; pass --rate 15625 for those.)
+const DEFAULT_RATE: u32 = 21875;
 
 /// Default TCP port of the maia-httpd airband stream, appended when the address
 /// argument omits an explicit `:port` (so `10.0.16.183` works like
@@ -152,7 +150,7 @@ struct Args {
     #[arg(long, default_value_t = 300.0)]
     filter_low: f64,
     /// Voice band-pass high corner in Hz (low-pass)
-    #[arg(long, default_value_t = 3400.0)]
+    #[arg(long, default_value_t = 7000.0)]
     filter_high: f64,
     /// Notch (band-stop) center frequency in Hz to kill a tonal spur (off if unset).
     #[arg(long)]
@@ -662,7 +660,7 @@ fn main() -> Result<()> {
         squelch: !matches!(args.squelch, SquelchArg::Off),
         agc: agc_on,
         notch: args.notch.is_some(),
-        denoise: !args.no_denoise,
+        denoise: false,
     };
     let cfg = DspCfg {
         rate: args.rate,

@@ -71,6 +71,24 @@ impl Biquad {
         )
     }
 
+    /// RBJ cookbook 2nd-order high-shelf at `f0` (Hz), quality `q`, gain `db`.
+    /// Used to de-droop the FPGA audio-CIC roll-off (boosts the high voice band).
+    fn high_shelf(f0: f64, fs: f64, q: f64, db: f64) -> Biquad {
+        let a = 10f64.powf(db / 40.0);
+        let w0 = 2.0 * PI * f0 / fs;
+        let (cos_w0, sin_w0) = (w0.cos(), w0.sin());
+        let alpha = sin_w0 / (2.0 * q);
+        let two_sqrt_a_alpha = 2.0 * a.sqrt() * alpha;
+        Biquad::norm(
+            a * ((a + 1.0) + (a - 1.0) * cos_w0 + two_sqrt_a_alpha),
+            -2.0 * a * ((a - 1.0) + (a + 1.0) * cos_w0),
+            a * ((a + 1.0) + (a - 1.0) * cos_w0 - two_sqrt_a_alpha),
+            (a + 1.0) - (a - 1.0) * cos_w0 + two_sqrt_a_alpha,
+            2.0 * ((a - 1.0) - (a + 1.0) * cos_w0),
+            (a + 1.0) - (a - 1.0) * cos_w0 - two_sqrt_a_alpha,
+        )
+    }
+
     #[inline]
     fn process(&mut self, x: f64) -> f64 {
         let y = self.b0 * x + self.b1 * self.x1 + self.b2 * self.x2 - self.a1 * self.y1
@@ -90,10 +108,12 @@ impl Biquad {
     }
 }
 
-/// 4th-order Butterworth band-pass (two high-pass + two low-pass biquads).
+/// 4th-order Butterworth band-pass (two high-pass + two low-pass biquads) plus a
+/// fixed high-shelf that de-droops the FPGA audio-CIC roll-off so the widened
+/// voice band stays flat to the top.
 #[derive(Clone)]
 pub struct VoiceFilter {
-    stages: [Biquad; 4],
+    stages: [Biquad; 5],
 }
 
 impl VoiceFilter {
@@ -109,6 +129,9 @@ impl VoiceFilter {
                 Biquad::high_pass(low, fs, Self::Q2),
                 Biquad::low_pass(high, fs, Self::Q1),
                 Biquad::low_pass(high, fs, Self::Q2),
+                // de-droop the order-4 audio CIC (~-4.2 dB @6 kHz at 21875 sps):
+                // gentle high-shelf, +4.5 dB above ~3 kHz.
+                Biquad::high_shelf(3000.0, fs, 0.5, 4.5),
             ],
         }
     }

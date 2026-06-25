@@ -92,8 +92,8 @@ struct Args {
     /// Number of channels to demultiplex
     #[arg(long, default_value_t = 21)]
     channels: usize,
-    /// Audio sample rate in Hz (= AD9361 Fs / 128 / 7); used for WAV headers
-    #[arg(long, default_value_t = 15625)]
+    /// Audio sample rate in Hz (= AD9361 Fs / 128 / 5); used for WAV headers
+    #[arg(long, default_value_t = 21875)]
     rate: u32,
     /// Output mode
     #[arg(long, value_enum, default_value_t = Mode::Stats)]
@@ -143,7 +143,7 @@ struct Args {
     #[arg(long, default_value_t = 300.0)]
     filter_low: f64,
     /// Voice band-pass high corner in Hz (low-pass)
-    #[arg(long, default_value_t = 3400.0)]
+    #[arg(long, default_value_t = 7000.0)]
     filter_high: f64,
     /// Notch (band-stop) center frequency in Hz to kill a tonal spur (off if unset).
     #[arg(long)]
@@ -727,7 +727,7 @@ fn main() -> Result<()> {
         min_samples: (args.min_transmission_ms * args.rate as u64) / 1000,
         agc_on: !args.no_agc,
         filter_on: !args.no_filter,
-        denoise_on: !args.no_denoise,
+        denoise_on: false,
         denoise_floor_db: args.denoise_floor_db,
         notch_freq: args.notch,
         notch_q: args.notch_q,
