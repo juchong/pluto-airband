@@ -559,15 +559,15 @@ LSB** (i.e. ~ −90 to −100 dBFS at 24-bit). Two things were eating it:
    | manual 64 dB | 64 dB | ~154 |
    | **manual 71 dB** | **71 dB** | **~280** |
 
-   Fixed **manual gain** wins by ~5× over the AGC modes for weak-signal recovery,
-   but the **shipped built-in default was lowered from 71 to 48 dB** (`maia-httpd`
-   `AirbandConfig::default`, what runs when `/root/airband.json` is absent): at
-   strong-signal sites 71 dB clips the *wideband* ADC (~13–15% of samples →
-   broadband intermod), and 48 dB is the measured clipping knee that *also* lowers
-   the conducted spur-comb "buzz" (which **is** amplified by RX gain — see
-   `firmware/diagnostics/term_tests.py`; it does not, however, fully remove the
-   comb). Behind an **external selective filter** the band is quiet enough to raise
-   toward the **73 dB** AD9361 ceiling for maximum sensitivity.
+   Fixed **manual gain** wins by ~5× over the AGC modes for weak-signal recovery.
+   The **shipped built-in default is now 0 dB** (`maia-httpd` `AirbandConfig::default`,
+   what runs when `/root/airband.json` is absent), down from 71 → 48 → 0: a bench A/B
+   showed the AD9361's **internal gain stage is itself the dominant generator** of the
+   conducted spur comb and broadband noise/intermod, and a clean low-NF **external
+   LNA** ahead of the Pluto (internal gain at its floor) is markedly cleaner. **The
+   0 dB default assumes an external LNA**; on a *bare* front end it is very insensitive
+   — raise toward the **48 dB** clipping knee (71 dB clips the wideband ADC ~13–15% →
+   broadband intermod) for that case, accepting a more prominent comb.
    To apply a config without reflashing, drop it on the device and restart:
 
    ```sh

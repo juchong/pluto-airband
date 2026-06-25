@@ -972,6 +972,33 @@ wideband tooth now has a source:
   `clock_shift_intVCTCXO_14.0-12.3-9.1MHz_*` (non-commensurate; clean),
   `lo_track_intVCTCXO_gain48_*`.
 
+### Default gain lowered 48 → 0 dB: internal gain stage is the comb/noise generator (2026-06-25)
+Bench A/B on the Pluto+ (`10.0.16.100`, USB) comparing an **external LNA** (ZFL-500LN+
+ahead of the Pluto, internal gain ~0) against **internal AD9361 gain** with the
+antenna direct. Captured with `band_snapshot.py` (identical N=32768 Welch pipeline);
+on the 96 MB unit, single short (≤0.06 s, no-retry) recorder grabs avoid the OOM that
+the 0.2 s buffer + retry loop caused.
+- **The AD9361 internal gain stage is itself the dominant generator** of the conducted
+  spur comb AND broadband noise/intermod. Both grow with internal gain and collapse
+  SFDR (comb teeth + broadband hash rise faster than the wanted signal). The external
+  LNA path is markedly cleaner — lower floor, fewer broadband peaks, better-behaved
+  front end — because a clean low-NF LNA sets the system noise figure (Friis) and lets
+  the internal stage run at its floor.
+- **No-notch / no-LNA / antenna-direct** captures (gain 0 and 25 dB): no ADC clipping
+  (118.050 only −18 to −19 dBFS peak), and +25 dB of internal gain raised wideband RMS
+  by only ~1.5 dB — consistent with the dominant energy being internal/conducted, not
+  antenna signal. Comb structure (~200 kHz, ~57–59 teeth) unchanged with/without the
+  notch and with/without the LNA → reconfirms internal/conducted origin.
+- **Default gain changed 48 → 0 dB** (built-in `AirbandConfig::default` in the fork +
+  `firmware/airband.json`). **This default assumes an external LNA**; on a bare front
+  end 0 dB is very insensitive — raise toward the 48 dB clipping knee for that case.
+  Docs aligned (README, SPEC §5/§6.1/§7, SPUR-INVESTIGATION). FIT-only change
+  (`maia-httpd` rootfs) → built via `build_firmware_full.sh` (TARGET=plutoplus),
+  flashed `plutoplus.dfu` only (u-boot env preserved).
+- Captures: `band_antenna-direct-nonotch_gain25_2026-06-25.png`,
+  `band_antenna-lna-nonotch_gain{0,25}_2026-06-25.png` (the `lna` labels predate the
+  amp removal), `band_antenna-notch-lna_gain0_2026-06-25.png`.
+
 ## Next steps
 - **Buzz spurs are characterized** (see "Buzz spur taxonomy", 2026-06-24): the
   dominant 126.000 MHz tooth is the AD9361 sample-clock 9th harmonic (9×14 MHz), plus

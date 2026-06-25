@@ -77,11 +77,15 @@ branch). The Maia base (spectrometer/recorder/DDC) is preserved.
 - **Single shared front-end:** one RX gain serves all 21 channels (no per-channel
   AGC; the AD9361 AGC modes settle on *wideband* power and starve weak narrowband
   channels, so fixed manual gain is used). The shipped default is now fixed manual
-  **48 dB** — the bare-front-end clipping knee: **71 dB** clips the wideband ADC
-  (~13–15% of samples → broadband intermod that looks like a poor noise floor) and
-  also amplifies the conducted spur comb. Raise toward the **73 dB** ceiling only
-  behind an external selective filter at a quiet site (max weak-signal sensitivity);
-  drop toward ~40 dB to suppress the comb further. See [Channel plan](#channel-plan).
+  **0 dB**, because the AD9361's **internal gain stage is itself the dominant
+  generator** of the conducted spur comb *and* broadband noise/intermod — both grow
+  with internal gain and collapse SFDR. The correct front-end is a clean low-NF
+  **external LNA** doing the gain ahead of the Pluto with internal gain at its floor;
+  an A/B (external LNA vs. internal gain) showed the external LNA markedly cleaner
+  (lower floor, fewer broadband peaks). **This default assumes an external LNA** — on
+  a *bare* front end (no LNA) 0 dB is very insensitive, so raise `gain_db` for that
+  case (the **48 dB** clipping knee is the bare-front-end guidance; the **71 dB**
+  ceiling clips the wideband ADC ~13–15%). See [Channel plan](#channel-plan).
 - **Transmitter quieted on boot.** This is a pure receiver, but the Pluto powers up
   in FDD with the TX LO running (2.45 GHz, ~10 dB attenuation) — radiated EMI to
   nearby radios. The firmware now powers down the TX LO and floors TX attenuation at
@@ -350,15 +354,15 @@ the airband band no matter what the browser does.
 
 The receiver reads `/root/airband.json` on the Pluto at startup; if absent it uses
 the `maia-httpd` **built-in defaults** shown below. A ready-to-copy template is at
-`firmware/airband.json` (identical to these built-in defaults; raise `gain_db`
-toward 71–73 only behind an external selective filter — see **Gain** below):
+`firmware/airband.json` (identical to these built-in defaults; the **0 dB** default
+assumes an external LNA — raise `gain_db` on a bare front end, see **Gain** below):
 
 ```jsonc
 {
   "center_hz":   123438000,   // AD9361 RX LO (capture center) — keep within the built window
   "samp_rate":   14000000,    // MUST stay 14 MHz (the rate the channelizer was built for)
   "rf_bandwidth":14000000,
-  "gain_db":     48.0,        // used when agc = "manual"; built-in default (see Gain)
+  "gain_db":     0.0,         // used when agc = "manual"; built-in default, assumes external LNA (see Gain)
   "agc":         "manual",    // "manual" | "slow_attack" | "fast_attack" | "hybrid"
   "poll_ms":     20,
   "channels_hz": [ 118050000, 119200000, /* … up to 21 … */ 128500000 ]
@@ -373,22 +377,24 @@ Rules:
 - Changing `center_hz` re-tunes the whole window; keep all desired channels inside it.
 - **Gain:** one shared RX gain serves all 21 channels; fixed `agc: "manual"` (the
   AD9361 AGC modes settle on *wideband* power and starve weak channels — measured
-  ch0 peak ~5× lower than fixed max). The shipped default is now **`gain_db: 48.0`**,
-  the bare-front-end clipping knee: a measured sweep
-  ([`firmware/diagnostics/floor_sweep.py`](firmware/diagnostics/floor_sweep.py))
-  shows the **71 dB** AD9361 near-ceiling clips ~13–15% of the *wideband* ADC at a
-  strong-signal site (broadband intermod that makes the floor look terrible,
-  effective ~−6 dBFS, and scatters spurs), with clipping gone by ~48 dB and the
-  floor ~19 dB lower at no SNR loss. 48 dB also **lowers the conducted spur comb**,
-  which is amplified by RX gain (`term_tests.py`). Per site:
-  - **External selective filter** (attenuates the strong local carrier): the band
-    goes quiet, so you can raise toward the **73 dB** AD9361 ceiling for maximum
-    weak-signal sensitivity (0 clipping).
-  - **Bare front end** at a strong site: keep **~48 dB** (or drop toward ~40 to
-    suppress the comb further, trading weak-signal sensitivity).
+  ch0 peak ~5× lower than fixed max). The shipped default is now **`gain_db: 0.0`**.
+  The AD9361's **internal gain stage is itself the dominant generator** of the
+  conducted spur comb and broadband noise/intermod — both grow with internal gain
+  and collapse the spurious-free dynamic range. The correct architecture is a clean
+  low-NF **external LNA** providing the gain ahead of the Pluto, with the internal
+  gain at its floor; an A/B comparison (external LNA vs. internal gain) showed the
+  external LNA is markedly cleaner — lower noise floor, fewer broadband peaks,
+  better-behaved front end. Per site:
+  - **External LNA (recommended):** keep internal **`gain_db: 0`**; the LNA sets the
+    (low) system noise figure and the internal stage adds minimal spurs/noise.
+  - **Bare front end** (no LNA): 0 dB is very insensitive — raise toward the **48 dB**
+    clipping knee (a measured sweep,
+    [`firmware/diagnostics/floor_sweep.py`](firmware/diagnostics/floor_sweep.py),
+    shows the **71 dB** near-ceiling clips ~13–15% of the *wideband* ADC → broadband
+    intermod; clipping is gone by ~48 dB), accepting a more prominent comb.
 
-  Gain does **not** remove the fixed-frequency channel "buzz" (the 120 MHz
-  reference-harmonic spur; see
+  Gain does **not** remove the fixed-frequency channel "buzz" (the internal clock-tone
+  comb; see
   [`firmware/diagnostics/README.md`](firmware/diagnostics/README.md)).
 
 Apply a new plan:

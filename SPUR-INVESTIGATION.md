@@ -179,7 +179,10 @@ Fix by mechanism (cheapest first). Full detail in
 [`firmware/diagnostics/README.md`](firmware/diagnostics/README.md).
 
 **Config / host (no reflash)**
-1. **RX gain ≈ 48 dB** (done) — removes clipping intermod.
+1. **Minimum internal RX gain + external LNA** (default now **0 dB**) — the AD9361's
+   internal gain stage is itself the dominant comb/intermod/noise generator, so run a
+   clean low-NF external LNA up front and keep internal gain at its floor. (On a bare
+   front end with no LNA, ~48 dB is the clipping knee — see §4/§5.)
 2. **Feed audio over USB, not GbE** — kills the 125 MHz PHY clock (Pluto+).
 3. **Host per-channel notch** (`airband-dsp::Notch`) at the fixed audio beat for any
    channel with an in-passband spur.
@@ -241,5 +244,7 @@ PLUTO_GAIN=48 $PY lo_track_test.py "$PLUTO_HOST"
   a low-spur OCXO.
 - **Waterfall ≠ audio:** wideband teeth in guard gaps are cosmetic; only spurs within
   ~±3.4 kHz of a carrier are audible.
-- The AD9361 built-in default gain change (71 → 48 dB) lives in the maia-sdr fork
-  (`maia-httpd/src/airband.rs`), separate from this repo.
+- The AD9361 built-in default gain (71 → 48 → **0 dB**, the last assuming an external
+  LNA) lives in the maia-sdr fork (`maia-httpd/src/airband.rs`), separate from this
+  repo. The 0 dB change follows a bench A/B showing the internal gain stage is the
+  dominant comb/noise generator and an external LNA is markedly cleaner.
