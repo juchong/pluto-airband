@@ -471,9 +471,16 @@ reconnects instead of going silently quiet. A single `--icecast-*` flag set is
 the one-channel shortcut. `host/airband-listen`
 runs the same chain on the played channel (and the squelch on every channel for
 activity meters), with `single`/`follow` (scanner)/`mix` monitor modes and live
-toggles. It defaults to **carrier squelch** and its meter shows **carrier level in dB
-over the cross-channel noise reference** (the demod audio is ~0 until modulation rides
-up, so audio dBFS is not a useful weak-signal indicator). A **live FFT window** (`g`
+toggles. It defaults to **audio VOX squelch** (a carrier-level squelch proved fragile
+against the conducted comb's per-channel offsets, so detection keys on in-band voice
+modulation) while its meter still shows **carrier level in dB over the cross-channel
+noise reference** (the demod audio is ~0 until modulation rides up, so audio dBFS is
+not a useful weak-signal indicator). A **DeepFilterNet** neural enhancer (`D` key) runs
+on the played stream **by default** — the host band-pass/LPF/notch/spectral-denoise
+instead start off so DFN cleans up alone. The DFN3 model is embedded and run at its
+native 48 kHz via streaming resampling from 21875 sps, **after** the filter+AGC chain
+and **only while the squelch is open** (NN inference is expensive); it adds ~tens of
+ms of latency and complements the spectral denoiser. A **live FFT window** (`g`
 key) plots a Welch PSD of the active post-DSP audio with a hover crosshair
 (frequency/magnitude) and a locked Y axis — a debugging aid for the host filters. The
 voice band-pass is on by default but does not remove the RF spur "buzz" (see §7).

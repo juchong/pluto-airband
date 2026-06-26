@@ -164,8 +164,11 @@ airband AM voice has no usable energy above ~3.4 kHz so a wider corner only pass
 hiss), an optional **notch**, an STFT **noise reduction** stage that attenuates the
 broadband hiss under the voice, and an **AGC** that normalizes loudness and
 soft-clips peaks. Defaults: band-pass on, 2.5 kHz LPF on, denoise on, AGC on.
-`airband-reader` defaults to squelch `auto`; **`airband-listen` defaults to
-`--squelch carrier`** (see below) since the demod audio is ~0 until a carrier keys.
+`airband-reader` and **`airband-listen` both default to squelch `auto`** (audio
+VOX, see below); a carrier-level squelch proved fragile against the conducted
+spur comb's per-channel offsets, so detection keys on in-band voice modulation.
+(`airband-listen`'s activity meter still reads out carrier level — that is a
+display metric, independent of the squelch.)
 
 Because the FPGA DC-blocks the audio before the host sees it, the default squelch
 works on voice energy (VOX) and uses a **hang time** (`--squelch-hang-ms`, default
@@ -287,19 +290,33 @@ cargo build --release --manifest-path host/Cargo.toml
 host/target/release/airband-listen 192.168.2.1:30000
 ```
 
-`airband-listen` runs the same `airband-dsp` chain on the played channel (carrier
-squelch + band-pass + 2.5 kHz LPF + denoise + AGC by default), and runs the squelch
-on *every* channel so the meter shows which frequencies are active. Interactive
+`airband-listen` runs the `airband-dsp` chain on the played channel with a
+**DeepFilterNet-centric default**: VOX squelch + AGC + **DeepFilterNet** on, while
+the host band-pass, 2.5 kHz LPF, notch, and spectral denoise start **off** so DFN
+does the cleanup in isolation (each is still runtime-toggleable). It runs the
+squelch on *every* channel so the meter shows which frequencies are active. Interactive
 keys: `↑/↓` (or `j`/`k`, `[`/`]`) step channels, type a number then `Enter` to jump,
 `+`/`-` adjust volume, `m` mutes, `s` toggles squelch, `a` toggles AGC, `f` toggles
 the band-pass, `l` toggles the **2.5 kHz low-pass**, `n` toggles a configured notch,
-`d` toggles **noise reduction**, `g` toggles a **live FFT window** (see below), `F`
-toggles **follow** (scanner) mode, `q` quits.
+`d` toggles **noise reduction**, `D` toggles **DeepFilterNet** (see below), `g`
+toggles a **live FFT window** (see below), `F` toggles **follow** (scanner) mode,
+`q` quits.
 `--monitor single|follow|mix` selects single-channel, scanner, or sum-of-open-
 channels playback. The per-channel meter shows **carrier level in dB over the
 cross-channel noise reference** (`dB·c`) — idle channels sit ~0, a keyed station
 reads positive even when its demod audio is buried — plus a squelch-open dot, the
 selected channel's squelch state, and cumulative dropped samples.
+
+**DeepFilterNet enhancement (`D`).** Runs the [DeepFilterNet](https://github.com/Rikorose/DeepFilterNet)
+neural speech enhancer on the played stream. It is **on by default** (the host
+band-pass/LPF/notch/spectral-denoise instead start off so DFN cleans up alone);
+toggle it with `D`. The DFN3 model is embedded in the binary and fed via streaming
+resampling from the 21875 sps audio to its native 48 kHz. It runs **after** the
+per-channel filter + AGC chain (so it sees a healthy, in-range signal) and **only
+while the squelch is open** (the inference is expensive and there is nothing to
+enhance in muted silence), adding ~tens of ms of latency. It complements the
+spectral `d` denoiser — try either or both. First enable loads the model (a
+one-time ~½ s hitch).
 
 **Live FFT window (`g`) — debugging.** Pops up a native GUI plotting a **Welch** PSD
 (2048-pt Hann, ~7 averaged segments) of the active channel's post-DSP audio, so you

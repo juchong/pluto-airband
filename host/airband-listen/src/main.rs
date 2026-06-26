@@ -20,7 +20,8 @@
 //!
 //! Monitor modes (`--monitor`): `single` plays one channel; `follow` is a
 //! scanner that auto-switches to whichever channel's squelch is open (with a
-//! hang time); `mix` sums every open channel into one stream.
+//! hang time); `mix` sums every open channel into one stream. In `follow`,
+//! `--ignore-channel` skips channels that false-trigger squelch.
 //!
 //! Keys:
 //!   ↑/↓ or j/k or [/]   previous / next channel
@@ -63,6 +64,9 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+
+mod dfn;
+use dfn::DfnEnhancer;
 
 /// Per-channel audio rate: the channelizer is fed IQ at Fs = 14 Msps and
 /// decimates by 640 (128 lane CIC * 5 audio) -> 21875 sps. (Older bitstreams used
@@ -124,13 +128,14 @@ struct Args {
     /// already normalized) or 25000 with --no-agc (raw airband audio is quiet).
     #[arg(long)]
     gain: Option<f32>,
-    /// Squelch mode: carrier (cross-channel carrier power, default), off, auto
-    /// (audio-energy noise-floor tracking), or manual (fixed dBFS). Carrier is the
-    /// reliable choice for weak AM: the audio is ~0 until modulation rides up, so
-    /// the FPGA per-channel carrier level is the real signal-present metric.
-    #[arg(long, value_enum, default_value_t = SquelchArg::Carrier)]
+    /// Squelch mode: auto (audio-energy VOX, default), off, manual (fixed dBFS),
+    /// or carrier (cross-channel carrier power). Auto/VOX keys on the demodulated
+    /// *modulation* (the audio) via a per-channel adaptive noise floor, so it is
+    /// immune to the per-channel carrier-level offsets the conducted comb causes
+    /// (the comb is a steady carrier bump with no in-band voice modulation).
+    #[arg(long, value_enum, default_value_t = SquelchArg::Auto)]
     squelch: SquelchArg,
-    /// Automatic-squelch open threshold, in dB of SNR above the noise floor.
+    /// Squelch open threshold, in dB of SNR above the (per-channel) noise floor.
     #[arg(long, default_value_t = 9.0)]
     squelch_snr: f32,
     /// Manual-squelch threshold in dBFS (used when --squelch manual).
@@ -162,6 +167,10 @@ struct Args {
     /// (a distinct LPF stage; 0 = off)
     #[arg(long, default_value_t = 2500.0)]
     lpf_hz: f64,
+    /// Enable DeepFilterNet neural enhancement on the played stream at startup
+    /// (toggle live with `D`). Heavy inference; runs only while squelch is open.
+    #[arg(long)]
+    dfn: bool,
     /// Notch (band-stop) center frequency in Hz to kill a tonal spur (off if unset).
     #[arg(long)]
     notch: Option<f64>,
@@ -174,6 +183,10 @@ struct Args {
     /// Follow-mode hang time in ms: stay on a channel this long after it goes idle.
     #[arg(long, default_value_t = 2000)]
     follow_hang_ms: u64,
+    /// Channel index(es) to skip in follow (scanner) mode. Repeat the flag or
+    /// pass a comma-separated list (e.g. `--ignore-channel 0,5,11`).
+    #[arg(long = "ignore-channel", value_delimiter = ',')]
+    ignore_channels: Vec<usize>,
 }
 
 /// Immutable DSP parameters handed to the reader thread.
@@ -221,11 +234,16 @@ struct Shared {
     notch_on: AtomicBool,
     denoise_on: AtomicBool,
     lpf_on: AtomicBool,
+    /// Toggle: DeepFilterNet enhancement on the played stream.
+    dfn_on: AtomicBool,
     /// Toggle: live FFT GUI window visible.
     fft_open: AtomicBool,
     /// Ring of the most recent played (post-DSP) samples of the active stream,
     /// consumed by the live FFT window.
     fft_samples: Mutex<VecDeque<f32>>,
+    /// Ring of the raw, pre-DSP demodulated samples (normalized to [-1,1]) of the
+    /// active stream, for the raw-vs-filtered overlay in the FFT window.
+    fft_raw: Mutex<VecDeque<f32>>,
 }
 
 impl Shared {
@@ -249,8 +267,10 @@ impl Shared {
             notch_on: AtomicBool::new(toggles.notch),
             denoise_on: AtomicBool::new(toggles.denoise),
             lpf_on: AtomicBool::new(toggles.lpf),
+            dfn_on: AtomicBool::new(toggles.dfn),
             fft_open: AtomicBool::new(false),
             fft_samples: Mutex::new(VecDeque::with_capacity(FFT_RING)),
+            fft_raw: Mutex::new(VecDeque::with_capacity(FFT_RING)),
         }
     }
 }
@@ -263,6 +283,7 @@ struct Toggles {
     notch: bool,
     denoise: bool,
     lpf: bool,
+    dfn: bool,
 }
 
 /// Per-sample DSP toggle snapshot handed to [`ChannelDsp::process`].
@@ -332,6 +353,49 @@ fn push_fft(shared: &Shared, sample: f32) {
     }
 }
 
+/// Taps one raw (pre-DSP) demodulated sample into the raw-FFT ring.
+fn push_fft_raw(shared: &Shared, sample: f32) {
+    let mut q = shared.fft_raw.lock().unwrap();
+    q.push_back(sample);
+    while q.len() > FFT_RING {
+        q.pop_front();
+    }
+}
+
+/// Applies DeepFilterNet to one played sample when enabled, lazily building the
+/// enhancer (the model load stalls the audio thread once) and resetting it while
+/// the stream is inactive — DFN only runs while the squelch is open. Runs on the
+/// fully-processed (filtered + AGC-leveled) audio so the model sees a healthy,
+/// in-range signal.
+fn apply_dfn(
+    shared: &Shared,
+    dfn: &mut Option<DfnEnhancer>,
+    rate: u32,
+    sample: f32,
+    active: bool,
+) -> f32 {
+    if !shared.dfn_on.load(Ordering::Relaxed) {
+        return sample;
+    }
+    if dfn.is_none() {
+        match DfnEnhancer::new(rate as f64) {
+            Ok(e) => *dfn = Some(e),
+            Err(err) => {
+                eprintln!("DeepFilterNet init failed: {err:#}");
+                shared.dfn_on.store(false, Ordering::Relaxed);
+                return sample;
+            }
+        }
+    }
+    let e = dfn.as_mut().unwrap();
+    if active {
+        e.process_sample(sample)
+    } else {
+        e.reset();
+        sample
+    }
+}
+
 /// An endless rodio source that drains the shared selected-channel queue,
 /// emitting silence on underrun so the sink never stops.
 struct ChannelSource {
@@ -388,9 +452,12 @@ impl ChannelDsp {
         }
     }
 
-    /// Runs one sample through the gated chain, returning normalized audio.
+    /// Runs one sample through the full gated chain (filters -> AGC), returning
+    /// normalized audio. DeepFilterNet (when enabled) runs after this on the
+    /// played stream, so it sees the filtered, AGC-leveled signal.
     fn process(&mut self, sample: i32, open: bool, just_opened: bool, above: bool, opt: ChainOpts) -> f32 {
         if !open {
+            // Keep the AGC tail decaying so it re-seeds cleanly on the next open.
             return if opt.agc {
                 self.agc.process(0.0, false, false, false)
             } else {
@@ -417,11 +484,10 @@ impl ChannelDsp {
             // Learn the noise model from below-threshold (non-speech) samples.
             vn = self.denoise.process(vn, !above);
         }
-        if opt.agc {
-            self.agc.process(vn, true, just_opened, above)
-        } else {
-            vn
+        if !opt.agc {
+            return vn;
         }
+        self.agc.process(vn, true, just_opened, above)
     }
 }
 
@@ -429,8 +495,11 @@ impl ChannelDsp {
 /// state and running the DSP chain (selected channel, or all channels in mix
 /// mode).
 fn reader_loop(shared: Arc<Shared>, addr: String, n: usize, cfg: DspCfg, mix: bool) {
-    // Carrier-squelch: cross-channel noise percentile + recompute cadence.
-    const CARRIER_NOISE_PCT: f32 = 0.75;
+    // Carrier-squelch: cross-channel noise percentile + recompute cadence. The
+    // median (0.5) is used rather than a high percentile because at useful gain
+    // several channels are elevated by the conducted comb, which would inflate a
+    // 75th-percentile "noise" reference and push the threshold above real traffic.
+    const CARRIER_NOISE_PCT: f32 = 0.5;
     const CARRIER_UPDATE_FRAMES: u64 = 8192;
     let carrier_mode = matches!(cfg.squelch_mode, SquelchMode::Carrier { .. });
     let carrier_snr_ratio = match cfg.squelch_mode {
@@ -460,11 +529,21 @@ fn reader_loop(shared: Arc<Shared>, addr: String, n: usize, cfg: DspCfg, mix: bo
         })
         .collect();
     let mut dsps: Vec<ChannelDsp> = (0..n).map(|_| ChannelDsp::new(&cfg)).collect();
+    // Dedicated 300-3400 Hz voice band-pass per channel, used only to derive the
+    // VOX squelch level from voice-band modulation energy. This keeps the squelch
+    // decision independent of the playback filter toggles and excludes the
+    // out-of-voice-band conducted comb and low-frequency rumble.
+    let mut sq_filters: Vec<VoiceFilter> =
+        (0..n).map(|_| VoiceFilter::new(cfg.rate as f64, 300.0, 3400.0)).collect();
 
     // Mix-mode accumulator: one contribution per channel, summed and emitted
     // once per audio tick (detected when the channel index wraps to a lower one).
     let mut mix_buf = vec![0f32; n];
+    let mut raw_mix_buf = vec![0f32; n];
     let mut prev_chan: Option<usize> = None;
+    // DeepFilterNet enhancer (lazy: built on first enable) plus its input leveler.
+    // One instance on the played stream, not per channel.
+    let mut dfn: Option<DfnEnhancer> = None;
 
     while shared.running.load(Ordering::Relaxed) {
         match TcpStream::connect(&addr) {
@@ -518,12 +597,14 @@ fn reader_loop(shared: Arc<Shared>, addr: String, n: usize, cfg: DspCfg, mix: bo
 
                     let mag = sample.unsigned_abs() as f32;
                     atomic_max_f32(&shared.peak[chan], mag);
+                    // Voice-band magnitude for VOX squelch (excludes comb/rumble).
+                    let sq_mag = sq_filters[chan].process(sample as f64).abs() as f32;
 
-                    // Carrier mode keys the squelch on the FPGA carrier level;
-                    // all other modes key on the audio magnitude.
+                    // Carrier mode keys the squelch on the FPGA carrier level; all
+                    // other modes key on voice-band modulation energy (VOX).
                     let sq_level = match cfg.squelch_mode {
                         SquelchMode::Carrier { .. } => decode_carrier(carrier),
-                        _ => mag,
+                        _ => sq_mag,
                     };
                     // Squelch runs on every channel so the meter shows activity.
                     let sq = &mut squelches[chan];
@@ -538,13 +619,13 @@ fn reader_loop(shared: Arc<Shared>, addr: String, n: usize, cfg: DspCfg, mix: bo
                     let lpf_on = shared.lpf_on.load(Ordering::Relaxed);
                     let open = !squelch_on || sq.is_open();
                     let just_opened = squelch_on && sq.just_opened();
-                    // Speech-present flag is always audio-energy based.
+                    // Speech-present flag is always voice-band modulation based.
                     let above = match audio_gates[chan].as_mut() {
                         Some(g) => {
-                            g.process(mag);
-                            mag >= g.threshold()
+                            g.process(sq_mag);
+                            sq_mag >= g.threshold()
                         }
-                        None => mag >= sq.threshold(),
+                        None => sq_mag >= sq.threshold(),
                     };
                     let opt = ChainOpts {
                         filter: filter_on,
@@ -559,12 +640,19 @@ fn reader_loop(shared: Arc<Shared>, addr: String, n: usize, cfg: DspCfg, mix: bo
                         if let Some(p) = prev_chan {
                             if chan <= p {
                                 let s: f32 = mix_buf.iter().sum::<f32>().clamp(-1.0, 1.0);
+                                let raw_s: f32 = raw_mix_buf.iter().sum::<f32>().clamp(-1.0, 1.0);
+                                let any_open =
+                                    (0..n).any(|c| shared.sq_open[c].load(Ordering::Relaxed));
+                                let s = apply_dfn(&shared, &mut dfn, cfg.rate, s, any_open);
                                 push_audio(&shared, s);
                                 push_fft(&shared, s);
+                                push_fft_raw(&shared, raw_s);
                                 mix_buf.iter_mut().for_each(|x| *x = 0.0);
+                                raw_mix_buf.iter_mut().for_each(|x| *x = 0.0);
                             }
                         }
                         mix_buf[chan] = dsps[chan].process(sample, open, just_opened, above, opt);
+                        raw_mix_buf[chan] = sample as f32 / SAMPLE_SCALE as f32;
                         prev_chan = Some(chan);
                         continue;
                     }
@@ -574,9 +662,14 @@ fn reader_loop(shared: Arc<Shared>, addr: String, n: usize, cfg: DspCfg, mix: bo
                         continue;
                     }
                     shared.sel_state.store(state_code(st), Ordering::Relaxed);
+                    // Chain: filters -> DFN -> AGC. DFN runs on the pre-AGC signal
+                    // so it denoises before the makeup gain (avoids garbling quiet
+                    // speech that the AGC would otherwise pump up first).
                     let out = dsps[chan].process(sample, open, just_opened, above, opt);
+                    let out = apply_dfn(&shared, &mut dfn, cfg.rate, out, open);
                     push_audio(&shared, out);
                     push_fft(&shared, out);
+                    push_fft_raw(&shared, sample as f32 / SAMPLE_SCALE as f32);
                 }
                 shared.connected.store(false, Ordering::Relaxed);
             }
@@ -614,36 +707,76 @@ fn select_channel(shared: &Shared, ch: usize) {
     shared.audio.lock().unwrap().clear();
 }
 
-fn render(shared: &Shared, n: usize, gain: f32, muted: bool, monitor: Monitor, entry: &str) -> Result<()> {
+/// Builds a per-channel ignore mask from CLI indices (out-of-range entries are dropped).
+fn ignore_mask(n: usize, indices: &[usize]) -> Vec<bool> {
+    let mut mask = vec![false; n];
+    for &ch in indices {
+        if ch < n {
+            mask[ch] = true;
+        }
+    }
+    mask
+}
+
+/// First non-ignored channel whose squelch is open, scanning round-robin from
+/// `start` (inclusive).
+fn first_open_channel(start: usize, n: usize, shared: &Shared, ignore: &[bool]) -> Option<usize> {
+    for off in 0..n {
+        let c = (start + off) % n;
+        if ignore.get(c).copied().unwrap_or(false) {
+            continue;
+        }
+        if shared.sq_open[c].load(Ordering::Relaxed) {
+            return Some(c);
+        }
+    }
+    None
+}
+
+fn render(
+    shared: &Shared,
+    n: usize,
+    gain: f32,
+    muted: bool,
+    monitor: Monitor,
+    ignore: &[bool],
+    entry: &str,
+) -> Result<()> {
     let sel = shared.selected.load(Ordering::Relaxed);
     let connected = shared.connected.load(Ordering::Relaxed);
     let records = shared.records.load(Ordering::Relaxed);
     let mut out = stdout();
     queue!(out, cursor::MoveTo(0, 0), Clear(ClearType::All))?;
 
+    // Fixed-width fields so the header doesn't shift as squelch/volume/mode change.
     let status = if connected { "connected" } else { "connecting…" };
+    let status = format!("{status:<11}");
     let mode = match monitor {
         Monitor::Single => "single",
         Monitor::Follow => "FOLLOW",
         Monitor::Mix => "MIX",
     };
+    let mode = format!("{mode:<6}");
     let vol = if muted {
         "MUTED".to_string()
     } else {
         format!("vol x{gain:.1}")
     };
+    let vol = format!("{vol:<12}");
     let sq = if shared.squelch_on.load(Ordering::Relaxed) {
         state_label(shared.sel_state.load(Ordering::Relaxed))
     } else {
         "SQ off"
     };
+    let sq = format!("{sq:<7}");
     let flags = format!(
-        "{} {} {} {} {} {}",
+        "{} {} {} {} {} {} {}",
         if shared.agc_on.load(Ordering::Relaxed) { "AGC" } else { "agc" },
         if shared.filter_on.load(Ordering::Relaxed) { "BPF" } else { "bpf" },
         if shared.notch_on.load(Ordering::Relaxed) { "NOTCH" } else { "notch" },
         if shared.denoise_on.load(Ordering::Relaxed) { "NR" } else { "nr" },
         if shared.lpf_on.load(Ordering::Relaxed) { "LPF" } else { "lpf" },
+        if shared.dfn_on.load(Ordering::Relaxed) { "DFN" } else { "dfn" },
         if shared.fft_open.load(Ordering::Relaxed) { "FFT" } else { "fft" },
     );
     queue!(
@@ -653,8 +786,21 @@ fn render(shared: &Shared, n: usize, gain: f32, muted: bool, monitor: Monitor, e
             "Pluto airband live listener — {status} — {vol} — sq:{sq} — {flags} — {mode} — {records} recs\r\n"
         )),
         ResetColor,
-        Print("↑/↓ select  0-9+Enter jump  +/- vol  m mute  s squelch  a agc  f bpf  n notch  d nr  l lpf  g fft  F follow  q quit\r\n\r\n"),
+        Print("↑/↓ select  0-9+Enter jump  +/- vol  m mute  s squelch  a agc  f bpf  n notch  d nr  l lpf  D dfn  g fft  F follow  q quit\r\n"),
     )?;
+    if monitor == Monitor::Follow {
+        let skipped: Vec<String> = (0..n)
+            .filter(|&c| ignore.get(c).copied().unwrap_or(false))
+            .map(|c| c.to_string())
+            .collect();
+        if !skipped.is_empty() {
+            queue!(
+                out,
+                Print(format!("follow: ignoring ch {}\r\n", skipped.join(", "))),
+            )?;
+        }
+    }
+    queue!(out, Print("\r\n"))?;
 
     // Carrier metering: each channel's FPGA carrier level in dB over the
     // cross-channel noise reference. Idle channels sit ~0 dB; a keyed station
@@ -669,7 +815,9 @@ fn render(shared: &Shared, n: usize, gain: f32, muted: bool, monitor: Monitor, e
         let bars = (frac * 24.0).round() as usize;
         let meter: String = "#".repeat(bars) + &"·".repeat(24 - bars);
         let marker = if ch == sel { "▶" } else { " " };
-        let active = if shared.sq_open[ch].load(Ordering::Relaxed) {
+        let active = if ignore.get(ch).copied().unwrap_or(false) {
+            "−"
+        } else if shared.sq_open[ch].load(Ordering::Relaxed) {
             "●"
         } else {
             " "
@@ -719,13 +867,18 @@ fn main() -> Result<()> {
         },
     };
     let agc_on = !args.no_agc;
+    // DFN-centric default chain: every host filter (band-pass, LPF, notch,
+    // spectral denoise) starts OFF and DeepFilterNet starts ON, so DFN does the
+    // cleanup in isolation. Each is still runtime-toggleable (f / l / n / d / D);
+    // AGC is leveling (gain), not a filter, so it follows --no-agc as before.
     let toggles = Toggles {
-        filter: !args.no_filter,
+        filter: false,
         squelch: !matches!(args.squelch, SquelchArg::Off),
         agc: agc_on,
-        notch: args.notch.is_some(),
-        denoise: !args.no_denoise,
-        lpf: args.lpf_hz > 0.0,
+        notch: false,
+        denoise: false,
+        lpf: false,
+        dfn: true,
     };
     let cfg = DspCfg {
         rate: args.rate,
@@ -769,14 +922,16 @@ fn main() -> Result<()> {
 
     // Terminal control UI on a background thread; the FFT GUI event loop must
     // own the main thread (macOS requires native windows on the main thread).
+    let ignore = ignore_mask(n, &args.ignore_channels);
     let term = {
         let shared = Arc::clone(&shared);
         let sink = Arc::clone(&sink);
         let monitor = args.monitor;
         let follow_hang_ms = args.follow_hang_ms;
+        let ignore = ignore.clone();
         thread::spawn(move || {
             let s = Arc::clone(&shared);
-            if let Err(e) = run_terminal(shared, sink, n, monitor, follow_hang_ms, gain) {
+            if let Err(e) = run_terminal(shared, sink, n, monitor, follow_hang_ms, ignore, gain) {
                 eprintln!("terminal UI error: {e:#}");
             }
             s.running.store(false, Ordering::Relaxed);
@@ -800,6 +955,7 @@ fn run_terminal(
     n: usize,
     mut monitor: Monitor,
     follow_hang_ms: u64,
+    ignore: Vec<bool>,
     mut gain: f32,
 ) -> Result<()> {
     let mut muted = false;
@@ -812,25 +968,30 @@ fn run_terminal(
 
     let mut entry = String::new();
     while shared.running.load(Ordering::Relaxed) {
-        // Scanner: stay on an active channel; after it goes idle for `hang`,
-        // hop (round-robin) to the next channel whose squelch is open.
+        // Scanner: stay on the current (non-ignored) channel while it's active;
+        // jump immediately to any other channel that breaks squelch; once the
+        // current channel goes idle for `hang`, rescan (bridges speech gaps).
         if monitor == Monitor::Follow {
             let sel = shared.selected.load(Ordering::Relaxed);
-            if shared.sq_open[sel].load(Ordering::Relaxed) {
+            let sel_ignored = ignore.get(sel).copied().unwrap_or(false);
+            let cur_open = !sel_ignored && shared.sq_open[sel].load(Ordering::Relaxed);
+
+            if cur_open {
+                follow_idle = Instant::now();
+            } else if let Some(c) = first_open_channel((sel + 1) % n, n, &shared, &ignore) {
+                // Another channel is active — switch right away (don't wait for hang).
+                select_channel(&shared, c);
                 follow_idle = Instant::now();
             } else if follow_idle.elapsed() >= hang {
-                for off in 1..=n {
-                    let c = (sel + off) % n;
-                    if shared.sq_open[c].load(Ordering::Relaxed) {
-                        select_channel(&shared, c);
-                        follow_idle = Instant::now();
-                        break;
-                    }
+                // Hang expired on an idle channel; rescan from the current position.
+                if let Some(c) = first_open_channel(sel, n, &shared, &ignore) {
+                    select_channel(&shared, c);
                 }
+                follow_idle = Instant::now();
             }
         }
 
-        render(&shared, n, gain, muted, monitor, &entry)?;
+        render(&shared, n, gain, muted, monitor, &ignore, &entry)?;
 
         if event::poll(Duration::from_millis(100))? {
             if let Event::Key(k) = event::read()? {
@@ -909,6 +1070,10 @@ fn run_terminal(
                         let now = !shared.fft_open.load(Ordering::Relaxed);
                         shared.fft_open.store(now, Ordering::Relaxed);
                     }
+                    KeyCode::Char('D') => {
+                        let now = !shared.dfn_on.load(Ordering::Relaxed);
+                        shared.dfn_on.store(now, Ordering::Relaxed);
+                    }
                     KeyCode::Char('F') => {
                         // Toggle scanner; mix is fixed at startup (reader-side).
                         monitor = match monitor {
@@ -917,6 +1082,11 @@ fn run_terminal(
                             Monitor::Mix => Monitor::Mix,
                         };
                         follow_idle = Instant::now();
+                        if monitor == Monitor::Follow {
+                            if let Some(c) = first_open_channel(0, n, &shared, &ignore) {
+                                select_channel(&shared, c);
+                            }
+                        }
                     }
                     _ => {}
                 }
@@ -983,26 +1153,35 @@ impl FftApp {
         }
     }
 
+    /// Snapshots a ring buffer into a Vec (empty if it has < one FFT segment).
+    fn snapshot(ring: &Mutex<VecDeque<f32>>) -> Vec<f32> {
+        let q = ring.lock().unwrap();
+        if q.len() < WELCH_NSEG {
+            return Vec::new();
+        }
+        q.iter().copied().collect()
+    }
+
     /// Welch PSD: average the periodograms of 50%-overlapping Hann-windowed
-    /// segments over the sample ring, returned as single-sided [freq_Hz, dB]
-    /// points. Averaging reduces variance so the trace (and thus the locked Y
-    /// axis) is steady enough to read.
-    fn spectrum(&mut self) -> Vec<[f64; 2]> {
-        let samples: Vec<f32> = {
-            let q = self.shared.fft_samples.lock().unwrap();
-            if q.len() < WELCH_NSEG {
-                return Vec::new();
-            }
-            q.iter().copied().collect()
-        };
+    /// segments of `samples`, returned as single-sided [freq_Hz, dB] points.
+    /// Averaging reduces variance so the trace (and thus the locked Y axis) is
+    /// steady enough to read.
+    fn spectrum(&mut self, samples: &[f32]) -> Vec<[f64; 2]> {
+        if samples.len() < WELCH_NSEG {
+            return Vec::new();
+        }
         let nbins = WELCH_NSEG / 2;
         let hop = WELCH_NSEG / 2;
+        // Remove DC before windowing: the raw AM-envelope tap carries a large
+        // carrier/DC term that otherwise dominates bin 0, swamps the audio bins,
+        // and skews the auto-fit — making the raw trace unreadable.
+        let mean = samples.iter().sum::<f32>() / samples.len() as f32;
         let mut psd = vec![0f32; nbins];
         let mut segs = 0u32;
         let mut start = 0;
         while start + WELCH_NSEG <= samples.len() {
             for i in 0..WELCH_NSEG {
-                self.buf[i] = Complex32::new(samples[start + i] * self.window[i], 0.0);
+                self.buf[i] = Complex32::new((samples[start + i] - mean) * self.window[i], 0.0);
             }
             self.fft
                 .process_with_scratch(&mut self.buf, &mut self.scratch);
@@ -1052,16 +1231,20 @@ impl eframe::App for FftApp {
         if !self.shared.fft_open.load(Ordering::Relaxed) {
             return;
         }
-        let pts = self.spectrum();
+        let raw_samples = Self::snapshot(&self.shared.fft_raw);
+        let filt_samples = Self::snapshot(&self.shared.fft_samples);
+        let raw_pts = self.spectrum(&raw_samples);
+        let filt_pts = self.spectrum(&filt_samples);
         let sel = self.shared.selected.load(Ordering::Relaxed);
         let mhz = FREQS_MHZ.get(sel).copied().unwrap_or(0.0);
         ui.label(format!(
-            "ch {sel} ({mhz:.3} MHz) — post-DSP audio, Welch {WELCH_NSEG}-pt Hann, {:.0} sps. Hover to read freq/dB; drag/scroll to adjust, double-click to reset.",
+            "ch {sel} ({mhz:.3} MHz) — raw (pre-DSP) vs filtered (post-DSP), Welch {WELCH_NSEG}-pt Hann, {:.0} sps. Hover to read freq/dB; drag/scroll to adjust, double-click to reset.",
             self.rate
         ));
         Plot::new("fft_plot")
             .x_axis_label("frequency (Hz)")
             .y_axis_label("magnitude (dBFS)")
+            .legend(egui_plot::Legend::default())
             .coordinates_formatter(Corner::RightBottom, CoordinatesFormatter::default())
             // Lock the Y axis (no per-frame autoscale jumping); X auto-fits the
             // constant 0..Fs/2 range. The user can still drag/scroll to change Y,
@@ -1069,8 +1252,11 @@ impl eframe::App for FftApp {
             .auto_bounds(egui::Vec2b::new(true, false))
             .default_y_bounds(-120.0, 0.0)
             .show(ui, |pu| {
-                if !pts.is_empty() {
-                    pu.line(Line::new("spectrum", PlotPoints::from(pts)));
+                if !raw_pts.is_empty() {
+                    pu.line(Line::new("raw (pre-DSP)", PlotPoints::from(raw_pts)));
+                }
+                if !filt_pts.is_empty() {
+                    pu.line(Line::new("filtered (post-DSP)", PlotPoints::from(filt_pts)));
                 }
             });
     }

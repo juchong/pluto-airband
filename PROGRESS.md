@@ -1045,6 +1045,39 @@ Captures via `airband-reader` (minimal-DSP: `--squelch off --no-agc --no-filter
   the GUI event loop on the main thread, so the terminal UI moved to a worker thread.
   Deps added: `eframe 0.34`, `egui_plot 0.35`, `rustfft`.
 
+### DeepFilterNet enhancer + VOX squelch + scanner mode (2026-06-26)
+- **DeepFilterNet (DFN3) integrated as a toggleable enhancer (`D` key).** New
+  `host/airband-listen/src/dfn.rs` wraps `deep_filter`'s `DfTract` (embedded
+  default model) with streaming linear resamplers (21875 ↔ 48000 sps) and a ~2-hop
+  priming cushion. It runs on the **played stream only**, **after** the per-channel
+  filter + AGC chain, and **only while the squelch is open** (NN inference is
+  expensive; `reset()` on close). Deps: `deep_filter` git-pinned (`d375b2d8`, features
+  `tract,default-model,transforms`) + `ndarray 0.15`; all `tract-*` pinned to `0.21.4`
+  in `Cargo.lock` (newer renames `symbol_table`→`symbols` and breaks `libDF`). The
+  `0.21.4` model trips a debug-only codegen dedup bug, so the load test is
+  `#[cfg_attr(debug_assertions, ignore)]` — it passes under `cargo test --release`,
+  the profile the listener ships in.
+- **Default chain is now DFN-centric:** VOX squelch + AGC + DFN on; band-pass, 2.5
+  kHz LPF, notch, and spectral denoise start **off** (all still toggleable f/l/n/d).
+- **Squelch reverted to audio VOX** (`--squelch auto` default). Carrier-level squelch
+  is fragile: the conducted comb gives each channel a different idle carrier baseline,
+  so a global threshold either never opens or false-opens. VOX keys on in-band voice
+  modulation and is immune to those offsets. The carrier metric is retained purely as
+  the **activity meter** readout (`dB·c`), not as the squelch.
+- **Follow (scanner) mode + ignore list.** `--monitor follow` (or `F`) auto-jumps to
+  any channel that breaks squelch; `--ignore-channel 0,5,11` skips channels that
+  false-trigger. Idle channels release immediately when another is active, else after
+  `--follow-hang-ms`.
+- **UI fixes:** the status bar now shows the **DFN** flag, and the header fields
+  (squelch state / volume / status / mode) are fixed-width so the bar no longer jumps
+  left/right as the squelch opens and closes. The raw-FFT overlay subtracts its DC
+  mean before windowing so the trace is readable.
+- **Audio-quality note (DFN placement):** DFN belongs **after** the AGC (it then sees
+  a ~−3.5 dBFS, in-range signal → effective suppression). Running it *before* the AGC
+  starves it (raw demod ≈ −60 dBFS → no suppression); a slow input leveler to fix that
+  instead pumped the inter-word noise floor to full scale (loud hiss). Both were tried
+  and reverted; DFN-after-AGC is the shipped arrangement.
+
 ## Next steps
 - **Buzz spurs are characterized** (see "Buzz spur taxonomy", 2026-06-24): the
   dominant 126.000 MHz tooth is the AD9361 sample-clock 9th harmonic (9×14 MHz), plus
