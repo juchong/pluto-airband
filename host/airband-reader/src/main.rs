@@ -36,7 +36,7 @@ mod icecast;
 mod metrics;
 
 use airband_dsp::{
-    carrier_noise_threshold, decode_carrier, level_to_dbfs, Agc, Denoise, Notch, Squelch,
+    carrier_noise_threshold, decode_carrier, level_to_dbfs, Agc, Denoise, LowPass, Notch, Squelch,
     SquelchConfig, SquelchMode, VoiceFilter, SAMPLE_SCALE,
 };
 
@@ -143,8 +143,12 @@ struct Args {
     #[arg(long, default_value_t = 300.0)]
     filter_low: f64,
     /// Voice band-pass high corner in Hz (low-pass)
-    #[arg(long, default_value_t = 7000.0)]
+    #[arg(long, default_value_t = 3400.0)]
     filter_high: f64,
+    /// Standalone low-pass -3 dB cutoff in Hz, applied after the band-pass
+    /// (a distinct LPF stage; 0 = off)
+    #[arg(long, default_value_t = 2500.0)]
+    lpf_hz: f64,
     /// Notch (band-stop) center frequency in Hz to kill a tonal spur (off if unset).
     #[arg(long)]
     notch: Option<f64>,
@@ -230,6 +234,7 @@ struct Config {
     notch_q: f64,
     low: f64,
     high: f64,
+    lpf_hz: f64,
 }
 
 /// Buffered UDP PCM sink: little-endian s16 datagrams of ~512 samples.
@@ -408,6 +413,7 @@ struct Channel {
     /// carrier, whose units don't match the audio sample magnitude.
     audio_gate: Option<Squelch>,
     vf: VoiceFilter,
+    lpf: Option<LowPass>,
     notch: Option<Notch>,
     denoise: Denoise,
     agc: Agc,
@@ -444,6 +450,7 @@ impl Channel {
                 _ => None,
             },
             vf: VoiceFilter::new(cfg.rate as f64, cfg.low, cfg.high),
+            lpf: (cfg.lpf_hz > 0.0).then(|| LowPass::new(cfg.rate as f64, cfg.lpf_hz)),
             notch: cfg
                 .notch_freq
                 .map(|f| Notch::new(f, cfg.rate as f64, cfg.notch_q)),
@@ -476,6 +483,10 @@ impl Channel {
         let mut v = sample as f64;
         if cfg.filter_on {
             v = self.vf.process(v);
+        }
+        // Distinct standalone LPF stage (independent of the band-pass).
+        if let Some(lp) = self.lpf.as_mut() {
+            v = lp.process(v);
         }
         if cfg.notch_freq.is_some() {
             if let Some(n) = self.notch.as_mut() {
@@ -727,12 +738,13 @@ fn main() -> Result<()> {
         min_samples: (args.min_transmission_ms * args.rate as u64) / 1000,
         agc_on: !args.no_agc,
         filter_on: !args.no_filter,
-        denoise_on: false,
+        denoise_on: !args.no_denoise,
         denoise_floor_db: args.denoise_floor_db,
         notch_freq: args.notch,
         notch_q: args.notch_q,
         low: args.filter_low,
         high: args.filter_high,
+        lpf_hz: args.lpf_hz,
     };
 
     if cfg.mode != Mode::Stats {

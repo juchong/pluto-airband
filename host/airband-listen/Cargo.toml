@@ -14,4 +14,7 @@ airband-dsp = { path = "../airband-dsp" }
 anyhow = "1.0"
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.28"
+eframe = "0.34"
+egui_plot = "0.35"
 rodio = { version = "0.19", default-features = false }
+rustfft = "6.4.1"

@@ -999,6 +999,52 @@ the 0.2 s buffer + retry loop caused.
   `band_antenna-lna-nonotch_gain{0,25}_2026-06-25.png` (the `lna` labels predate the
   amp removal), `band_antenna-notch-lna_gain0_2026-06-25.png`.
 
+### Gain 0 → 12 dB: receiver is internal-noise/quantization-limited (2026-06-25, supersedes the 48→0 entry)
+A controlled investigation on the Pluto+ (`10.0.16.100`, GbE) with the external LNA
+(ZFL-500LN+, 16 V → ~29 dB) corrected the earlier "minimum internal gain" stance.
+Captures via `airband-reader` (minimal-DSP: `--squelch off --no-agc --no-filter
+--no-denoise`) + `firmware/diagnostics/analyze_ch_audio.py` / `ab_audio_chains.py`.
+- **The receiver is internal-noise-limited, not antenna/thermal-limited.** ch11 idle
+  audio floor: antenna+LNA **−92.9 dBFS** vs **50 Ω load+LNA −93.3 dBFS** (Δ0.4 dB) —
+  identical. And +6 dB internal gain raised the floor only **+1.1 dB** (not +6). So the
+  audio floor is **ADC quantization + the conducted comb**, downstream of the gain; a
+  quieter antenna/site cannot lower it. Plot: `audio_floor_antenna_vs_term_2026-06-25.png`,
+  `audio_floor_g0_vs_g6_2026-06-25.png`.
+- **At 0 dB the wanted signal is *at* the quantization floor.** Controlled gain sweep
+  on the continuous 118.050 AWOS carrier (carrier-over-noise, same signal throughout,
+  `awos_snr_vs_gain_2026-06-25.png`): audio SNR **~1 dB @0 dB → ~10 @6 → ~12 @12**, then
+  a plateau through 42 dB. The earlier 0 dB default literally buried voice in the noise
+  ("none of the dBFS readouts are useful because everything is in the noise"). ADC clip
+  at 12 dB = **0 %, ~7 dB headroom** (with the LNA).
+- **Default gain 0 → 12 dB** (built-in `AirbandConfig::default` in the fork +
+  `firmware/airband.json`), tuned for the external LNA. The LNA still matters (low
+  system NF; lets the internal gain — the dominant comb/noise generator — run lower)
+  but does **not** replace the ~12 dB internal gain. History: 71 → 48 (clip knee) → 0
+  (quantization-starved) → **12**. Bare front end (no LNA): raise toward 48 dB.
+- **Biggest remaining audio-quality lever is front-end dynamic range:** a SAW airband
+  (118–137 MHz) band-pass + low-NF LNA so strong out-of-band signals don't starve the
+  12-bit ADC. Host DSP and a quiet site cannot add SNR here.
+
+### Host audio chain + airband-listen debugging tools (2026-06-25)
+- **Carrier metric is the real signal indicator.** The demod audio is ~0 (1–2 LSB,
+  ≈ −130 dBFS) until modulation rides up, so audio dBFS meters are useless on weak AM.
+  The per-channel carrier byte (frame bits [31:24]) is populated on all 21 ch and
+  discriminates (118.050 AWOS ≈ +21 dB over the no-carrier baseline). `airband-listen`
+  now **defaults to `--squelch carrier`** and its **meter shows carrier level in dB over
+  the cross-channel noise reference** (`dB·c`); idle ≈ 0, a keyed station reads positive.
+- **Voice band tightened, hiss reduced (evidence-based).** On-air ch0/ch11 FFTs show
+  airband AM voice has no usable energy above ~3.4 kHz. Host changes: band-pass kept at
+  **300–3400 Hz**, the earlier **de-droop high-shelf removed** (it boosted HF hiss),
+  **denoise on by default** (idle hiss −17 dB), and a **standalone 2.5 kHz low-pass**
+  (`LowPass` in `airband-dsp`, `--lpf-hz`, default 2500) toggled independently with the
+  **`l`** key. Plots: `audio_ch11-122975_*`, `audio_hiss_chains_ch11_*`, `fft_ch0_*`.
+- **Live FFT GUI in `airband-listen` (`g` key).** A native egui/egui_plot window shows
+  a **Welch** PSD (2048-pt Hann, ~7 averaged segments) of the active post-DSP audio,
+  with a hover crosshair reading frequency + magnitude and a **locked Y axis** (no
+  per-frame autoscale; drag/scroll still adjusts, double-click resets). macOS requires
+  the GUI event loop on the main thread, so the terminal UI moved to a worker thread.
+  Deps added: `eframe 0.34`, `egui_plot 0.35`, `rustfft`.
+
 ## Next steps
 - **Buzz spurs are characterized** (see "Buzz spur taxonomy", 2026-06-24): the
   dominant 126.000 MHz tooth is the AD9361 sample-clock 9th harmonic (9×14 MHz), plus

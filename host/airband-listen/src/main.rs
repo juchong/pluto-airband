@@ -36,7 +36,7 @@
 //!   q                   quit
 
 use airband_dsp::{
-    carrier_noise_threshold, decode_carrier, level_to_dbfs, Agc, Denoise, Notch, Squelch,
+    carrier_noise_threshold, decode_carrier, Agc, Denoise, LowPass, Notch, Squelch,
     SquelchConfig, SquelchMode, SquelchState, VoiceFilter, SAMPLE_SCALE,
 };
 use anyhow::{Context, Result};
@@ -48,7 +48,10 @@ use crossterm::{
     style::{Color, Print, ResetColor, SetForegroundColor},
     terminal::{self, Clear, ClearType},
 };
+use eframe::egui;
+use egui_plot::{CoordinatesFormatter, Corner, Line, Plot, PlotPoints};
 use rodio::{OutputStream, Sink, Source};
+use rustfft::{num_complex::Complex32, Fft, FftPlanner};
 use std::{
     collections::VecDeque,
     io::{stdout, BufReader, Read, Write},
@@ -121,8 +124,11 @@ struct Args {
     /// already normalized) or 25000 with --no-agc (raw airband audio is quiet).
     #[arg(long)]
     gain: Option<f32>,
-    /// Squelch mode: off, auto (noise-floor tracking), or manual (fixed dBFS).
-    #[arg(long, value_enum, default_value_t = SquelchArg::Auto)]
+    /// Squelch mode: carrier (cross-channel carrier power, default), off, auto
+    /// (audio-energy noise-floor tracking), or manual (fixed dBFS). Carrier is the
+    /// reliable choice for weak AM: the audio is ~0 until modulation rides up, so
+    /// the FPGA per-channel carrier level is the real signal-present metric.
+    #[arg(long, value_enum, default_value_t = SquelchArg::Carrier)]
     squelch: SquelchArg,
     /// Automatic-squelch open threshold, in dB of SNR above the noise floor.
     #[arg(long, default_value_t = 9.0)]
@@ -150,8 +156,12 @@ struct Args {
     #[arg(long, default_value_t = 300.0)]
     filter_low: f64,
     /// Voice band-pass high corner in Hz (low-pass)
-    #[arg(long, default_value_t = 7000.0)]
+    #[arg(long, default_value_t = 3400.0)]
     filter_high: f64,
+    /// Standalone low-pass -3 dB cutoff in Hz, applied after the band-pass
+    /// (a distinct LPF stage; 0 = off)
+    #[arg(long, default_value_t = 2500.0)]
+    lpf_hz: f64,
     /// Notch (band-stop) center frequency in Hz to kill a tonal spur (off if unset).
     #[arg(long)]
     notch: Option<f64>,
@@ -172,6 +182,7 @@ struct DspCfg {
     rate: u32,
     low: f64,
     high: f64,
+    lpf_hz: f64,
     squelch_mode: SquelchMode,
     squelch_hang_ms: f32,
     notch_freq: Option<f64>,
@@ -188,6 +199,12 @@ struct Shared {
     audio: Mutex<VecDeque<f32>>,
     /// Per-channel peak magnitude in raw 24-bit units (f32 bits), reset each frame.
     peak: Vec<AtomicU32>,
+    /// Per-channel latest decoded carrier level (f32 bits) — the meter metric.
+    carrier: Vec<AtomicU32>,
+    /// Cross-channel carrier noise reference (75th pct, f32 bits); meter shows
+    /// each channel's carrier in dB over this, so idle ~ 0 dB and a keyed station
+    /// reads positive regardless of how quiet the demod audio is.
+    carrier_noise: AtomicU32,
     /// Per-channel cumulative dropped-sample count (from the seq counter).
     drops: Vec<AtomicU64>,
     /// Per-channel squelch-open flag (for the activity indicator).
@@ -203,6 +220,12 @@ struct Shared {
     agc_on: AtomicBool,
     notch_on: AtomicBool,
     denoise_on: AtomicBool,
+    lpf_on: AtomicBool,
+    /// Toggle: live FFT GUI window visible.
+    fft_open: AtomicBool,
+    /// Ring of the most recent played (post-DSP) samples of the active stream,
+    /// consumed by the live FFT window.
+    fft_samples: Mutex<VecDeque<f32>>,
 }
 
 impl Shared {
@@ -213,6 +236,8 @@ impl Shared {
             connected: AtomicBool::new(false),
             audio: Mutex::new(VecDeque::with_capacity(max_queue)),
             peak: (0..channels).map(|_| AtomicU32::new(0)).collect(),
+            carrier: (0..channels).map(|_| AtomicU32::new(0)).collect(),
+            carrier_noise: AtomicU32::new(0f32.to_bits()),
             drops: (0..channels).map(|_| AtomicU64::new(0)).collect(),
             sq_open: (0..channels).map(|_| AtomicBool::new(false)).collect(),
             sel_state: AtomicU8::new(0),
@@ -223,6 +248,9 @@ impl Shared {
             agc_on: AtomicBool::new(toggles.agc),
             notch_on: AtomicBool::new(toggles.notch),
             denoise_on: AtomicBool::new(toggles.denoise),
+            lpf_on: AtomicBool::new(toggles.lpf),
+            fft_open: AtomicBool::new(false),
+            fft_samples: Mutex::new(VecDeque::with_capacity(FFT_RING)),
         }
     }
 }
@@ -234,6 +262,7 @@ struct Toggles {
     agc: bool,
     notch: bool,
     denoise: bool,
+    lpf: bool,
 }
 
 /// Per-sample DSP toggle snapshot handed to [`ChannelDsp::process`].
@@ -243,6 +272,7 @@ struct ChainOpts {
     notch: bool,
     agc: bool,
     denoise: bool,
+    lpf: bool,
 }
 
 fn state_code(s: SquelchState) -> u8 {
@@ -288,6 +318,20 @@ fn push_audio(shared: &Shared, sample: f32) {
     }
 }
 
+/// Welch FFT segment length, and the ring of recent samples we average over
+/// (8192 / 2048 with 50% overlap -> ~7 averaged periodograms).
+const WELCH_NSEG: usize = 2048;
+const FFT_RING: usize = 8192;
+
+/// Taps one played (post-DSP) sample into the live-FFT ring.
+fn push_fft(shared: &Shared, sample: f32) {
+    let mut q = shared.fft_samples.lock().unwrap();
+    q.push_back(sample);
+    while q.len() > FFT_RING {
+        q.pop_front();
+    }
+}
+
 /// An endless rodio source that drains the shared selected-channel queue,
 /// emitting silence on underrun so the sink never stops.
 struct ChannelSource {
@@ -322,6 +366,7 @@ impl Source for ChannelSource {
 /// channel so the listener can mix or scan without losing filter/AGC state.
 struct ChannelDsp {
     vf: VoiceFilter,
+    lpf: Option<LowPass>,
     notch: Option<Notch>,
     denoise: Denoise,
     agc: Agc,
@@ -334,6 +379,7 @@ impl ChannelDsp {
     fn new(cfg: &DspCfg) -> ChannelDsp {
         ChannelDsp {
             vf: VoiceFilter::new(cfg.rate as f64, cfg.low, cfg.high),
+            lpf: (cfg.lpf_hz > 0.0).then(|| LowPass::new(cfg.rate as f64, cfg.lpf_hz)),
             notch: cfg
                 .notch_freq
                 .map(|f| Notch::new(f, cfg.rate as f64, cfg.notch_q)),
@@ -354,6 +400,12 @@ impl ChannelDsp {
         let mut v = sample as f64;
         if opt.filter {
             v = self.vf.process(v);
+        }
+        // Distinct standalone LPF stage, toggled independently of the band-pass.
+        if opt.lpf {
+            if let Some(lp) = self.lpf.as_mut() {
+                v = lp.process(v);
+            }
         }
         if opt.notch {
             if let Some(nf) = self.notch.as_mut() {
@@ -436,20 +488,22 @@ fn reader_loop(shared: Arc<Shared>, addr: String, n: usize, cfg: DspCfg, mix: bo
                     if chan >= n {
                         continue;
                     }
-                    if carrier_mode {
-                        last_carrier[chan] = decode_carrier(carrier);
-                        since_carrier_update += 1;
-                        if since_carrier_update >= CARRIER_UPDATE_FRAMES {
-                            let thr = carrier_noise_threshold(
-                                &last_carrier,
-                                CARRIER_NOISE_PCT,
-                                carrier_snr_ratio,
-                            );
+                    // Always track the per-channel carrier (drives the meter) and
+                    // periodically recompute the cross-channel noise reference.
+                    let car = decode_carrier(carrier);
+                    last_carrier[chan] = car;
+                    shared.carrier[chan].store(car.to_bits(), Ordering::Relaxed);
+                    since_carrier_update += 1;
+                    if since_carrier_update >= CARRIER_UPDATE_FRAMES {
+                        let noise = carrier_noise_threshold(&last_carrier, CARRIER_NOISE_PCT, 1.0);
+                        shared.carrier_noise.store(noise.to_bits(), Ordering::Relaxed);
+                        if carrier_mode {
+                            let thr = noise * carrier_snr_ratio;
                             for sq in squelches.iter_mut() {
                                 sq.set_threshold(thr);
                             }
-                            since_carrier_update = 0;
                         }
+                        since_carrier_update = 0;
                     }
                     shared.records.fetch_add(1, Ordering::Relaxed);
 
@@ -481,6 +535,7 @@ fn reader_loop(shared: Arc<Shared>, addr: String, n: usize, cfg: DspCfg, mix: bo
                     let squelch_on = shared.squelch_on.load(Ordering::Relaxed);
                     let agc_on = shared.agc_on.load(Ordering::Relaxed);
                     let denoise_on = shared.denoise_on.load(Ordering::Relaxed);
+                    let lpf_on = shared.lpf_on.load(Ordering::Relaxed);
                     let open = !squelch_on || sq.is_open();
                     let just_opened = squelch_on && sq.just_opened();
                     // Speech-present flag is always audio-energy based.
@@ -496,14 +551,16 @@ fn reader_loop(shared: Arc<Shared>, addr: String, n: usize, cfg: DspCfg, mix: bo
                         notch: notch_on,
                         agc: agc_on,
                         denoise: denoise_on,
+                        lpf: lpf_on,
                     };
 
                     if mix {
                         // Emit the previous tick's sum when the index wraps.
                         if let Some(p) = prev_chan {
                             if chan <= p {
-                                let s: f32 = mix_buf.iter().sum();
-                                push_audio(&shared, s.clamp(-1.0, 1.0));
+                                let s: f32 = mix_buf.iter().sum::<f32>().clamp(-1.0, 1.0);
+                                push_audio(&shared, s);
+                                push_fft(&shared, s);
                                 mix_buf.iter_mut().for_each(|x| *x = 0.0);
                             }
                         }
@@ -519,6 +576,7 @@ fn reader_loop(shared: Arc<Shared>, addr: String, n: usize, cfg: DspCfg, mix: bo
                     shared.sel_state.store(state_code(st), Ordering::Relaxed);
                     let out = dsps[chan].process(sample, open, just_opened, above, opt);
                     push_audio(&shared, out);
+                    push_fft(&shared, out);
                 }
                 shared.connected.store(false, Ordering::Relaxed);
             }
@@ -580,11 +638,13 @@ fn render(shared: &Shared, n: usize, gain: f32, muted: bool, monitor: Monitor, e
         "SQ off"
     };
     let flags = format!(
-        "{} {} {} {}",
+        "{} {} {} {} {} {}",
         if shared.agc_on.load(Ordering::Relaxed) { "AGC" } else { "agc" },
         if shared.filter_on.load(Ordering::Relaxed) { "BPF" } else { "bpf" },
         if shared.notch_on.load(Ordering::Relaxed) { "NOTCH" } else { "notch" },
         if shared.denoise_on.load(Ordering::Relaxed) { "NR" } else { "nr" },
+        if shared.lpf_on.load(Ordering::Relaxed) { "LPF" } else { "lpf" },
+        if shared.fft_open.load(Ordering::Relaxed) { "FFT" } else { "fft" },
     );
     queue!(
         out,
@@ -593,15 +653,19 @@ fn render(shared: &Shared, n: usize, gain: f32, muted: bool, monitor: Monitor, e
             "Pluto airband live listener — {status} — {vol} — sq:{sq} — {flags} — {mode} — {records} recs\r\n"
         )),
         ResetColor,
-        Print("↑/↓ select  0-9+Enter jump  +/- vol  m mute  s squelch  a agc  f bpf  n notch  d nr  F follow  q quit\r\n\r\n"),
+        Print("↑/↓ select  0-9+Enter jump  +/- vol  m mute  s squelch  a agc  f bpf  n notch  d nr  l lpf  g fft  F follow  q quit\r\n\r\n"),
     )?;
 
+    // Carrier metering: each channel's FPGA carrier level in dB over the
+    // cross-channel noise reference. Idle channels sit ~0 dB; a keyed station
+    // reads positive even when its demod audio is buried in the noise.
+    let noise_ref = f32::from_bits(shared.carrier_noise.load(Ordering::Relaxed)).max(1.0);
     for ch in 0..n {
-        let peak = f32::from_bits(shared.peak[ch].swap(0, Ordering::Relaxed));
+        let carrier = f32::from_bits(shared.carrier[ch].load(Ordering::Relaxed)).max(1.0);
         let drops = shared.drops[ch].load(Ordering::Relaxed);
-        let db = level_to_dbfs(peak);
-        // map -60..0 dBFS onto the 24-cell meter
-        let frac = ((db + 60.0) / 60.0).clamp(0.0, 1.0);
+        let cdb = 20.0 * (carrier / noise_ref).log10();
+        // map 0..30 dB-over-noise onto the 24-cell meter
+        let frac = (cdb / 30.0).clamp(0.0, 1.0);
         let bars = (frac * 24.0).round() as usize;
         let meter: String = "#".repeat(bars) + &"·".repeat(24 - bars);
         let marker = if ch == sel { "▶" } else { " " };
@@ -615,7 +679,7 @@ fn render(shared: &Shared, n: usize, gain: f32, muted: bool, monitor: Monitor, e
             out,
             SetForegroundColor(color),
             Print(format!(
-                "{marker}{active} ch {ch:>2}  {}  [{meter}] {db:>6.1} dBFS  drops {drops}\r\n",
+                "{marker}{active} ch {ch:>2}  {}  [{meter}] {cdb:>5.1} dB·c  drops {drops}\r\n",
                 freq_label(ch)
             )),
             ResetColor,
@@ -660,12 +724,14 @@ fn main() -> Result<()> {
         squelch: !matches!(args.squelch, SquelchArg::Off),
         agc: agc_on,
         notch: args.notch.is_some(),
-        denoise: false,
+        denoise: !args.no_denoise,
+        lpf: args.lpf_hz > 0.0,
     };
     let cfg = DspCfg {
         rate: args.rate,
         low: args.filter_low,
         high: args.filter_high,
+        lpf_hz: args.lpf_hz,
         squelch_mode,
         squelch_hang_ms: args.squelch_hang_ms,
         notch_freq: args.notch,
@@ -677,30 +743,67 @@ fn main() -> Result<()> {
     let max_queue = (args.rate as usize * 2) / 5;
     let shared = Arc::new(Shared::new(n, max_queue, start, toggles));
 
-    // Audio output: keep _stream alive for the lifetime of the sink.
+    // Audio output: keep _stream alive on the main thread (it is !Send and the
+    // GUI event loop also lives here). The Sink is shared with the terminal UI
+    // thread for volume control.
     let (_stream, handle) = OutputStream::try_default()
         .context("no default audio output device (is one available?)")?;
-    let sink = Sink::try_new(&handle).context("failed to create audio sink")?;
+    let sink = Arc::new(Sink::try_new(&handle).context("failed to create audio sink")?);
     // With AGC the audio is already normalized to ~unity, so a small sink gain
     // suffices; without AGC the raw airband audio is very quiet and needs a big
     // makeup factor (the historical default).
-    let mut gain = args.gain.unwrap_or(if agc_on { 1.5 } else { 25000.0 }).max(0.0);
-    let mut muted = false;
+    let gain = args.gain.unwrap_or(if agc_on { 1.5 } else { 25000.0 }).max(0.0);
     sink.set_volume(gain);
     sink.append(ChannelSource {
         shared: Arc::clone(&shared),
         rate: args.rate,
     });
 
-    let mut monitor = args.monitor;
-    let mix = monitor == Monitor::Mix;
+    let mix = args.monitor == Monitor::Mix;
     let reader = {
         let shared = Arc::clone(&shared);
         let addr = normalize_addr(&args.addr);
         let cfg = cfg.clone();
         thread::spawn(move || reader_loop(shared, addr, n, cfg, mix))
     };
-    let hang = Duration::from_millis(args.follow_hang_ms);
+
+    // Terminal control UI on a background thread; the FFT GUI event loop must
+    // own the main thread (macOS requires native windows on the main thread).
+    let term = {
+        let shared = Arc::clone(&shared);
+        let sink = Arc::clone(&sink);
+        let monitor = args.monitor;
+        let follow_hang_ms = args.follow_hang_ms;
+        thread::spawn(move || {
+            let s = Arc::clone(&shared);
+            if let Err(e) = run_terminal(shared, sink, n, monitor, follow_hang_ms, gain) {
+                eprintln!("terminal UI error: {e:#}");
+            }
+            s.running.store(false, Ordering::Relaxed);
+        })
+    };
+
+    // Blocks until the app quits (running -> false), then we join the threads.
+    run_fft_gui(Arc::clone(&shared), args.rate as f32);
+    shared.running.store(false, Ordering::Relaxed);
+    let _ = term.join();
+    let _ = reader.join();
+    Ok(())
+}
+
+/// Terminal control UI loop (background thread): owns the raw-mode terminal and
+/// all keyboard handling. Exits when `running` clears (`q` here, or the GUI
+/// window quitting).
+fn run_terminal(
+    shared: Arc<Shared>,
+    sink: Arc<Sink>,
+    n: usize,
+    mut monitor: Monitor,
+    follow_hang_ms: u64,
+    mut gain: f32,
+) -> Result<()> {
+    let mut muted = false;
+    let hang = Duration::from_millis(follow_hang_ms);
     let mut follow_idle = Instant::now();
 
     terminal::enable_raw_mode().context("failed to enter raw terminal mode")?;
@@ -708,7 +811,7 @@ fn main() -> Result<()> {
     let _guard = TermGuard;
 
     let mut entry = String::new();
-    loop {
+    while shared.running.load(Ordering::Relaxed) {
         // Scanner: stay on an active channel; after it goes idle for `hang`,
         // hop (round-robin) to the next channel whose squelch is open.
         if monitor == Monitor::Follow {
@@ -798,6 +901,14 @@ fn main() -> Result<()> {
                         let now = !shared.denoise_on.load(Ordering::Relaxed);
                         shared.denoise_on.store(now, Ordering::Relaxed);
                     }
+                    KeyCode::Char('l') => {
+                        let now = !shared.lpf_on.load(Ordering::Relaxed);
+                        shared.lpf_on.store(now, Ordering::Relaxed);
+                    }
+                    KeyCode::Char('g') => {
+                        let now = !shared.fft_open.load(Ordering::Relaxed);
+                        shared.fft_open.store(now, Ordering::Relaxed);
+                    }
                     KeyCode::Char('F') => {
                         // Toggle scanner; mix is fixed at startup (reader-side).
                         monitor = match monitor {
@@ -814,8 +925,155 @@ fn main() -> Result<()> {
     }
 
     shared.running.store(false, Ordering::Relaxed);
-    let _ = reader.join();
     Ok(())
+}
+
+/// Live FFT GUI (egui/eframe) — runs on the main thread. The window starts
+/// hidden and is shown/hidden by the `fft_open` toggle (`g` in the terminal).
+/// egui_plot's hover crosshair reads out frequency (x) and magnitude (y) for
+/// precision debugging; scroll/drag to zoom/pan.
+fn run_fft_gui(shared: Arc<Shared>, rate: f32) {
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_title("airband-listen — live FFT")
+            .with_inner_size([960.0, 440.0])
+            .with_visible(false),
+        ..Default::default()
+    };
+    let app_shared = Arc::clone(&shared);
+    if let Err(e) = eframe::run_native(
+        "airband-listen-fft",
+        options,
+        Box::new(move |_cc| Ok(Box::new(FftApp::new(app_shared, rate)))),
+    ) {
+        eprintln!("FFT GUI error: {e}");
+    }
+    // GUI exited -> bring the whole app down.
+    shared.running.store(false, Ordering::Relaxed);
+}
+
+/// egui app drawing a live single-sided FFT (dB vs Hz) of the active stream.
+struct FftApp {
+    shared: Arc<Shared>,
+    rate: f32,
+    fft: Arc<dyn Fft<f32>>,
+    window: Vec<f32>,
+    buf: Vec<Complex32>,
+    scratch: Vec<Complex32>,
+}
+
+impl FftApp {
+    fn new(shared: Arc<Shared>, rate: f32) -> FftApp {
+        let fft = FftPlanner::<f32>::new().plan_fft_forward(WELCH_NSEG);
+        let scratch = vec![Complex32::new(0.0, 0.0); fft.get_inplace_scratch_len()];
+        // Hann window (coherent gain ~0.5, corrected in the magnitude scale).
+        let window: Vec<f32> = (0..WELCH_NSEG)
+            .map(|i| {
+                let w = 2.0 * std::f32::consts::PI * i as f32 / (WELCH_NSEG as f32 - 1.0);
+                0.5 - 0.5 * w.cos()
+            })
+            .collect();
+        FftApp {
+            shared,
+            rate,
+            fft,
+            window,
+            buf: vec![Complex32::new(0.0, 0.0); WELCH_NSEG],
+            scratch,
+        }
+    }
+
+    /// Welch PSD: average the periodograms of 50%-overlapping Hann-windowed
+    /// segments over the sample ring, returned as single-sided [freq_Hz, dB]
+    /// points. Averaging reduces variance so the trace (and thus the locked Y
+    /// axis) is steady enough to read.
+    fn spectrum(&mut self) -> Vec<[f64; 2]> {
+        let samples: Vec<f32> = {
+            let q = self.shared.fft_samples.lock().unwrap();
+            if q.len() < WELCH_NSEG {
+                return Vec::new();
+            }
+            q.iter().copied().collect()
+        };
+        let nbins = WELCH_NSEG / 2;
+        let hop = WELCH_NSEG / 2;
+        let mut psd = vec![0f32; nbins];
+        let mut segs = 0u32;
+        let mut start = 0;
+        while start + WELCH_NSEG <= samples.len() {
+            for i in 0..WELCH_NSEG {
+                self.buf[i] = Complex32::new(samples[start + i] * self.window[i], 0.0);
+            }
+            self.fft
+                .process_with_scratch(&mut self.buf, &mut self.scratch);
+            for (k, p) in psd.iter_mut().enumerate() {
+                *p += self.buf[k].norm_sqr();
+            }
+            segs += 1;
+            start += hop;
+        }
+        if segs == 0 {
+            return Vec::new();
+        }
+        // RMS magnitude per bin (avg power -> sqrt); Hann CG=0.5 (×2) and
+        // single-sided (×2) folded into 4/N, matching the single-window scale.
+        let inv = 1.0 / segs as f32;
+        let scale = 4.0 / WELCH_NSEG as f32;
+        (0..nbins)
+            .map(|k| {
+                let rms = (psd[k] * inv).sqrt();
+                let db = 20.0 * (rms * scale).max(1e-9).log10();
+                [(k as f32 * self.rate / WELCH_NSEG as f32) as f64, db as f64]
+            })
+            .collect()
+    }
+}
+
+impl eframe::App for FftApp {
+    /// Non-painting logic (also runs while the window is hidden): drive the
+    /// window visibility from the `g` toggle, quit when `running` clears, and
+    /// keep polling for those flags via scheduled repaints.
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if !self.shared.running.load(Ordering::Relaxed) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
+        // Closing the window (X) just hides it, like pressing `g` again.
+        if ctx.input(|i| i.viewport().close_requested()) {
+            self.shared.fft_open.store(false, Ordering::Relaxed);
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        }
+        let open = self.shared.fft_open.load(Ordering::Relaxed);
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(open));
+        ctx.request_repaint_after(Duration::from_millis(if open { 33 } else { 150 }));
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        if !self.shared.fft_open.load(Ordering::Relaxed) {
+            return;
+        }
+        let pts = self.spectrum();
+        let sel = self.shared.selected.load(Ordering::Relaxed);
+        let mhz = FREQS_MHZ.get(sel).copied().unwrap_or(0.0);
+        ui.label(format!(
+            "ch {sel} ({mhz:.3} MHz) — post-DSP audio, Welch {WELCH_NSEG}-pt Hann, {:.0} sps. Hover to read freq/dB; drag/scroll to adjust, double-click to reset.",
+            self.rate
+        ));
+        Plot::new("fft_plot")
+            .x_axis_label("frequency (Hz)")
+            .y_axis_label("magnitude (dBFS)")
+            .coordinates_formatter(Corner::RightBottom, CoordinatesFormatter::default())
+            // Lock the Y axis (no per-frame autoscale jumping); X auto-fits the
+            // constant 0..Fs/2 range. The user can still drag/scroll to change Y,
+            // and double-click resets to these default bounds.
+            .auto_bounds(egui::Vec2b::new(true, false))
+            .default_y_bounds(-120.0, 0.0)
+            .show(ui, |pu| {
+                if !pts.is_empty() {
+                    pu.line(Line::new("spectrum", PlotPoints::from(pts)));
+                }
+            });
+    }
 }
 
 #[cfg(test)]

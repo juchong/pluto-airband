@@ -74,18 +74,23 @@ branch). The Maia base (spectrometer/recorder/DDC) is preserved.
   reference** (for the 120 MHz line); input power, enclosure shielding, and a switcher
   bead do not help. Full root-cause analysis and a diagnostic toolkit:
   [`firmware/diagnostics/README.md`](firmware/diagnostics/README.md).
-- **Single shared front-end:** one RX gain serves all 21 channels (no per-channel
-  AGC; the AD9361 AGC modes settle on *wideband* power and starve weak narrowband
-  channels, so fixed manual gain is used). The shipped default is now fixed manual
-  **0 dB**, because the AD9361's **internal gain stage is itself the dominant
-  generator** of the conducted spur comb *and* broadband noise/intermod — both grow
-  with internal gain and collapse SFDR. The correct front-end is a clean low-NF
-  **external LNA** doing the gain ahead of the Pluto with internal gain at its floor;
-  an A/B (external LNA vs. internal gain) showed the external LNA markedly cleaner
-  (lower floor, fewer broadband peaks). **This default assumes an external LNA** — on
-  a *bare* front end (no LNA) 0 dB is very insensitive, so raise `gain_db` for that
-  case (the **48 dB** clipping knee is the bare-front-end guidance; the **71 dB**
-  ceiling clips the wideband ADC ~13–15%). See [Channel plan](#channel-plan).
+- **Single shared front-end, and it is internal-noise-limited.** One RX gain serves
+  all 21 channels (fixed manual gain; the AD9361 AGC modes settle on *wideband* power
+  and starve weak narrowband channels). The audio noise floor is the **receiver's own
+  internal noise** (ADC quantization + the conducted spur comb), *not* antenna/sky
+  noise: the channel-11 idle floor is identical with the antenna or a **50 Ω dummy
+  load** (within 0.4 dB) and rises only ~1 dB per +6 dB of gain. The shipped default
+  is fixed manual **12 dB**, tuned for an **external LNA** ahead of the Pluto. At 0 dB
+  the wanted signal sits *at* the quantization floor (a controlled sweep on the
+  continuous 118.050 AWOS carrier measured audio SNR ~1 dB at 0 dB, ~10–12 dB by
+  6–12 dB, then a plateau to 42 dB), so ~12 dB is the minimum that lifts voice clear;
+  with the LNA it does not clip the ADC (0 %, ~7 dB headroom). The external LNA still
+  matters for SFDR — it sets a low system noise figure and lets the internal gain
+  stage (the dominant comb/noise generator) run lower — but does **not** substitute
+  for the ~12 dB internal gain. On a *bare* front end (no LNA) raise `gain_db` toward
+  the **48 dB** clipping knee. Because the limit is internal, more audio quality comes
+  from front-end **dynamic range** (a SAW airband band-pass + low-NF LNA so the ADC
+  isn't starved), not a quieter site. See [Channel plan](#channel-plan).
 - **Transmitter quieted on boot.** This is a pure receiver, but the Pluto powers up
   in FDD with the TX LO running (2.45 GHz, ~10 dB attenuation) — radiated EMI to
   nearby radios. The firmware now powers down the TX LO and floors TX attenuation at
@@ -153,12 +158,14 @@ $BIN 192.168.2.1:30000 --mode raw --no-agc --shift 6
 ```
 
 **Shared DSP chain** (in `airband-dsp`, ported from RTLSDR-Airband and adapted to
-the FPGA's already-demodulated, DC-blocked audio): per-channel **squelch**
-(noise-floor tracking, mutes inter-transmission static), a 300–3400 Hz voice
-**band-pass**, an optional **notch**, an STFT **noise reduction** stage that
-attenuates the broadband hiss under the voice, and an **AGC** that normalizes
-loudness and soft-clips peaks. Defaults: squelch `auto` (`--squelch-snr 9` dB),
-band-pass on, denoise on, AGC on.
+the FPGA's already-demodulated, DC-blocked audio): per-channel **squelch**, a
+300–3400 Hz voice **band-pass**, a standalone **2.5 kHz low-pass** (`--lpf-hz`,
+airband AM voice has no usable energy above ~3.4 kHz so a wider corner only passes
+hiss), an optional **notch**, an STFT **noise reduction** stage that attenuates the
+broadband hiss under the voice, and an **AGC** that normalizes loudness and
+soft-clips peaks. Defaults: band-pass on, 2.5 kHz LPF on, denoise on, AGC on.
+`airband-reader` defaults to squelch `auto`; **`airband-listen` defaults to
+`--squelch carrier`** (see below) since the demod audio is ~0 until a carrier keys.
 
 Because the FPGA DC-blocks the audio before the host sees it, the default squelch
 works on voice energy (VOX) and uses a **hang time** (`--squelch-hang-ms`, default
@@ -181,7 +188,10 @@ new bitstream and host tools must be deployed together.
   `--squelch-hang-ms`) — gating, threshold, and hang time.
 - `--no-denoise`, `--denoise-floor-db <dB>` — spectral noise reduction (more
   negative floor = deeper, more aggressive cut).
-- `--no-filter`, `--notch <Hz>` / `--notch-q` — band-pass / notch.
+- `--no-filter`, `--filter-low`/`--filter-high` — voice band-pass (300–3400 Hz).
+- `--lpf-hz <Hz>` — standalone low-pass −3 dB corner applied after the band-pass
+  (default 2500; `0` disables). In `airband-listen` toggle live with `l`.
+- `--notch <Hz>` / `--notch-q` — tonal-spur notch.
 - `--no-agc` falls back to fixed-gain output, where `--shift` scales the 24-bit
   sample to 16-bit (**positive = attenuate, negative = makeup gain**; airband AM
   is quiet so a negative value is usual).
@@ -277,17 +287,26 @@ cargo build --release --manifest-path host/Cargo.toml
 host/target/release/airband-listen 192.168.2.1:30000
 ```
 
-`airband-listen` runs the same `airband-dsp` chain on the played channel (squelch
-+ band-pass + AGC by default), and runs the squelch on *every* channel so the
-meter shows which frequencies are active. Interactive keys: `↑/↓` (or `j`/`k`,
-`[`/`]`) step channels, type a number then `Enter` to jump, `+`/`-` adjust volume,
-`m` mutes, `s` toggles squelch, `a` toggles AGC, `f` toggles the band-pass, `n`
-toggles a configured notch, `d` toggles **noise reduction**, `F` toggles
-**follow** (scanner) mode, `q` quits.
+`airband-listen` runs the same `airband-dsp` chain on the played channel (carrier
+squelch + band-pass + 2.5 kHz LPF + denoise + AGC by default), and runs the squelch
+on *every* channel so the meter shows which frequencies are active. Interactive
+keys: `↑/↓` (or `j`/`k`, `[`/`]`) step channels, type a number then `Enter` to jump,
+`+`/`-` adjust volume, `m` mutes, `s` toggles squelch, `a` toggles AGC, `f` toggles
+the band-pass, `l` toggles the **2.5 kHz low-pass**, `n` toggles a configured notch,
+`d` toggles **noise reduction**, `g` toggles a **live FFT window** (see below), `F`
+toggles **follow** (scanner) mode, `q` quits.
 `--monitor single|follow|mix` selects single-channel, scanner, or sum-of-open-
-channels playback. The display shows a per-channel dBFS meter, a squelch-open dot,
-the selected channel's squelch state, and cumulative dropped samples, so it
-doubles as a quick link-health check.
+channels playback. The per-channel meter shows **carrier level in dB over the
+cross-channel noise reference** (`dB·c`) — idle channels sit ~0, a keyed station
+reads positive even when its demod audio is buried — plus a squelch-open dot, the
+selected channel's squelch state, and cumulative dropped samples.
+
+**Live FFT window (`g`) — debugging.** Pops up a native GUI plotting a **Welch** PSD
+(2048-pt Hann, ~7 averaged segments) of the active channel's post-DSP audio, so you
+can *see* the effect of the band-pass/LPF/notch/denoise/AGC (toggle them off to
+inspect the raw demod spectrum). Hover for a precision crosshair reading frequency
+and magnitude; the Y axis is locked (drag/scroll to adjust, double-click to reset).
+Press `g` again or close the window to hide it.
 
 ### Audio output interface (write your own client)
 
@@ -354,15 +373,15 @@ the airband band no matter what the browser does.
 
 The receiver reads `/root/airband.json` on the Pluto at startup; if absent it uses
 the `maia-httpd` **built-in defaults** shown below. A ready-to-copy template is at
-`firmware/airband.json` (identical to these built-in defaults; the **0 dB** default
-assumes an external LNA — raise `gain_db` on a bare front end, see **Gain** below):
+`firmware/airband.json` (identical to these built-in defaults; the **12 dB** default
+is tuned for an external LNA — raise `gain_db` on a bare front end, see **Gain** below):
 
 ```jsonc
 {
   "center_hz":   123438000,   // AD9361 RX LO (capture center) — keep within the built window
   "samp_rate":   14000000,    // MUST stay 14 MHz (the rate the channelizer was built for)
   "rf_bandwidth":14000000,
-  "gain_db":     0.0,         // used when agc = "manual"; built-in default, assumes external LNA (see Gain)
+  "gain_db":     12.0,        // used when agc = "manual"; built-in default, tuned for an external LNA (see Gain)
   "agc":         "manual",    // "manual" | "slow_attack" | "fast_attack" | "hybrid"
   "poll_ms":     20,
   "channels_hz": [ 118050000, 119200000, /* … up to 21 … */ 128500000 ]
@@ -377,21 +396,29 @@ Rules:
 - Changing `center_hz` re-tunes the whole window; keep all desired channels inside it.
 - **Gain:** one shared RX gain serves all 21 channels; fixed `agc: "manual"` (the
   AD9361 AGC modes settle on *wideband* power and starve weak channels — measured
-  ch0 peak ~5× lower than fixed max). The shipped default is now **`gain_db: 0.0`**.
-  The AD9361's **internal gain stage is itself the dominant generator** of the
-  conducted spur comb and broadband noise/intermod — both grow with internal gain
-  and collapse the spurious-free dynamic range. The correct architecture is a clean
-  low-NF **external LNA** providing the gain ahead of the Pluto, with the internal
-  gain at its floor; an A/B comparison (external LNA vs. internal gain) showed the
-  external LNA is markedly cleaner — lower noise floor, fewer broadband peaks,
-  better-behaved front end. Per site:
-  - **External LNA (recommended):** keep internal **`gain_db: 0`**; the LNA sets the
-    (low) system noise figure and the internal stage adds minimal spurs/noise.
-  - **Bare front end** (no LNA): 0 dB is very insensitive — raise toward the **48 dB**
-    clipping knee (a measured sweep,
-    [`firmware/diagnostics/floor_sweep.py`](firmware/diagnostics/floor_sweep.py),
-    shows the **71 dB** near-ceiling clips ~13–15% of the *wideband* ADC → broadband
-    intermod; clipping is gone by ~48 dB), accepting a more prominent comb.
+  ch0 peak ~5× lower than fixed max). The shipped default is **`gain_db: 12.0`**,
+  tuned for an external LNA. Two measured facts set this:
+  - **The receiver is internal-noise-limited.** The channel-11 idle audio floor is
+    identical with the antenna or a **50 Ω load** (−92.9 vs −93.3 dBFS) and rises only
+    ~1 dB per +6 dB of gain → the floor is **ADC quantization + the conducted comb**,
+    downstream of the gain, not antenna/sky/thermal noise. A quieter site won't lower
+    it; only getting the signal higher above it (front-end dynamic range) helps.
+  - **At 0 dB the signal is *at* that floor.** A controlled sweep on the continuous
+    118.050 AWOS carrier (`firmware/diagnostics/` — carrier-over-noise vs gain): audio
+    SNR **~1 dB at 0 dB → ~10 dB at 6 dB → ~12 dB at 12 dB**, then a plateau through
+    42 dB. So ~12 dB is the minimum internal gain that lifts voice clear of
+    quantization; with the LNA it does **not** clip the ADC (0 %, ~7 dB headroom).
+
+  The external LNA still matters (lower system NF; lets the internal gain stage — the
+  dominant comb/noise generator — run lower), but it does **not** replace the ~12 dB
+  internal gain. Per site:
+  - **External LNA (recommended):** internal **`gain_db: 12`** (clears quantization,
+    no clipping). The biggest further gain is a **SAW airband band-pass + low-NF LNA**
+    so strong out-of-band signals don't starve the ADC.
+  - **Bare front end** (no LNA): 12 dB is insensitive — raise toward the **48 dB**
+    clipping knee ([`firmware/diagnostics/floor_sweep.py`](firmware/diagnostics/floor_sweep.py);
+    the **71 dB** near-ceiling clips ~13–15% of the wideband ADC), accepting a more
+    prominent comb.
 
   Gain does **not** remove the fixed-frequency channel "buzz" (the internal clock-tone
   comb; see

@@ -13,7 +13,7 @@ mod squelch;
 
 pub use agc::Agc;
 pub use denoise::Denoise;
-pub use filter::{Notch, VoiceFilter};
+pub use filter::{LowPass, Notch, VoiceFilter};
 pub use squelch::{
     carrier_noise_threshold, Squelch, SquelchConfig, SquelchMode, SquelchState,
 };

@@ -234,20 +234,30 @@ The receiver reads `/root/airband.json` at startup (template:
 - **Gain:** one shared RX gain serves all 21 channels (no per-channel *RF* AGC;
   per-channel audio AGC is done on the host, §6.4); fixed **manual gain** (the
   AD9361 AGC modes settle on wideband power and starve weak channels). The shipped
-  default is now **0 dB**, because the AD9361's **internal gain stage is itself the
-  dominant generator** of the conducted spur comb (§7) *and* broadband
-  noise/intermod — both grow with internal gain and collapse the spurious-free
-  dynamic range. The correct front-end architecture is a clean low-NF **external
-  LNA** providing the gain ahead of the Pluto (Friis: the LNA sets the system noise
-  figure and refers the internal stage's noise/spurs to the input ÷ LNA gain), with
-  the internal gain at its floor. A bench A/B (external LNA vs. internal gain) showed
-  the external-LNA path markedly cleaner: lower noise floor, fewer broadband peaks,
-  better-behaved front end. **This default assumes an external LNA**; on a *bare*
-  front end (no LNA) 0 dB is very insensitive — raise toward the **48 dB** clipping
-  knee (a measured sweep, `firmware/diagnostics/floor_sweep.py`, shows the **71 dB**
-  near-ceiling clips ~13–15 % of the wideband ADC → broadband intermod, gone by
-  ~48 dB), accepting a more prominent comb. Lower gain reduces the conducted in-band
-  comb (§7) which **is amplified by RX gain** (`firmware/diagnostics/term_tests.py`).
+  default is **12 dB**, tuned for an external LNA, and the choice is set by two
+  measured facts:
+  - **The receiver is internal-noise-limited, not antenna/thermal-limited.** The
+    channel-11 idle audio floor is identical with the antenna or a **50 Ω termination**
+    (−92.9 vs −93.3 dBFS, Δ0.4 dB) and rises only ~1 dB per +6 dB of gain. So the
+    audio floor is **ADC quantization + the conducted comb (§7)**, downstream of the
+    gain — a quieter antenna environment cannot lower it.
+  - **At 0 dB the wanted signal sits at that floor.** A controlled gain sweep on the
+    continuous 118.050 AWOS carrier (carrier-over-noise, same signal throughout)
+    measured audio SNR **~1 dB at 0 dB → ~10 dB at 6 dB → ~12 dB at 12 dB**, plateauing
+    through 42 dB. ~12 dB is therefore the minimum internal gain that lifts voice clear
+    of quantization; with the external LNA the wideband ADC does not clip (0 %, ~7 dB
+    headroom).
+
+  The external LNA still matters — a clean low-NF stage ahead of the Pluto sets the
+  system noise figure (Friis) and lets the AD9361's internal gain stage (the dominant
+  comb/intermod generator, §7) run lower — but it does **not** substitute for the
+  ~12 dB internal gain needed to clear quantization. Because the limit is internal
+  dynamic range, the largest further gains come from a **front-end SAW airband
+  band-pass + low-NF LNA** (so strong out-of-band signals don't starve the 12-bit
+  ADC), not a quieter site. On a *bare* front end (no LNA) raise toward the **48 dB**
+  clipping knee (a sweep, `firmware/diagnostics/floor_sweep.py`, shows the **71 dB**
+  near-ceiling clips ~13–15 % of the wideband ADC). Higher RX gain does raise the
+  conducted comb (§7), but it stays in the channel-plan guard gaps.
 
 While `maia-httpd` runs with `--airband`, the AD9361 front-end is **locked
 read-only** (`/api/ad9361` is a no-op and the web UI disables RF controls) so the
@@ -339,8 +349,8 @@ On boot with `--airband`, `maia-httpd` reads `/root/airband.json` (or built-in
 defaults) and:
 1. Sets the AD9361 **sampling frequency** (14 MHz), **RX RF bandwidth** (= Fs),
    and **RX LO** (123.438 MHz).
-2. Sets the gain: `agc: "manual"` → manual gain mode + `gain_db` (0 dB default,
-   assumes an external LNA); otherwise the named AGC mode.
+2. Sets the gain: `agc: "manual"` → manual gain mode + `gain_db` (12 dB default,
+   tuned for an external LNA — clears ADC quantization, §5); otherwise the named AGC mode.
 3. Computes each channel's 24-bit NCO word `round(((f − LO)/Fs)·2^24)` and writes
    it to the FPGA, rejecting any channel outside `±Fs/2`.
 4. Enables the receiver and starts the cyclic DMA.
@@ -399,7 +409,9 @@ adapted to the fact that the FPGA already AM-demodulates and DC-blocks the audio
 (§6.1-6.2), so there is no IQ/de-emphasis stage on the host. The chain per channel
 is: **squelch** (EWMA noise-floor tracking → SNR/manual threshold, with an
 open-delay/hang state machine; mutes inter-transmission static) → **voice
-band-pass** (4th-order Butterworth, 300-3400 Hz) → optional
+band-pass** (4th-order Butterworth, 300-3400 Hz) → a standalone **low-pass**
+(2nd-order Butterworth, default −3 dB at 2.5 kHz, `--lpf-hz`; airband AM voice has
+no usable energy above ~3.4 kHz so a tighter corner trims hiss) → optional
 **notch** (2nd-order band-stop for a tonal spur) → **AM AGC** (loudness
 normalization with a bounded soft-clip and click-free fade on close). All units
 work in raw 24-bit sample magnitude; level metering is reported in dBFS.
@@ -459,8 +471,12 @@ reconnects instead of going silently quiet. A single `--icecast-*` flag set is
 the one-channel shortcut. `host/airband-listen`
 runs the same chain on the played channel (and the squelch on every channel for
 activity meters), with `single`/`follow` (scanner)/`mix` monitor modes and live
-toggles. The voice band-pass is now on by default but does not remove the RF spur
-"buzz" (see §7).
+toggles. It defaults to **carrier squelch** and its meter shows **carrier level in dB
+over the cross-channel noise reference** (the demod audio is ~0 until modulation rides
+up, so audio dBFS is not a useful weak-signal indicator). A **live FFT window** (`g`
+key) plots a Welch PSD of the active post-DSP audio with a hover crosshair
+(frequency/magnitude) and a locked Y axis — a debugging aid for the host filters. The
+voice band-pass is on by default but does not remove the RF spur "buzz" (see §7).
 
 ### 6.5 Web config API and page
 The channel plan and front-end settings can be edited from a browser instead of
@@ -517,9 +533,9 @@ absolute under LO shift; moves to other n·Fs under Fs shift), plus a **125 MHz
 Gigabit-Ethernet PHY clock** (Pluto+) and the **120 MHz reference 3rd harmonic** —
 all at fixed *absolute* frequencies, none on the switcher rail. Input power
 (USB/battery/benchtop identical), enclosure shielding, an antenna band-pass, and a
-switcher↔bulk-cap bead do **not** help; the effective levers are **minimum internal
-RX gain** (the AD9361 internal gain stage is the dominant comb/intermod generator, so
-the shipped default is now **0 dB** with a clean **external LNA** doing the gain — see
+switcher↔bulk-cap bead do **not** help; the effective levers are a clean **external
+LNA + modest internal gain** (~12 dB default — the internal gain stage is the dominant
+comb/intermod generator, so keep it low, but it must still clear ADC quantization, see
 §5), **frequency planning** (keep channels off the fixed lines — the shipped plan
 already places them in guard gaps), and an **external clean reference** (removes the
 120 MHz line). The

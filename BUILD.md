@@ -560,14 +560,19 @@ LSB** (i.e. ~ −90 to −100 dBFS at 24-bit). Two things were eating it:
    | **manual 71 dB** | **71 dB** | **~280** |
 
    Fixed **manual gain** wins by ~5× over the AGC modes for weak-signal recovery.
-   The **shipped built-in default is now 0 dB** (`maia-httpd` `AirbandConfig::default`,
-   what runs when `/root/airband.json` is absent), down from 71 → 48 → 0: a bench A/B
-   showed the AD9361's **internal gain stage is itself the dominant generator** of the
-   conducted spur comb and broadband noise/intermod, and a clean low-NF **external
-   LNA** ahead of the Pluto (internal gain at its floor) is markedly cleaner. **The
-   0 dB default assumes an external LNA**; on a *bare* front end it is very insensitive
-   — raise toward the **48 dB** clipping knee (71 dB clips the wideband ADC ~13–15% →
-   broadband intermod) for that case, accepting a more prominent comb.
+   The **shipped built-in default is 12 dB** (`maia-httpd` `AirbandConfig::default`,
+   what runs when `/root/airband.json` is absent), tuned for an external LNA. The
+   receiver is **internal-noise-limited** (the ch11 audio floor is identical with the
+   antenna or a 50 Ω load, Δ0.4 dB, and rises ~1 dB per +6 dB of gain → the floor is
+   ADC quantization + the conducted comb, not antenna noise). A controlled sweep on the
+   continuous 118.050 AWOS carrier showed audio SNR **~1 dB at 0 dB → ~10 dB at 6 dB →
+   ~12 dB at 12 dB**, plateauing to 42 dB: at 0 dB the wanted signal is *at* the
+   quantization floor, so ~12 dB is the minimum that lifts voice clear (and with the
+   LNA it does not clip the ADC: 0 %, ~7 dB headroom). The external LNA still matters
+   for SFDR (low system NF; lets the internal gain stage — the dominant comb/noise
+   generator — run lower) but does **not** replace the ~12 dB internal gain. History:
+   71 → 48 (clipping knee) → 0 (wrong — quantization-starved) → **12**. On a *bare*
+   front end (no LNA) raise toward the **48 dB** clipping knee.
    To apply a config without reflashing, drop it on the device and restart:
 
    ```sh
