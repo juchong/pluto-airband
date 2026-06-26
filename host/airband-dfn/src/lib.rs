@@ -1,4 +1,5 @@
-//! DeepFilterNet speech-enhancement stage for the live listener.
+//! DeepFilterNet speech-enhancement stage shared by the Pluto airband host tools
+//! (`airband-listen`, `airband-reader`).
 //!
 //! DeepFilterNet (`deep_filter`'s `DfTract`) is a 48 kHz, hop-based neural noise
 //! suppressor. Our audio is 21875 sps, so this wraps the model with streaming
@@ -9,7 +10,12 @@
 //! It is intentionally driven only while the squelch is open (NN inference is
 //! expensive and there is nothing to enhance in muted silence); call
 //! [`DfnEnhancer::reset`] when the squelch closes.
+//!
+//! [`Presence`] is the post-DFN brightness lift (high-shelf + soft clip) used to
+//! restore consonant energy DFN trims at low SNR; both binaries share it so all
+//! outputs sound identical.
 
+use airband_dsp::HighShelf;
 use anyhow::Result;
 use df::tract::DfTract;
 use ndarray::Array2;
@@ -82,6 +88,31 @@ impl Default for DfnParams {
     }
 }
 
+/// Bounds how many DeepFilterNet inferences may run concurrently across threads.
+///
+/// [`DfnEnhancer::process_sample_gated`] calls [`enter`](InferencePermit::enter)
+/// immediately before each NN forward pass and [`leave`](InferencePermit::leave)
+/// immediately after, so a caller can cap simultaneous inference (e.g. to the
+/// number of CPU cores) without ever dropping or bypassing audio: a worker that
+/// can't get a slot **blocks around that one hop only** — its input buffers and
+/// the audio is delayed, not lost. Because the permit is scoped to the inference
+/// (not the whole transmission), a continuously-keyed channel cannot starve the
+/// others; permits free between hops and rotate among all open channels.
+pub trait InferencePermit {
+    /// Blocks until an inference slot is free. Called once per NN hop.
+    fn enter(&self);
+    /// Releases the inference slot. Called once per NN hop.
+    fn leave(&self);
+}
+
+/// No-op permit: unbounded concurrency (used by [`DfnEnhancer::process_sample`]).
+impl InferencePermit for () {
+    #[inline]
+    fn enter(&self) {}
+    #[inline]
+    fn leave(&self) {}
+}
+
 /// DeepFilterNet enhancer operating on a single mono stream at `native_rate`.
 pub struct DfnEnhancer {
     df: DfTract,
@@ -146,6 +177,21 @@ impl DfnEnhancer {
     /// Enhances one native-rate sample. Output is delayed by the model lookahead
     /// plus the priming cushion (~tens of ms); during priming it returns silence.
     pub fn process_sample(&mut self, x: f32) -> f32 {
+        self.run(x, &())
+    }
+
+    /// Like [`process_sample`](Self::process_sample) but bounds concurrent NN
+    /// inference via `permit`: each forward pass is wrapped in
+    /// [`enter`](InferencePermit::enter)/[`leave`](InferencePermit::leave). A
+    /// hop that can't get a slot blocks (buffering, never dropping); the permit
+    /// is released between hops so no channel starves another.
+    pub fn process_sample_gated<P: InferencePermit>(&mut self, x: f32, permit: &P) -> f32 {
+        self.run(x, permit)
+    }
+
+    /// Shared streaming body: resample up, run any ready hops through the model
+    /// (each gated by `permit`), resample down, and emit one buffered output.
+    fn run<P: InferencePermit>(&mut self, x: f32, permit: &P) -> f32 {
         self.up_scratch.clear();
         self.up.push(x, &mut self.up_scratch);
         for &s in &self.up_scratch {
@@ -155,8 +201,13 @@ impl DfnEnhancer {
             for i in 0..self.hop {
                 self.noisy[[0, i]] = self.in48.pop_front().unwrap();
             }
+            // Cap concurrent inference to the permit's slots, wrapping only the
+            // NN forward pass (not the cheap resampling) so slots free quickly.
+            permit.enter();
+            let res = self.df.process(self.noisy.view(), self.enh.view_mut());
+            permit.leave();
             // Ignore the returned LSNR; record (don't crash on) any inference error.
-            if self.df.process(self.noisy.view(), self.enh.view_mut()).is_err() {
+            if res.is_err() {
                 self.errored = true;
             }
             self.down_scratch.clear();
@@ -190,13 +241,54 @@ impl DfnEnhancer {
     }
 }
 
+/// Smooth bounded clip in (-1, 1): identity below 0.8, then a tanh knee, so a
+/// presence-boosted peak can never clip the 16-bit output.
+#[inline]
+pub fn soft_clip(v: f32) -> f32 {
+    let t = 0.8f32;
+    let a = v.abs();
+    if a <= t {
+        v
+    } else {
+        v.signum() * (t + (1.0 - t) * ((a - t) / (1.0 - t)).tanh())
+    }
+}
+
+/// Post-DFN presence (consonant) brightness lift: a high-shelf boost followed by
+/// a soft clip. DFN over-attenuates the upper voice band (2-3.4 kHz) at low SNR,
+/// making speech sound muffled; this restores that energy. Reset it while the
+/// stream is idle so each transmission starts with clean filter state.
+pub struct Presence {
+    shelf: HighShelf,
+}
+
+impl Presence {
+    /// High-shelf at `corner_hz`, transition `q`, `gain_db` boost, at `fs` Hz.
+    pub fn new(fs: f64, corner_hz: f64, q: f64, gain_db: f64) -> Presence {
+        Presence {
+            shelf: HighShelf::new(fs, corner_hz, q, gain_db),
+        }
+    }
+
+    /// Applies the brightness lift and soft clip to one sample.
+    #[inline]
+    pub fn process(&mut self, sample: f32) -> f32 {
+        soft_clip(self.shelf.process(sample as f64) as f32)
+    }
+
+    /// Clears the IIR state (call when the stream goes idle).
+    pub fn reset(&mut self) {
+        self.shelf.reset();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     // The bundled DFN3 model trips a tract 0.21.4 codegen dedup bug ("duplicate
     // name") only under the unoptimized (debug) profile; it loads fine in release,
-    // which is the profile the listener ships in. Skip in debug so `cargo test`
+    // which is the profile the host tools ship in. Skip in debug so `cargo test`
     // stays green; `cargo test --release` exercises the real model-load path.
     #[cfg_attr(debug_assertions, ignore)]
     #[test]
@@ -227,5 +319,17 @@ mod tests {
         let expected = n as f64 * 48000.0 / 21875.0;
         let err = (out.len() as f64 - expected).abs();
         assert!(err < 4.0, "got {} expected ~{:.0}", out.len(), expected);
+    }
+
+    #[test]
+    fn soft_clip_is_bounded_and_identity_below_knee() {
+        // Identity below the 0.8 knee.
+        assert_eq!(soft_clip(0.5), 0.5);
+        assert_eq!(soft_clip(-0.5), -0.5);
+        // Compressive knee above 0.8 (0.9 -> ~0.89, still < input).
+        assert!(soft_clip(0.9) > 0.8 && soft_clip(0.9) < 0.9);
+        // Bounded to [-1, 1] for large input.
+        assert!(soft_clip(10.0) <= 1.0 && soft_clip(10.0) > 0.8);
+        assert!(soft_clip(-10.0) >= -1.0 && soft_clip(-10.0) < -0.8);
     }
 }

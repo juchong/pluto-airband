@@ -35,6 +35,7 @@ mod feeds;
 mod icecast;
 mod metrics;
 
+use airband_dfn::{DfnEnhancer, DfnParams, InferencePermit, Presence};
 use airband_dsp::{
     carrier_noise_threshold, decode_carrier, level_to_dbfs, Agc, Denoise, LowPass, Notch, Squelch,
     SquelchConfig, SquelchMode, VoiceFilter, SAMPLE_SCALE,
@@ -42,7 +43,10 @@ use airband_dsp::{
 
 /// Carrier-squelch: population percentile used as the cross-channel noise
 /// reference, and how often (in frames) the shared threshold is recomputed.
-const CARRIER_NOISE_PCT: f32 = 0.75;
+/// The median (0.5) matches airband-listen: at useful gain several channels are
+/// elevated by the conducted comb, so a high percentile would inflate the
+/// "noise" reference and push the threshold above real traffic.
+const CARRIER_NOISE_PCT: f32 = 0.5;
 const CARRIER_UPDATE_FRAMES: u64 = 8192;
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
@@ -53,7 +57,12 @@ use std::{
     io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     net::{TcpStream, UdpSocket},
     path::PathBuf,
-    sync::{mpsc::SyncSender, Arc},
+    sync::{
+        atomic::{AtomicU32, Ordering},
+        mpsc::{self, Receiver, Sender, SyncSender},
+        Arc, Barrier, Condvar, Mutex,
+    },
+    thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -130,15 +139,17 @@ struct Args {
     /// Disable the AGC (use raw, band-passed audio scaled by --shift).
     #[arg(long)]
     no_agc: bool,
-    /// Disable the spectral noise reducer (on by default).
+    /// Enable the STFT spectral noise reducer (off by default; the DFN-centric
+    /// chain lets DeepFilterNet do the cleanup, like airband-listen).
     #[arg(long)]
-    no_denoise: bool,
+    denoise: bool,
     /// Noise-reducer spectral floor in dB (more negative = more aggressive cut).
     #[arg(long, default_value_t = -18.0, allow_hyphen_values = true)]
     denoise_floor_db: f32,
-    /// Disable the voice band-pass (on by default; 300-3400 Hz).
+    /// Enable the voice band-pass (off by default; 300-3400 Hz). The DFN-centric
+    /// chain leaves it off so DeepFilterNet cleans up in isolation.
     #[arg(long)]
-    no_filter: bool,
+    filter: bool,
     /// Voice band-pass low corner in Hz (high-pass)
     #[arg(long, default_value_t = 300.0)]
     filter_low: f64,
@@ -146,8 +157,8 @@ struct Args {
     #[arg(long, default_value_t = 3400.0)]
     filter_high: f64,
     /// Standalone low-pass -3 dB cutoff in Hz, applied after the band-pass
-    /// (a distinct LPF stage; 0 = off)
-    #[arg(long, default_value_t = 2500.0)]
+    /// (a distinct LPF stage; 0 = off, the default; e.g. 2500 to enable)
+    #[arg(long, default_value_t = 0.0)]
     lpf_hz: f64,
     /// Notch (band-stop) center frequency in Hz to kill a tonal spur (off if unset).
     #[arg(long)]
@@ -214,6 +225,36 @@ struct Args {
     /// mismatches (disables MITM protection; never use for a public feed).
     #[arg(long)]
     icecast_tls_insecure: bool,
+    /// Disable DeepFilterNet neural speech enhancement (on by default; runs on
+    /// squelch-open audio after the AGC, exactly like airband-listen).
+    #[arg(long)]
+    no_dfn: bool,
+    /// DeepFilterNet local-SNR floor in dB (frames below are treated as noise).
+    /// Lower keeps faint speech; -20 avoids the "garbled mumble" zero-gating.
+    #[arg(long, default_value_t = -20.0, allow_hyphen_values = true)]
+    dfn_min_snr: f32,
+    /// DeepFilterNet max attenuation in dB (>=100 = unlimited). 15 caps depth so
+    /// noise-like consonants are not fully muted.
+    #[arg(long, default_value_t = 15.0)]
+    dfn_atten_lim: f32,
+    /// DeepFilterNet post-filter beta (0 = off; ~0.02 trims residual musical noise).
+    #[arg(long, default_value_t = 0.02)]
+    dfn_pf_beta: f32,
+    /// Maximum number of channels running DeepFilterNet inference at once. Excess
+    /// keyed channels wait (buffer, never drop or bypass) until a slot frees,
+    /// bounding NN load on the Pi 5. Default leaves a core for I/O.
+    #[arg(long, default_value_t = 3)]
+    dfn_max_active: usize,
+    /// Post-DFN presence/brightness high-shelf boost in dB (0 = off). Restores the
+    /// upper voice band DFN trims at low SNR so pilots are not muffled.
+    #[arg(long, default_value_t = 8.0, allow_hyphen_values = true)]
+    presence_db: f64,
+    /// Presence high-shelf corner frequency in Hz.
+    #[arg(long, default_value_t = 1600.0)]
+    presence_hz: f64,
+    /// Presence high-shelf transition Q.
+    #[arg(long, default_value_t = 0.707)]
+    presence_q: f64,
 }
 
 /// Resolved, immutable runtime configuration.
@@ -235,6 +276,12 @@ struct Config {
     low: f64,
     high: f64,
     lpf_hz: f64,
+    dfn_on: bool,
+    dfn_params: DfnParams,
+    dfn_max_active: usize,
+    presence_db: f64,
+    presence_hz: f64,
+    presence_q: f64,
 }
 
 /// Buffered UDP PCM sink: little-endian s16 datagrams of ~512 samples.
@@ -403,42 +450,103 @@ impl Recorder {
 /// STFT frame size for the spectral denoiser (~16 ms at 15625 sps).
 const DENOISE_FRAME: usize = 256;
 
-/// All per-channel state: drop tracking, DSP, recorder, and stats.
-struct Channel {
+/// Counting semaphore bounding how many DeepFilterNet **inferences** run at once
+/// (`--dfn-max-active`). It is acquired per NN hop (see [`InferencePermit`]) —
+/// immediately around each forward pass, then released — so excess simultaneous
+/// transmissions **buffer** (their unbounded input queue grows, adding latency)
+/// instead of dropping audio or bypassing the filter, while permits free between
+/// hops and rotate among all open channels (no channel starves another). This
+/// keeps NN load on the Pi 5 bounded to a few cores while always filtering.
+struct Semaphore {
+    count: Mutex<usize>,
+    cv: Condvar,
+}
+
+impl Semaphore {
+    fn new(n: usize) -> Semaphore {
+        Semaphore {
+            count: Mutex::new(n.max(1)),
+            cv: Condvar::new(),
+        }
+    }
+
+    fn acquire(&self) {
+        let mut c = self.count.lock().unwrap();
+        while *c == 0 {
+            c = self.cv.wait(c).unwrap();
+        }
+        *c -= 1;
+    }
+
+    fn release(&self) {
+        let mut c = self.count.lock().unwrap();
+        *c += 1;
+        self.cv.notify_one();
+    }
+}
+
+impl InferencePermit for Semaphore {
+    #[inline]
+    fn enter(&self) {
+        self.acquire();
+    }
+    #[inline]
+    fn leave(&self) {
+        self.release();
+    }
+}
+
+/// A message from the router thread to a per-channel worker.
+enum Msg {
+    /// One demultiplexed audio record: (sample, FPGA carrier byte).
+    Sample(i32, u8),
+    /// Stream reset (reconnect/shutdown): finalize any open recording and clear
+    /// streaming DSP state so the next transmission starts clean.
+    Reset,
+}
+
+/// Per-channel processing worker. Owns the channel's squelch, full audio chain
+/// (band-pass/LPF/notch/denoise/AGC), DeepFilterNet enhancer, presence
+/// brightness, and all output sinks (recorder/UDP/Icecast). Each runs on its own
+/// thread so the Pi 5's cores process channels in parallel and a slow stage
+/// (notably DFN inference) never stalls the socket-reading router.
+struct Worker {
     index: usize,
-    last_seq: Option<u32>,
     squelch: Squelch,
     /// Audio-energy VOX used only in carrier-squelch mode to drive the `above`
     /// (speech-present) flag for AGC/denoise; the main squelch then keys on the
     /// carrier, whose units don't match the audio sample magnitude.
     audio_gate: Option<Squelch>,
+    /// Dedicated 300-3400 Hz band-pass used only to derive the VOX squelch level
+    /// from voice-band modulation energy (mirrors airband-listen): keeps the
+    /// decision independent of the playback filter and excludes the out-of-band
+    /// conducted comb and low-frequency rumble.
+    sq_filter: VoiceFilter,
     vf: VoiceFilter,
     lpf: Option<LowPass>,
     notch: Option<Notch>,
     denoise: Denoise,
     agc: Agc,
+    /// DeepFilterNet enhancer (built eagerly at startup when enabled).
+    dfn: Option<DfnEnhancer>,
+    /// Post-DFN brightness high-shelf (None when `--presence-db 0`).
+    presence: Option<Presence>,
     recorder: Option<Recorder>,
     udp: Option<UdpOut>,
     /// Icecast feeds for this channel (fan-out: one sender per destination).
     icecast: Vec<SyncSender<i16>>,
-    // stats since last report
-    interval_count: u64,
-    interval_peak: i32,
-    // totals
-    total: u64,
-    drops: u64,
+    since_checkpoint: u64,
 }
 
-impl Channel {
-    fn new(index: usize, cfg: &Config) -> Channel {
+impl Worker {
+    fn new(index: usize, cfg: &Config, udp: Option<UdpOut>, icecast: Vec<SyncSender<i16>>) -> Worker {
         let recorder = match cfg.mode {
             Mode::Stats => None,
             Mode::Wav => Some(Recorder::new(true)),
             Mode::Raw => Some(Recorder::new(false)),
         };
-        Channel {
+        Worker {
             index,
-            last_seq: None,
             squelch: Squelch::new(
                 SquelchConfig::new(cfg.squelch_mode, cfg.rate).with_hang_ms(cfg.squelch_hang_ms),
             ),
@@ -449,6 +557,7 @@ impl Channel {
                 ))),
                 _ => None,
             },
+            sq_filter: VoiceFilter::new(cfg.rate as f64, 300.0, 3400.0),
             vf: VoiceFilter::new(cfg.rate as f64, cfg.low, cfg.high),
             lpf: (cfg.lpf_hz > 0.0).then(|| LowPass::new(cfg.rate as f64, cfg.lpf_hz)),
             notch: cfg
@@ -456,13 +565,14 @@ impl Channel {
                 .map(|f| Notch::new(f, cfg.rate as f64, cfg.notch_q)),
             denoise: Denoise::new(DENOISE_FRAME, cfg.denoise_floor_db),
             agc: Agc::new(),
+            dfn: None,
+            presence: (cfg.presence_db != 0.0).then(|| {
+                Presence::new(cfg.rate as f64, cfg.presence_hz, cfg.presence_q, cfg.presence_db)
+            }),
             recorder,
-            udp: None,
-            icecast: Vec::new(),
-            interval_count: 0,
-            interval_peak: 0,
-            total: 0,
-            drops: 0,
+            udp,
+            icecast,
+            since_checkpoint: 0,
         }
     }
 
@@ -471,13 +581,16 @@ impl Channel {
         self.recorder.is_some() || self.udp.is_some() || !self.icecast.is_empty()
     }
 
-    /// Produces the gated/processed 16-bit sample for this input sample.
-    fn audio_pcm(&mut self, sample: i32, open: bool, just_opened: bool, above: bool, cfg: &Config) -> i16 {
+    /// Runs one sample through the gated audio chain (filters -> denoise -> AGC),
+    /// returning a normalized f32 (DFN and presence run on this, like the
+    /// listener, so the model sees a healthy in-range signal).
+    fn audio_chain(&mut self, sample: i32, open: bool, just_opened: bool, above: bool, cfg: &Config) -> f32 {
         if !open {
+            // Keep the AGC tail decaying so it re-seeds cleanly on the next open.
             return if cfg.agc_on {
-                (self.agc.process(0.0, false, false, false) * 32767.0) as i16
+                self.agc.process(0.0, false, false, false)
             } else {
-                0
+                0.0
             };
         }
         let mut v = sample as f64;
@@ -489,8 +602,8 @@ impl Channel {
             v = lp.process(v);
         }
         if cfg.notch_freq.is_some() {
-            if let Some(n) = self.notch.as_mut() {
-                v = n.process(v);
+            if let Some(nf) = self.notch.as_mut() {
+                v = nf.process(v);
             }
         }
         let mut vn = (v / SAMPLE_SCALE as f64) as f32;
@@ -498,218 +611,352 @@ impl Channel {
             // Learn the noise model from below-threshold (non-speech) samples.
             vn = self.denoise.process(vn, !above);
         }
-        if cfg.agc_on {
-            let y = self.agc.process(vn, true, just_opened, above);
-            (y as f64 * 32767.0).round().clamp(i16::MIN as f64, i16::MAX as f64) as i16
+        if !cfg.agc_on {
+            return vn;
+        }
+        self.agc.process(vn, true, just_opened, above)
+    }
+
+    /// Applies DeepFilterNet to one chain-output sample. Runs only while the
+    /// squelch is open. In gated modes each NN hop acquires a concurrency permit
+    /// just for that inference and releases it immediately after, so an overran
+    /// hop waits (its input buffers, never drops) but a continuously-keyed
+    /// channel never holds a slot long enough to starve the others. In ungated
+    /// mode (squelch off) there is no transmission structure, so it runs uncapped.
+    fn apply_dfn(&mut self, sample: f32, open: bool, gated: bool, sem: &Semaphore) -> f32 {
+        let Some(e) = self.dfn.as_mut() else {
+            return sample;
+        };
+        if !open {
+            e.reset();
+            return sample;
+        }
+        if gated {
+            e.process_sample_gated(sample, sem)
         } else {
-            let scaled = vn as f64 * SAMPLE_SCALE as f64 * 2f64.powi(-cfg.shift);
-            scaled.round().clamp(i16::MIN as f64, i16::MAX as f64) as i16
+            e.process_sample(sample)
         }
     }
 
-    fn push(&mut self, seq: u32, sample: i32, carrier: u8, cfg: &Config) -> Result<()> {
-        if let Some(prev) = self.last_seq {
-            let expected = (prev + 1) % SEQ_MOD;
-            if seq != expected {
-                self.drops += u64::from((seq + SEQ_MOD - expected) % SEQ_MOD);
-            }
+    /// Post-DFN presence brightness lift on the open stream (reset while idle).
+    fn apply_presence(&mut self, sample: f32, open: bool) -> f32 {
+        let Some(p) = self.presence.as_mut() else {
+            return sample;
+        };
+        if !open {
+            p.reset();
+            return sample;
         }
-        self.last_seq = Some(seq);
-        self.total += 1;
-        self.interval_count += 1;
-        self.interval_peak = self.interval_peak.max(sample.abs());
+        p.process(sample)
+    }
 
-        // Carrier-power squelch keys on the FPGA carrier level; all others on the
-        // audio magnitude. (Carrier is 0 on bitstreams that don't ship it.)
-        let level = if matches!(cfg.squelch_mode, SquelchMode::Carrier { .. }) {
-            decode_carrier(carrier)
-        } else {
-            sample.unsigned_abs() as f32
-        };
-        self.squelch.process(level);
-        let gated = !matches!(cfg.squelch_mode, SquelchMode::Off);
-        let open = !gated || self.squelch.is_open();
-        let just_opened = gated && self.squelch.just_opened();
-        let just_closed = gated && self.squelch.just_closed();
-        // Speech-present flag for AGC/denoise is always audio-energy based.
-        let mag = sample.unsigned_abs() as f32;
-        let above = match self.audio_gate.as_mut() {
-            Some(g) => {
-                g.process(mag);
-                mag >= g.threshold()
-            }
-            None => mag >= self.squelch.threshold(),
-        };
-
-        if !self.needs_audio() {
+    /// Writes the processed PCM sample to the recorder per the split policy.
+    fn record(&mut self, pcm: i16, gated: bool, just_opened: bool, just_closed: bool, cfg: &Config) -> Result<()> {
+        let Some(rec) = self.recorder.as_mut() else {
             return Ok(());
-        }
-
-        // One processed sample feeds every consumer. UDP and Icecast want a
-        // continuous stream (silence between transmissions); the recorder gates
-        // it per the split policy.
-        let pcm = self.audio_pcm(sample, open, just_opened, above, cfg);
-        if let Some(u) = self.udp.as_mut() {
-            u.push(pcm);
-        }
-        for tx in &self.icecast {
-            let _ = tx.try_send(pcm); // drop on back-pressure rather than block
-        }
-
-        if let Some(rec) = self.recorder.as_mut() {
-            if cfg.split && gated {
-                // One file per transmission.
-                if just_opened {
-                    let path = cfg.out_dir.join(format!(
-                        "ch{:02}_{}.{}",
-                        self.index,
-                        utc_stamp(SystemTime::now()),
-                        if cfg.mode == Mode::Wav { "wav" } else { "s16" }
-                    ));
-                    rec.open(path, cfg.rate)?;
-                }
-                if rec.is_open() {
-                    rec.write(pcm)?;
-                }
-                if just_closed {
-                    rec.close(cfg.rate, cfg.min_samples)?;
-                }
-            } else {
-                // Continuous single file (gated audio flows; closed = silence).
-                if !rec.is_open() {
-                    let path = cfg.out_dir.join(format!(
-                        "ch{:02}.{}",
-                        self.index,
-                        if cfg.mode == Mode::Wav { "wav" } else { "s16" }
-                    ));
-                    rec.open(path, cfg.rate)?;
-                }
+        };
+        if cfg.split && gated {
+            // One file per transmission.
+            if just_opened {
+                let path = cfg.out_dir.join(format!(
+                    "ch{:02}_{}.{}",
+                    self.index,
+                    utc_stamp(SystemTime::now()),
+                    if cfg.mode == Mode::Wav { "wav" } else { "s16" }
+                ));
+                rec.open(path, cfg.rate)?;
+            }
+            if rec.is_open() {
                 rec.write(pcm)?;
             }
+            if just_closed {
+                rec.close(cfg.rate, cfg.min_samples)?;
+            }
+        } else {
+            // Continuous single file (gated audio flows; closed = silence).
+            if !rec.is_open() {
+                let path = cfg.out_dir.join(format!(
+                    "ch{:02}.{}",
+                    self.index,
+                    if cfg.mode == Mode::Wav { "wav" } else { "s16" }
+                ));
+                rec.open(path, cfg.rate)?;
+            }
+            rec.write(pcm)?;
+        }
+        // Periodically flush / refresh the WAV header (once per ~second).
+        self.since_checkpoint += 1;
+        if self.since_checkpoint >= cfg.rate as u64 {
+            rec.checkpoint(cfg.rate)?;
+            self.since_checkpoint = 0;
         }
         Ok(())
     }
 
-    /// Pushes the channel's current state into the metrics snapshot.
-    fn update_metric(&self, m: &metrics::ChannelMetric) {
-        m.set(
-            self.total,
-            self.drops,
+    /// Processes one demultiplexed sample: squelch decision, audio chain, DFN,
+    /// presence, then fan-out to all sinks.
+    fn on_sample(
+        &mut self,
+        sample: i32,
+        carrier: u8,
+        carrier_thr: Option<f32>,
+        cfg: &Config,
+        sem: &Semaphore,
+        metric: &metrics::ChannelMetric,
+    ) -> Result<()> {
+        // Voice-band magnitude drives both the VOX squelch and the speech-present
+        // flag (excludes the conducted comb / rumble).
+        let sq_mag = self.sq_filter.process(sample as f64).abs() as f32;
+        // Carrier mode keys the squelch on the FPGA carrier level; all other
+        // modes on voice-band modulation energy (VOX).
+        let sq_level = match cfg.squelch_mode {
+            SquelchMode::Carrier { .. } => decode_carrier(carrier),
+            _ => sq_mag,
+        };
+        // In carrier mode, apply the latest cross-channel threshold (>0 once the
+        // router has computed it; before that the squelch keeps its default).
+        if let Some(thr) = carrier_thr {
+            if thr > 0.0 {
+                self.squelch.set_threshold(thr);
+            }
+        }
+        self.squelch.process(sq_level);
+        let gated = !matches!(cfg.squelch_mode, SquelchMode::Off);
+        let open = !gated || self.squelch.is_open();
+        let just_opened = gated && self.squelch.just_opened();
+        let just_closed = gated && self.squelch.just_closed();
+        let above = match self.audio_gate.as_mut() {
+            Some(g) => {
+                g.process(sq_mag);
+                sq_mag >= g.threshold()
+            }
+            None => sq_mag >= self.squelch.threshold(),
+        };
+
+        // Publish squelch-derived gauges for stats/metrics (every channel).
+        metric.set_squelch(
             self.squelch.open_count(),
             self.squelch.level(),
             self.squelch.noise_floor(),
             self.squelch.is_open(),
         );
+
+        if !self.needs_audio() {
+            return Ok(());
+        }
+
+        // Chain: filters -> denoise -> AGC -> DFN -> presence brightness. UDP and
+        // Icecast get a continuous stream (near-silence between transmissions);
+        // the recorder gates it per the split policy.
+        let mut n = self.audio_chain(sample, open, just_opened, above, cfg);
+        n = self.apply_dfn(n, open, gated, sem);
+        n = self.apply_presence(n, open);
+        let pcm = if cfg.agc_on {
+            (n as f64 * 32767.0).round().clamp(i16::MIN as f64, i16::MAX as f64) as i16
+        } else {
+            (n as f64 * SAMPLE_SCALE as f64 * 2f64.powi(-cfg.shift))
+                .round()
+                .clamp(i16::MIN as f64, i16::MAX as f64) as i16
+        };
+
+        if let Some(u) = self.udp.as_mut() {
+            u.push(pcm);
+        }
+        for tx in &self.icecast {
+            // Drop only under network back-pressure (slow/dead Icecast); the DFN
+            // path itself never drops or bypasses.
+            let _ = tx.try_send(pcm);
+        }
+        self.record(pcm, gated, just_opened, just_closed, cfg)
     }
 
-    /// Finalize any open split recording (called on reconnect/shutdown).
-    fn finalize(&mut self, cfg: &Config) {
+    /// Finalizes streaming state on a stream reset (reconnect/shutdown).
+    fn reset(&mut self, cfg: &Config) {
+        if let Some(r) = self.recorder.as_mut() {
+            let _ = r.close(cfg.rate, cfg.min_samples);
+        }
+        if let Some(e) = self.dfn.as_mut() {
+            e.reset();
+        }
+        if let Some(p) = self.presence.as_mut() {
+            p.reset();
+        }
+        self.since_checkpoint = 0;
+    }
+
+    /// Worker thread body: eagerly load the DFN model (so no transmission is
+    /// missed to a cold model), sync at the startup barrier, then process samples
+    /// until the channel sender is dropped.
+    fn run(
+        mut self,
+        rx: Receiver<Msg>,
+        cfg: Arc<Config>,
+        sem: Arc<Semaphore>,
+        metrics: Arc<Metrics>,
+        carrier_thr: Arc<AtomicU32>,
+        barrier: Arc<Barrier>,
+    ) {
+        if cfg.dfn_on && self.needs_audio() {
+            match DfnEnhancer::new(cfg.rate as f64, cfg.dfn_params) {
+                Ok(e) => self.dfn = Some(e),
+                Err(err) => eprintln!(
+                    "ch{:02}: DeepFilterNet init failed ({err:#}); streaming without it",
+                    self.index
+                ),
+            }
+        }
+        barrier.wait();
+        let carrier_mode = matches!(cfg.squelch_mode, SquelchMode::Carrier { .. });
+        let metric = &metrics.channels[self.index];
+        while let Ok(msg) = rx.recv() {
+            match msg {
+                Msg::Sample(sample, carrier) => {
+                    let thr = carrier_mode
+                        .then(|| f32::from_bits(carrier_thr.load(Ordering::Relaxed)));
+                    if let Err(e) = self.on_sample(sample, carrier, thr, &cfg, &sem, metric) {
+                        eprintln!("ch{:02}: output error ({e:#})", self.index);
+                    }
+                }
+                Msg::Reset => self.reset(&cfg),
+            }
+        }
         if let Some(r) = self.recorder.as_mut() {
             let _ = r.close(cfg.rate, cfg.min_samples);
         }
     }
-
-    fn checkpoint(&mut self, cfg: &Config) -> Result<()> {
-        if let Some(r) = self.recorder.as_mut() {
-            r.checkpoint(cfg.rate)?;
-        }
-        Ok(())
-    }
 }
 
-fn report(channels: &mut [Channel], elapsed: f64, overflow_hint: bool) {
-    let mut active = 0;
-    let mut total_drops = 0u64;
-    println!(
-        "---- airband {:.1}s ---- {}",
-        elapsed,
-        if overflow_hint { "(stream gaps seen)" } else { "" }
-    );
-    println!("  ch    sps   total      drops   peak(dBFS)  floor(dBFS)  tx");
-    for s in channels.iter_mut() {
-        total_drops += s.drops;
-        if s.interval_count > 0 {
-            active += 1;
-            let sps = s.interval_count as f64 / elapsed;
-            let peak_db = level_to_dbfs(s.interval_peak as f32);
-            let floor_db = level_to_dbfs(s.squelch.noise_floor());
-            println!(
-                "  {:2}  {:6.0}  {:9}  {:9}  {:9.1}  {:9.1}  {:4}",
-                s.index, sps, s.total, s.drops, peak_db, floor_db, s.squelch.open_count()
+/// Periodic stats reporter, reading the shared `Metrics` atomics updated by the
+/// router (samples/drops/peak) and workers (squelch gauges).
+struct StatsPrinter {
+    interval: Duration,
+    last: Instant,
+    prev_samples: Vec<u64>,
+    mode: Mode,
+}
+
+impl StatsPrinter {
+    fn new(interval_secs: u64, n: usize, mode: Mode) -> StatsPrinter {
+        StatsPrinter {
+            interval: Duration::from_secs(interval_secs.max(1)),
+            last: Instant::now(),
+            prev_samples: vec![0; n],
+            mode,
+        }
+    }
+
+    fn due(&self) -> bool {
+        self.last.elapsed() >= self.interval
+    }
+
+    fn emit(&mut self, metrics: &Metrics) {
+        let elapsed = self.last.elapsed().as_secs_f64();
+        if self.mode == Mode::Stats {
+            println!("---- airband {elapsed:.1}s ----");
+            println!("  ch    sps   total      drops   peak(dBFS)  floor(dBFS)  tx");
+        }
+        let mut active = 0;
+        let mut total_drops = 0u64;
+        let mut total_active_channels = 0;
+        let mut total_tx = 0u64;
+        for (i, m) in metrics.channels.iter().enumerate() {
+            let total = m.samples.load(Ordering::Relaxed);
+            let drops = m.drops.load(Ordering::Relaxed);
+            let tx = m.transmissions.load(Ordering::Relaxed);
+            total_drops += drops;
+            total_tx += tx;
+            let interval_samples = total.saturating_sub(self.prev_samples[i]);
+            self.prev_samples[i] = total;
+            if total > 0 {
+                total_active_channels += 1;
+            }
+            if interval_samples > 0 {
+                active += 1;
+                if self.mode == Mode::Stats {
+                    let sps = interval_samples as f64 / elapsed;
+                    let peak_db = level_to_dbfs(m.take_peak());
+                    let floor_db =
+                        level_to_dbfs(f32::from_bits(m.floor_bits.load(Ordering::Relaxed)));
+                    println!(
+                        "  {i:2}  {sps:6.0}  {total:9}  {drops:9}  {peak_db:9.1}  {floor_db:9.1}  {tx:4}"
+                    );
+                }
+            } else {
+                let _ = m.take_peak();
+            }
+        }
+        if self.mode == Mode::Stats {
+            println!("  active channels: {active}, cumulative drops: {total_drops}");
+        } else {
+            eprintln!(
+                "[{elapsed:.0}s] {total_active_channels} channels active, {total_tx} transmissions, cumulative drops {total_drops}"
             );
         }
-        s.interval_count = 0;
-        s.interval_peak = 0;
+        self.last = Instant::now();
     }
-    println!("  active channels: {active}, cumulative drops: {total_drops}");
 }
 
+/// Router/demux thread: reads framed records from the socket, detects drops,
+/// maintains the carrier-mode noise reference, and routes each sample to its
+/// channel worker over an unbounded queue (never blocks the socket, never drops).
 fn run_session(
-    args: &Args,
+    addr: &str,
+    n: usize,
     cfg: &Config,
-    channels: &mut [Channel],
-    metrics: Option<&Arc<Metrics>>,
-    last_report: &mut Instant,
+    senders: &[Sender<Msg>],
+    metrics: &Metrics,
+    carrier_thr: &AtomicU32,
+    stats: &mut StatsPrinter,
 ) -> Result<()> {
-    let stream = TcpStream::connect(&args.addr)
-        .with_context(|| format!("connecting to {}", args.addr))?;
+    let stream = TcpStream::connect(addr).with_context(|| format!("connecting to {addr}"))?;
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
-    eprintln!("connected to {}", args.addr);
+    eprintln!("connected to {addr}");
     let mut reader = BufReader::with_capacity(1 << 16, stream);
     let mut frame = [0u8; FRAME_BYTES];
-    let interval = Duration::from_secs(args.stats_interval.max(1));
 
-    // Carrier-squelch: track the latest carrier per channel and periodically push
-    // a shared, cross-channel-derived threshold to every channel's squelch.
     let carrier_mode = matches!(cfg.squelch_mode, SquelchMode::Carrier { .. });
-    let carrier_snr_ratio = 10f32.powf(args.squelch_snr / 20.0);
-    let mut last_carrier = vec![0f32; channels.len()];
+    let carrier_snr_ratio = match cfg.squelch_mode {
+        SquelchMode::Carrier { snr_db } => 10f32.powf(snr_db / 20.0),
+        _ => 1.0,
+    };
+    let mut last_carrier = vec![0f32; n];
+    let mut last_seq = vec![Option::<u32>::None; n];
     let mut since_carrier_update: u64 = 0;
 
     loop {
         reader.read_exact(&mut frame)?;
         let (seq, chan, sample, carrier) = unpack(u64::from_le_bytes(frame));
-        if carrier_mode {
-            if let Some(c) = last_carrier.get_mut(usize::from(chan)) {
-                *c = decode_carrier(carrier);
+        let ci = usize::from(chan);
+        if ci >= n {
+            continue;
+        }
+
+        // Drop detection from the per-channel sequence counter.
+        if let Some(prev) = last_seq[ci] {
+            let expected = (prev + 1) % SEQ_MOD;
+            if seq != expected {
+                metrics.channels[ci].add_drops(u64::from((seq + SEQ_MOD - expected) % SEQ_MOD));
             }
+        }
+        last_seq[ci] = Some(seq);
+        metrics.channels[ci].note_sample(sample.unsigned_abs() as f32);
+
+        if carrier_mode {
+            last_carrier[ci] = decode_carrier(carrier);
             since_carrier_update += 1;
             if since_carrier_update >= CARRIER_UPDATE_FRAMES {
                 let thr =
                     carrier_noise_threshold(&last_carrier, CARRIER_NOISE_PCT, carrier_snr_ratio);
-                for ch in channels.iter_mut() {
-                    ch.squelch.set_threshold(thr);
-                }
+                carrier_thr.store(thr.to_bits(), Ordering::Relaxed);
                 since_carrier_update = 0;
             }
         }
-        if let Some(ch) = channels.get_mut(usize::from(chan)) {
-            ch.push(seq, sample, carrier, cfg)?;
-        }
-        if last_report.elapsed() >= interval {
-            let elapsed = last_report.elapsed().as_secs_f64();
-            for ch in channels.iter_mut() {
-                ch.checkpoint(cfg)?;
-            }
-            if let Some(m) = metrics {
-                for ch in channels.iter() {
-                    ch.update_metric(&m.channels[ch.index]);
-                }
-            }
-            if cfg.mode == Mode::Stats {
-                report(channels, elapsed, false);
-            } else {
-                let drops: u64 = channels.iter().map(|c| c.drops).sum();
-                let tx: u64 = channels.iter().map(|c| c.squelch.open_count()).sum();
-                eprintln!(
-                    "[{:.0}s] {} channels active, {} transmissions, cumulative drops {}",
-                    elapsed,
-                    channels.iter().filter(|c| c.total > 0).count(),
-                    tx,
-                    drops
-                );
-            }
-            *last_report = Instant::now();
+
+        // Unbounded, non-blocking handoff: never stall the socket, never drop.
+        let _ = senders[ci].send(Msg::Sample(sample, carrier));
+
+        if stats.due() {
+            stats.emit(metrics);
         }
     }
 }
@@ -727,7 +974,7 @@ fn main() -> Result<()> {
             snr_db: args.squelch_snr,
         },
     };
-    let cfg = Config {
+    let cfg = Arc::new(Config {
         mode: args.mode,
         out_dir: args.out_dir.clone(),
         rate: args.rate,
@@ -737,42 +984,54 @@ fn main() -> Result<()> {
         split: !args.no_split,
         min_samples: (args.min_transmission_ms * args.rate as u64) / 1000,
         agc_on: !args.no_agc,
-        filter_on: !args.no_filter,
-        denoise_on: !args.no_denoise,
+        filter_on: args.filter,
+        denoise_on: args.denoise,
         denoise_floor_db: args.denoise_floor_db,
         notch_freq: args.notch,
         notch_q: args.notch_q,
         low: args.filter_low,
         high: args.filter_high,
         lpf_hz: args.lpf_hz,
-    };
+        dfn_on: !args.no_dfn,
+        dfn_params: DfnParams {
+            min_snr_db: args.dfn_min_snr,
+            atten_lim_db: args.dfn_atten_lim,
+            pf_beta: args.dfn_pf_beta,
+        },
+        dfn_max_active: args.dfn_max_active,
+        presence_db: args.presence_db,
+        presence_hz: args.presence_hz,
+        presence_q: args.presence_q,
+    });
 
     if cfg.mode != Mode::Stats {
         fs::create_dir_all(&cfg.out_dir)
             .with_context(|| format!("creating output dir {:?}", cfg.out_dir))?;
     }
-    let mut channels: Vec<Channel> = (0..args.channels).map(|c| Channel::new(c, &cfg)).collect();
-    let mut last_report = Instant::now();
 
-    // Optional UDP PCM sink.
+    let n = args.channels;
+
+    // Per-channel output sinks, assembled before the workers are built so each
+    // worker owns its own recorder/UDP/Icecast senders (a channel may fan out to
+    // several Icecast mounts).
+    let mut udp_sinks: Vec<Option<UdpOut>> = (0..n).map(|_| None).collect();
     if let Some(ch) = args.udp_channel {
         let dest = args
             .udp_dest
             .as_ref()
             .context("--udp-channel requires --udp-dest host:port")?;
-        let target = channels
-            .get_mut(ch)
-            .with_context(|| format!("--udp-channel {ch} out of range"))?;
-        target.udp = Some(UdpOut::new(dest)?);
+        anyhow::ensure!(ch < n, "--udp-channel {ch} out of range");
+        udp_sinks[ch] = Some(UdpOut::new(dest)?);
         eprintln!("udp: streaming channel {ch} PCM to {dest}");
     }
 
     // Icecast feeds: a JSON feeds file (many channels / many servers) and/or the
     // single-stream --icecast-* flags. Both produce IcecastConfig entries that
     // are attached to their channel (a channel may have several = fan-out).
+    let mut icecast_sinks: Vec<Vec<SyncSender<i16>>> = (0..n).map(|_| Vec::new()).collect();
     let mut feed_cfgs: Vec<IcecastConfig> = Vec::new();
     if let Some(path) = args.feeds.as_ref() {
-        feed_cfgs.extend(feeds::load(path, cfg.rate, channels.len())?);
+        feed_cfgs.extend(feeds::load(path, cfg.rate, n)?);
     }
     if let Some(ch) = args.icecast_channel {
         let tls = TlsMode::parse(&args.icecast_tls).map_err(|e| anyhow::anyhow!(e))?;
@@ -795,39 +1054,70 @@ fn main() -> Result<()> {
     }
     for icfg in feed_cfgs {
         let ch = icfg.channel;
-        let target = channels
-            .get_mut(ch)
-            .with_context(|| format!("icecast feed channel {ch} out of range"))?;
+        anyhow::ensure!(ch < n, "icecast feed channel {ch} out of range");
         let scheme = if icfg.tls == TlsMode::Disabled { "icecast" } else { "icecast+tls" };
         eprintln!(
             "icecast: feed ch{ch} -> {scheme}://{}:{}{}",
             icfg.host, icfg.port, icfg.mount
         );
-        target.icecast.push(icecast::spawn(icfg));
+        icecast_sinks[ch].push(icecast::spawn(icfg));
     }
 
-    // Optional Prometheus metrics endpoint.
-    let metrics = if args.metrics_port > 0 {
-        let m = Metrics::new(args.channels);
-        metrics::serve(Arc::clone(&m), args.metrics_port);
-        Some(m)
-    } else {
-        None
-    };
+    // Shared cross-thread state: stats/metrics bus, DFN concurrency semaphore,
+    // and the carrier-mode noise threshold.
+    let metrics = Metrics::new(n);
+    if args.metrics_port > 0 {
+        metrics::serve(Arc::clone(&metrics), args.metrics_port);
+    }
+    let sem = Arc::new(Semaphore::new(cfg.dfn_max_active));
+    let carrier_thr = Arc::new(AtomicU32::new(0));
+
+    // Spawn one worker thread per channel. Each builds its DeepFilterNet model
+    // up front and waits on the barrier, so the router only starts reading the
+    // stream once every channel is ready (no transmission missed to a cold model).
+    let barrier = Arc::new(Barrier::new(n + 1));
+    let mut senders: Vec<Sender<Msg>> = Vec::with_capacity(n);
+    let mut udp_iter = udp_sinks.into_iter();
+    let mut ice_iter = icecast_sinks.into_iter();
+    for c in 0..n {
+        let (tx, rx) = mpsc::channel::<Msg>();
+        senders.push(tx);
+        let udp = udp_iter.next().unwrap();
+        let ice = ice_iter.next().unwrap();
+        let cfg_c = Arc::clone(&cfg);
+        let sem_c = Arc::clone(&sem);
+        let metrics_c = Arc::clone(&metrics);
+        let thr_c = Arc::clone(&carrier_thr);
+        let bar_c = Arc::clone(&barrier);
+        // Build the worker (and its non-Send DeepFilterNet model) inside its own
+        // thread so nothing DFN-related ever crosses a thread boundary.
+        thread::spawn(move || {
+            let worker = Worker::new(c, &cfg_c, udp, ice);
+            worker.run(rx, cfg_c, sem_c, metrics_c, thr_c, bar_c);
+        });
+    }
 
     eprintln!(
-        "airband-reader: {} channels, audio {} sps, mode {:?}, squelch {:?}, split {}, agc {}",
-        args.channels, cfg.rate, cfg.mode, args.squelch, cfg.split, cfg.agc_on
+        "airband-reader: {} channels, audio {} sps, mode {:?}, squelch {:?}, split {}, agc {}, dfn {} (max-active {})",
+        n, cfg.rate, cfg.mode, args.squelch, cfg.split, cfg.agc_on, cfg.dfn_on, args.dfn_max_active
     );
+    if cfg.dfn_on {
+        eprintln!("loading DeepFilterNet models for output channels (eager startup)...");
+    }
+    barrier.wait();
+    eprintln!("ready");
 
+    let mut stats = StatsPrinter::new(args.stats_interval, n, cfg.mode);
     loop {
-        if let Err(e) = run_session(&args, &cfg, &mut channels, metrics.as_ref(), &mut last_report) {
+        if let Err(e) =
+            run_session(&args.addr, n, &cfg, &senders, &metrics, &carrier_thr, &mut stats)
+        {
             eprintln!("stream error ({e:#}); reconnecting in 1s");
-            for ch in channels.iter_mut() {
-                ch.finalize(&cfg); // close any open split recording
-                ch.last_seq = None; // a reconnect is an expected seq discontinuity
+            // Reconnect: tell workers to finalize recordings and clear state.
+            for s in &senders {
+                let _ = s.send(Msg::Reset);
             }
-            std::thread::sleep(Duration::from_secs(1));
+            thread::sleep(Duration::from_secs(1));
         }
     }
 }

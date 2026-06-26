@@ -11,12 +11,11 @@ path = "src/main.rs"
 
 [dependencies]
 airband-dsp = { path = "../airband-dsp" }
+airband-dfn = { path = "../airband-dfn" }
 anyhow = "1.0"
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.28"
-deep_filter = { git = "https://github.com/Rikorose/DeepFilterNet", rev = "d375b2d8309e0935d165700c91da9de862a99c31", version = "0.5.7-pre", features = ["tract", "default-model", "transforms"] }
 eframe = "0.34"
 egui_plot = "0.35"
-ndarray = "0.15"
 rodio = { version = "0.19", default-features = false }
 rustfft = "6.4.1"

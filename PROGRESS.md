@@ -1098,6 +1098,75 @@ Captures via `airband-reader` (minimal-DSP: `--squelch off --no-agc --no-filter
 - All knobs are live/CLI-tunable: `--dfn-min-snr`, `--dfn-atten-lim`, `--dfn-pf-beta`,
   `--presence-db/-hz/-q`; `p` toggles brightness, `D` toggles DFN.
 
+### Multi-channel DFN/presence in airband-reader for all 21 Icecast feeds (2026-06-26)
+- **Goal:** bring the listener's proven chain (VOX squelch → filters → AGC → DFN →
+  presence) to `airband-reader` so every streamed channel sounds the same, within
+  the Raspberry Pi 5's 4× A76 / 8 GB budget. Per the user: **always filter, never
+  drop**; **eager model init at startup** so no transmission is missed.
+- **Shared `host/airband-dfn` crate.** Moved `LinResampler`/`DfnEnhancer`/`DfnParams`
+  out of the listener and added `Presence` (the `HighShelf` brightness + `soft_clip`),
+  so both binaries enhance audio from one source. `airband-listen` now depends on it
+  (its `src/dfn.rs` deleted); the `tract-*` 0.21.4 pins and the debug-gated model-load
+  test moved with it (passes under `cargo test --release`).
+- **Router + per-channel worker model.** `run_session` is now a thin **router**: it
+  unpacks frames, detects drops, maintains the carrier-mode noise reference, and
+  routes each sample to its channel's **worker thread** over an **unbounded**
+  `mpsc` queue — so the socket read never blocks and **no sample is ever dropped**.
+  One worker per channel owns its squelch + VOX `sq_filter` (voice-band level, like
+  the listener) + band-pass/LPF/notch/denoise/AGC + DFN + presence + recorder/UDP/
+  Icecast fan-out, so the Pi's cores run channels in parallel.
+- **Eager DFN init + barrier.** Each worker builds its `DfTract` at thread start
+  (in-thread, since `DfTract` is `!Send`) and the router waits on a `Barrier` until
+  all are ready before connecting — no transmission lost to a cold model. Fixed
+  ~10–15 MB/channel RSS, deliberate per the dedicated-Pi spec.
+- **DFN concurrency cap = wait, never bypass — per inference hop.** A global
+  counting semaphore (`--dfn-max-active`, default 3) bounds simultaneous NN
+  inference; a hop that can't get a permit **blocks**, so its channel's (unbounded)
+  queue buffers and the audio is delayed but still fully DFN-filtered — latency is
+  the only overload valve, honoring *always filter / never drop*. The permit is
+  acquired/released **per hop** (around each `DfTract::process` call), not for the
+  whole open period, so permits rotate among all open channels and a continuously-
+  keyed channel (AWOS/ATIS) cannot starve the rest. DFN3 is sub-real-time on one
+  A76, so the cap rarely engages for realistic airband concurrency.
+- **Carrier-noise percentile aligned to the listener** (75th → median 0.5): at useful
+  gain the conducted comb elevates several channels, so a high percentile inflates the
+  "noise" reference. New CLI flags mirror the listener: `--no-dfn`, `--dfn-min-snr`,
+  `--dfn-atten-lim`, `--dfn-pf-beta`, `--presence-db/-hz/-q`, `--dfn-max-active`.
+- **All outputs enhanced** (Icecast/UDP/WAV get the identical DFN+presence audio).
+  Stats/metrics now flow through the shared `Metrics` atomics (router writes
+  samples/drops/peak; workers write the squelch gauges).
+- **Reader defaults flipped to DFN-centric** for listener parity: band-pass, LPF,
+  notch, and spectral denoise now **off by default** (AGC + DFN + presence on).
+  The enable flags changed accordingly — `--no-filter`/`--no-denoise` became
+  `--filter`/`--denoise` (off→on), and `--lpf-hz` now defaults to `0` (pass e.g.
+  2500 to enable). AGC stays on (`--no-agc` to disable).
+- Workspace builds + tests green (debug + `--release`); **live Pi 5 validation
+  pending credentials.**
+
+### Fix: DFN permit starvation — acquire/release per inference hop (2026-06-26)
+- **Symptom:** on the device, with all 21 channels enhanced, only ~3 channels ever
+  produced audio; the rest were silent. (A continuously-keyed channel like ch0
+  AWOS made it worse.)
+- **Root cause:** `Worker::apply_dfn` acquired a `--dfn-max-active` permit when a
+  channel's squelch *opened* and held it for the **entire transmission** (released
+  only on close). With the default cap of 3, the first 3 channels to open kept their
+  permits indefinitely; every later channel blocked forever in `Semaphore::acquire`,
+  so its samples were never processed → silence. A continuous carrier never released
+  its slot at all. This contradicted the plan's intended *block per hop* semantics.
+- **Fix:** scope the permit to the **inference**, not the open period. Added an
+  `InferencePermit` trait in `host/airband-dfn` (no-op `()` impl for unbounded use)
+  and a `DfnEnhancer::process_sample_gated` that wraps only the `DfTract::process`
+  forward pass in `enter()`/`leave()`. `airband-reader` now `impl`s the trait on its
+  `Semaphore` and calls `process_sample_gated` each sample; the `holding_permit`
+  field and open/close acquire/release are gone. Permits now free between hops and
+  rotate among all open channels — a slow/overrun hop still **waits** (buffers, never
+  drops), but no channel can be starved. `airband-listen` untouched (uses the no-op
+  permit via `process_sample`).
+- **Verified on device** (`…:30000`): forcing all 21 channels open with
+  `--dfn-max-active 3` now yields audio on **all 21** (RMS −14…−18 dBFS, 0 drops),
+  vs 3/21 before. Default VOX+DFN run: ch0 AWOS loud (−18.4 dBFS RMS, −1.5 peak),
+  0 drops. `airband-dfn` (3) + `airband-reader` (13) tests pass.
+
 ## Next steps
 - **Buzz spurs are characterized** (see "Buzz spur taxonomy", 2026-06-24): the
   dominant 126.000 MHz tooth is the AD9361 sample-clock 9th harmonic (9×14 MHz), plus

@@ -160,6 +160,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "airband-dfn"
+version = "0.1.0"
+dependencies = [
+ "airband-dsp",
+ "anyhow",
+ "deep_filter",
+ "ndarray",
+]
+
+[[package]]
 name = "airband-dsp"
 version = "0.1.0"
 dependencies = [
@@ -170,14 +180,13 @@ dependencies = [
 name = "airband-listen"
 version = "0.1.0"
 dependencies = [
+ "airband-dfn",
  "airband-dsp",
  "anyhow",
  "clap",
  "crossterm",
- "deep_filter",
  "eframe",
  "egui_plot",
- "ndarray",
  "rodio",
  "rustfft",
 ]
@@ -186,6 +195,7 @@ dependencies = [
 name = "airband-reader"
 version = "0.1.0"
 dependencies = [
+ "airband-dfn",
  "airband-dsp",
  "anyhow",
  "clap",

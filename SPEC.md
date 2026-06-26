@@ -150,9 +150,10 @@ the airband channelizer generalizes by time-multiplexing.
                                          ▼
    ┌───────────────────────────────────────────────────────────────┐
    │  Host (PC now; Raspberry Pi at the tower in production)         │
-   │   airband-dsp (Rust lib): squelch, voice band-pass, notch, AGC  │
-   │   airband-reader (Rust): demux, drop detection, DSP chain,      │
-   │     split-on-transmission WAV/raw, Icecast(LAME)/UDP/metrics    │
+   │   airband-dsp / airband-dfn (Rust libs): squelch, band-pass,    │
+   │     notch, denoise, AGC, DeepFilterNet, presence                │
+   │   airband-reader (Rust): router + per-channel workers, demux,   │
+   │     DFN/presence DSP, WAV/raw, Icecast(LAME)/UDP/metrics         │
    │   airband-listen (Rust): live DSP playback, scanner/mix modes,  │
    │     per-channel dBFS meters                                      │
    └───────────────────────────────────────────────────────────────┘
@@ -403,8 +404,10 @@ buffer to all connected TCP clients on `0.0.0.0:30000`. Clients that fall more t
 **raw 64-bit records**, not per-channel sockets.
 
 ### 6.4 Host tools and shared DSP
-The host side is a Cargo workspace (`host/`): two binaries over a shared DSP
-library `host/airband-dsp` (Rust). The DSP is ported from RTLSDR-Airband and
+The host side is a Cargo workspace (`host/`): two binaries over shared libraries
+`host/airband-dsp` (filters, squelch, AGC, presence high-shelf) and
+`host/airband-dfn` (the DeepFilterNet enhancer + presence brightness, shared so
+both binaries enhance identically). The DSP is ported from RTLSDR-Airband and
 adapted to the fact that the FPGA already AM-demodulates and DC-blocks the audio
 (§6.1-6.2), so there is no IQ/de-emphasis stage on the host. The chain per channel
 is: **squelch** (EWMA noise-floor tracking → SNR/manual threshold, with an
@@ -420,8 +423,8 @@ An optional STFT **spectral noise reduction** stage (`airband-dsp::Denoise`,
 decision-directed Wiener gain, 256-pt frames at 50% overlap) sits between the
 notch and the AGC. It learns the per-bin noise floor only while the channel is
 below the speech-present threshold, so broadband hiss under the voice is
-attenuated without warbling the speech. It is on by default (`--no-denoise` to
-disable, `--denoise-floor-db` to bound the cut).
+attenuated without warbling the speech. With the DFN-centric defaults it is now
+**off by default** (`--denoise` to enable, `--denoise-floor-db` to bound the cut).
 
 Two squelch strategies exist.
 
@@ -438,9 +441,11 @@ per-channel adaptive-SNR floor is *not* usable here: it can't tell a continuous
 AWOS carrier from a high steady noise floor, so it learns the carrier away and
 closes. Instead the host derives a **shared, fixed threshold from a cross-channel
 noise estimate** — all channels of one receiver see the same wideband noise, so
-the 75th percentile of the live per-channel carrier levels is the noise reference
-and a station is a large outlier above it. The threshold is
-`pct75 × 10^(--squelch-snr/20)`, recomputed every 8192 frames
+the **median** (50th percentile) of the live per-channel carrier levels is the
+noise reference and a station is a large outlier above it (the median matches
+`airband-listen`: at useful gain the conducted comb elevates several channels,
+which would inflate a high percentile and push the threshold above real traffic).
+The threshold is `median × 10^(--squelch-snr/20)`, recomputed every 8192 frames
 (`airband-dsp::carrier_noise_threshold`) and applied to every channel via
 `Squelch::set_threshold`. Because it tracks the *other* channels' noise rather
 than a channel's own level, it holds a continuous carrier open (no hang, no
@@ -452,8 +457,10 @@ carrier alone can't distinguish speech from inter-word silence within an open
 transmission).
 
 `host/airband-reader` connects to `:30000`, demuxes records by the channel byte,
-and uses the per-channel sequence counter to count dropped samples. Defaults:
-squelch `auto` (`--squelch-snr 9` dB), band-pass on, AGC on. Modes: `stats` (live
+and uses the per-channel sequence counter to count dropped samples. Defaults are
+**DFN-centric** (matching `airband-listen`): squelch `auto` (`--squelch-snr 9` dB),
+AGC + DeepFilterNet + presence on, with band-pass/LPF/notch/spectral-denoise off
+(enable with `--filter`/`--lpf-hz`/`--notch`/`--denoise`). Modes: `stats` (live
 link health + level/floor dBFS + transmission counts, default), `wav`, and `raw`.
 Recording defaults to **split-on-transmission** (one timestamped file per keyed
 transmission, gated by the squelch — no dead air); `--no-split` writes one
@@ -468,7 +475,28 @@ or more servers (a channel may fan out to several servers), with per-feed
 (`disabled`/`transport`/`upgrade`/`auto`/`auto_no_plain`, plus a testing-only
 `tls_insecure`); the handshake response is checked so a rejected source
 reconnects instead of going silently quiet. A single `--icecast-*` flag set is
-the one-channel shortcut. `host/airband-listen`
+the one-channel shortcut.
+
+`airband-reader` runs the **same full enhancement chain as `airband-listen`** —
+VOX squelch (voice-band) → band-pass/LPF/notch/denoise → AGC → **DeepFilterNet**
+→ **presence brightness** → soft clip — on **every** streamed channel, so all
+Icecast/UDP/WAV outputs carry identical enhanced audio. To stay real-time across
+21 channels on the Raspberry Pi 5 (4× Cortex-A76) it uses a **router + per-channel
+worker** model: a single router thread reads the socket, detects drops, maintains
+the carrier-mode noise reference, and routes each sample to its channel's worker
+over an **unbounded queue** (never blocking the socket, never dropping a sample);
+one worker thread per channel runs that channel's DSP + DFN + presence and fans
+out to its sinks. DeepFilterNet models load **eagerly at startup** (the router
+waits on a barrier for all workers before reading the stream) so no transmission
+is missed to a cold model (~10–15 MB RAM per streamed channel, fixed). A global
+**DFN concurrency cap** (`--dfn-max-active`, default 3) bounds simultaneous NN
+inference, acquired/released **per inference hop** (not per transmission) so a
+continuously-keyed channel cannot starve the others — permits free between hops
+and rotate among all open channels. Over the cap a hop **waits** (its channel's
+queue buffers, adding latency) rather than dropping or bypassing — the constraint
+is *always filter, never drop*, with latency as the only overload valve. Built so
+per the user's dedicated-Pi requirement; DFN3 runs faster than real time on one
+A76, so for realistic airband concurrency the cap rarely engages. `host/airband-listen`
 runs the same chain on the played channel (and the squelch on every channel for
 activity meters), with `single`/`follow` (scanner)/`mix` monitor modes and live
 toggles. It defaults to **audio VOX squelch** (a carrier-level squelch proved fragile

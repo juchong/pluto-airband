@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 airband-dsp = { path = "../airband-dsp" }
+airband-dfn = { path = "../airband-dfn" }
 anyhow = "1.0"
 clap = { version = "4", features = ["derive"] }
 mp3lame-encoder = "0.2.4"

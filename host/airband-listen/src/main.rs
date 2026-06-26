@@ -37,7 +37,7 @@
 //!   q                   quit
 
 use airband_dsp::{
-    carrier_noise_threshold, decode_carrier, Agc, Denoise, HighShelf, LowPass, Notch, Squelch,
+    carrier_noise_threshold, decode_carrier, Agc, Denoise, LowPass, Notch, Squelch,
     SquelchConfig, SquelchMode, SquelchState, VoiceFilter, SAMPLE_SCALE,
 };
 use anyhow::{Context, Result};
@@ -65,8 +65,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-mod dfn;
-use dfn::{DfnEnhancer, DfnParams};
+use airband_dfn::{DfnEnhancer, DfnParams, Presence};
 
 /// Per-channel audio rate: the channelizer is fed IQ at Fs = 14 Msps and
 /// decimates by 640 (128 lane CIC * 5 audio) -> 21875 sps. (Older bitstreams used
@@ -394,28 +393,10 @@ fn push_fft_raw(shared: &Shared, sample: f32) {
     }
 }
 
-/// Applies DeepFilterNet to one played sample when enabled, lazily building the
-/// enhancer (the model load stalls the audio thread once) and resetting it while
-/// the stream is inactive — DFN only runs while the squelch is open. Runs on the
-/// fully-processed (filtered + AGC-leveled) audio so the model sees a healthy,
-/// in-range signal.
-/// Smooth bounded clip in (-1, 1): identity below 0.8, then a tanh knee, so a
-/// presence-boosted peak can never clip the 16-bit output.
-#[inline]
-fn soft_clip(v: f32) -> f32 {
-    let t = 0.8f32;
-    let a = v.abs();
-    if a <= t {
-        v
-    } else {
-        v.signum() * (t + (1.0 - t) * ((a - t) / (1.0 - t)).tanh())
-    }
-}
-
 /// Post-DFN presence (consonant) boost on the played sample, then a soft clip.
 /// Toggled by `presence_on`; the IIR is reset while the stream is idle so it
 /// starts each transmission clean.
-fn apply_presence(shared: &Shared, presence: &mut HighShelf, sample: f32, active: bool) -> f32 {
+fn apply_presence(shared: &Shared, presence: &mut Presence, sample: f32, active: bool) -> f32 {
     if !active {
         presence.reset();
         return sample;
@@ -423,9 +404,14 @@ fn apply_presence(shared: &Shared, presence: &mut HighShelf, sample: f32, active
     if !shared.presence_on.load(Ordering::Relaxed) {
         return sample;
     }
-    soft_clip(presence.process(sample as f64) as f32)
+    presence.process(sample)
 }
 
+/// Applies DeepFilterNet to one played sample when enabled, lazily building the
+/// enhancer (the model load stalls the audio thread once) and resetting it while
+/// the stream is inactive — DFN only runs while the squelch is open. Runs on the
+/// fully-processed (filtered + AGC-leveled) audio so the model sees a healthy,
+/// in-range signal.
 fn apply_dfn(
     shared: &Shared,
     dfn: &mut Option<DfnEnhancer>,
@@ -605,7 +591,7 @@ fn reader_loop(shared: Arc<Shared>, addr: String, n: usize, cfg: DspCfg, mix: bo
     // One instance on the played stream, not per channel.
     let mut dfn: Option<DfnEnhancer> = None;
     // Post-DFN brightness (high-shelf) lift on the played stream; gated by presence_on.
-    let mut presence = HighShelf::new(
+    let mut presence = Presence::new(
         cfg.rate as f64,
         cfg.presence_hz,
         cfg.presence_q,

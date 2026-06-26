@@ -137,8 +137,9 @@ over USB. Full build + flash + first-boot details (incl. the u-boot env that a
 ### 2. Listen
 
 The host tools are a Cargo workspace (`host/`): two binaries (`airband-reader`,
-`airband-listen`) over a shared DSP library (`airband-dsp`). Build everything at
-once:
+`airband-listen`) over shared libraries — `airband-dsp` (filters, squelch, AGC)
+and `airband-dfn` (the DeepFilterNet enhancer + presence brightness, shared so
+both binaries enhance audio identically). Build everything at once:
 
 ```bash
 cargo build --release --manifest-path host/Cargo.toml
@@ -163,7 +164,10 @@ the FPGA's already-demodulated, DC-blocked audio): per-channel **squelch**, a
 airband AM voice has no usable energy above ~3.4 kHz so a wider corner only passes
 hiss), an optional **notch**, an STFT **noise reduction** stage that attenuates the
 broadband hiss under the voice, and an **AGC** that normalizes loudness and
-soft-clips peaks. Defaults: band-pass on, 2.5 kHz LPF on, denoise on, AGC on.
+soft-clips peaks. **Both binaries now default to a DFN-centric chain**: AGC +
+**DeepFilterNet** + presence brightness **on**, while the band-pass, 2.5 kHz LPF,
+notch, and spectral denoise start **off** so DFN does the cleanup in isolation
+(enable them with `--filter`, `--lpf-hz`, `--notch`, `--denoise`).
 `airband-reader` and **`airband-listen` both default to squelch `auto`** (audio
 VOX, see below); a carrier-level squelch proved fragile against the conducted
 spur comb's per-channel offsets, so detection keys on in-band voice modulation.
@@ -180,8 +184,8 @@ push-to-talk traffic; raise it if a feed still chatters between words.
 A bitstream built from the current `hdl/` also ships a per-channel **carrier
 level** in each audio frame; with it, `--squelch carrier` gates on carrier power
 instead of voice energy. All channels of one receiver see the same wideband
-noise, so the host takes a high percentile (75th) of the live per-channel carrier
-levels as a shared **noise reference** and opens any channel whose carrier sits
+noise, so the host takes the **median** (50th percentile) of the live per-channel
+carrier levels as a shared **noise reference** and opens any channel whose carrier sits
 `--squelch-snr` dB above it. Because that threshold comes from the *other*
 channels' noise (not a channel's own level), it holds a continuous carrier
 (AWOS/ATIS) open with no hang and no chatter, while empty channels stay shut. The
@@ -189,11 +193,12 @@ new bitstream and host tools must be deployed together.
 
 - `--squelch off|auto|manual|carrier` (`--squelch-snr`, `--squelch-level` dBFS,
   `--squelch-hang-ms`) — gating, threshold, and hang time.
-- `--no-denoise`, `--denoise-floor-db <dB>` — spectral noise reduction (more
-  negative floor = deeper, more aggressive cut).
-- `--no-filter`, `--filter-low`/`--filter-high` — voice band-pass (300–3400 Hz).
+- `--denoise` (off by default), `--denoise-floor-db <dB>` — spectral noise
+  reduction (more negative floor = deeper, more aggressive cut).
+- `--filter` (off by default), `--filter-low`/`--filter-high` — voice band-pass
+  (300–3400 Hz).
 - `--lpf-hz <Hz>` — standalone low-pass −3 dB corner applied after the band-pass
-  (default 2500; `0` disables). In `airband-listen` toggle live with `l`.
+  (default `0` = off; e.g. `2500` to enable). In `airband-listen` toggle live with `l`.
 - `--notch <Hz>` / `--notch-q` — tonal-spur notch.
 - `--no-agc` falls back to fixed-gain output, where `--shift` scales the 24-bit
   sample to 16-bit (**positive = attenuate, negative = makeup gain**; airband AM
@@ -280,6 +285,46 @@ proxy that accepts the `SOURCE` method, use `tls: "transport"` against the
 HTTPS port. If the source connection is rejected (wrong password, bad mount,
 etc.) the reader now logs the server's HTTP status and reconnects, rather than
 silently going quiet.
+
+### Multi-channel enhancement on the Pi 5 (DeepFilterNet for every feed)
+
+`airband-reader` runs the **same enhancement chain as `airband-listen`** on
+**every** streamed channel — VOX squelch (voice-band) → AGC → **DeepFilterNet** →
+**presence brightness** → soft clip, with the band-pass/LPF/notch/spectral-denoise
+**off by default** (DFN-centric, enable per the flags above) — so all 21 Icecast
+mounts sound like the tuned single-channel listener, and the *identical* enhanced
+audio goes to Icecast, UDP, and WAV recordings.
+
+To keep this real-time across 21 channels on the Raspberry Pi 5 (4× Cortex-A76)
+the reader is a **router + per-channel worker** pipeline:
+
+- A **router thread** reads the TCP stream, detects drops, maintains the
+  carrier-mode noise reference, and hands each sample to its channel's worker
+  over an **unbounded queue** — it never blocks the socket and **never drops** a
+  sample.
+- One **worker thread per channel** runs that channel's full DSP + DFN + presence
+  and fans the result out to its outputs, so the Pi's cores process channels in
+  parallel and a slow DFN inference never stalls the stream.
+- **DeepFilterNet models load eagerly at startup** (the router waits on a barrier
+  until all workers' models are ready before reading the stream), so no
+  transmission is ever missed to a cold model. This costs a fixed ~10–15 MB per
+  streamed channel of RAM — trivial on the Pi 5's 8 GB.
+- A global **DFN concurrency cap** (`--dfn-max-active`, default **3**) bounds how
+  many NN **inferences** run simultaneously, leaving a core for I/O. The permit is
+  acquired **per inference hop** (around each forward pass) and released right
+  after, not held for a whole transmission — so a continuously-keyed channel
+  (AWOS/ATIS) can never hold a slot long enough to **starve** the others; permits
+  free between hops and rotate among all open channels. The cap **never bypasses
+  or drops**: a hop that can't get a permit *waits*, so that channel's audio is
+  buffered (adding latency) and still fully filtered. For real airband traffic —
+  only a few channels keyed at once, DFN running faster than real time on one A76
+  — the cap rarely engages; raise it if you have headroom, lower it if you see
+  drops or thermal throttling.
+
+DFN tuning and presence flags are shared with the listener (see below):
+`--no-dfn`, `--dfn-min-snr` (−20), `--dfn-atten-lim` (15), `--dfn-pf-beta`
+(0.02), `--presence-db` (8), `--presence-hz` (1600), `--presence-q` (0.707), and
+`--dfn-max-active` (3).
 
 ### Audition channels live (testing)
 
@@ -525,9 +570,10 @@ the request/response schema.
 | `hdl/` | Amaranth HDL DSP blocks (channelizer, AM demod, framer) + sims; see `hdl/README.md` |
 | `firmware/` | build scripts, devicetree patch, channel-plan template, image notes (`firmware/README.md`) |
 | `firmware/diagnostics/` | RF diagnostic toolkit + the buzz root-cause analysis (`firmware/diagnostics/README.md`) |
-| `host/` | Rust host workspace (shared DSP + two client binaries) |
-| `host/airband-dsp/` | shared DSP library: voice band-pass, notch, squelch, noise reduction, AM AGC, dBFS |
-| `host/airband-reader/` | host reader: demux, drop detection, DSP, split recording, Icecast/UDP/metrics |
+| `host/` | Rust host workspace (shared libs + two client binaries) |
+| `host/airband-dsp/` | shared DSP library: voice band-pass, notch, squelch, noise reduction, AM AGC, presence high-shelf, dBFS |
+| `host/airband-dfn/` | shared DeepFilterNet enhancer + presence brightness (used by both binaries) |
+| `host/airband-reader/` | host reader: router + per-channel workers, demux, drop detection, DFN/presence DSP, split recording, Icecast/UDP/metrics |
 | `host/airband-listen/` | interactive listener: live DSP playback, scanner/mix modes, per-channel meters |
 | `maia-sdr/` | our Maia SDR fork (gitignored here; the airband HDL + `maia-httpd` integration) |
 | `plutosdr-fw/` | Pluto firmware assembler (gitignored; pinned upstream) |

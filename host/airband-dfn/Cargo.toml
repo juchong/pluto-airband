@@ -1,0 +1,12 @@
+[package]
+name = "airband-dfn"
+version = "0.1.0"
+edition = "2021"
+description = "DeepFilterNet speech-enhancement stage shared by the Pluto airband host tools"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+airband-dsp = { path = "../airband-dsp" }
+anyhow = "1.0"
+deep_filter = { git = "https://github.com/Rikorose/DeepFilterNet", rev = "d375b2d8309e0935d165700c91da9de862a99c31", version = "0.5.7-pre", features = ["tract", "default-model", "transforms"] }
+ndarray = "0.15"

@@ -12,7 +12,10 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 
-/// Per-channel metric cells, updated from the processing loop.
+/// Per-channel metric cells. The router updates the sample/drop/peak counters
+/// (it sees every record); each channel worker updates the squelch-derived
+/// gauges. All cells are atomic so they double as the cross-thread stats bus
+/// regardless of whether the Prometheus endpoint is enabled.
 pub struct ChannelMetric {
     pub samples: AtomicU64,
     pub drops: AtomicU64,
@@ -21,6 +24,8 @@ pub struct ChannelMetric {
     pub level_bits: AtomicU32,
     /// Noise floor (raw 24-bit units) as f32 bits.
     pub floor_bits: AtomicU32,
+    /// Peak audio magnitude since the last stats interval (raw units) as f32 bits.
+    pub peak_bits: AtomicU32,
     pub open: AtomicBool,
 }
 
@@ -32,18 +37,47 @@ impl ChannelMetric {
             transmissions: AtomicU64::new(0),
             level_bits: AtomicU32::new(0),
             floor_bits: AtomicU32::new(0),
+            peak_bits: AtomicU32::new(0),
             open: AtomicBool::new(false),
         }
     }
 
-    /// Stores a snapshot of a channel's current state.
-    pub fn set(&self, samples: u64, drops: u64, transmissions: u64, level: f32, floor: f32, open: bool) {
-        self.samples.store(samples, Ordering::Relaxed);
-        self.drops.store(drops, Ordering::Relaxed);
+    /// Router: count one received sample and track the interval peak magnitude.
+    /// `mag` is a non-negative raw amplitude, so its bit pattern is monotonic and
+    /// can be max-reduced directly.
+    pub fn note_sample(&self, mag: f32) {
+        self.samples.fetch_add(1, Ordering::Relaxed);
+        let bits = mag.to_bits();
+        let mut cur = self.peak_bits.load(Ordering::Relaxed);
+        while bits > cur {
+            match self.peak_bits.compare_exchange_weak(
+                cur,
+                bits,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(c) => cur = c,
+            }
+        }
+    }
+
+    /// Router: record `n` dropped samples detected from the sequence counter.
+    pub fn add_drops(&self, n: u64) {
+        self.drops.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Worker: publish the channel's current squelch-derived gauges.
+    pub fn set_squelch(&self, transmissions: u64, level: f32, floor: f32, open: bool) {
         self.transmissions.store(transmissions, Ordering::Relaxed);
         self.level_bits.store(level.to_bits(), Ordering::Relaxed);
         self.floor_bits.store(floor.to_bits(), Ordering::Relaxed);
         self.open.store(open, Ordering::Relaxed);
+    }
+
+    /// Stats printer: read and reset the interval peak magnitude (raw units).
+    pub fn take_peak(&self) -> f32 {
+        f32::from_bits(self.peak_bits.swap(0, Ordering::Relaxed))
     }
 }
 
