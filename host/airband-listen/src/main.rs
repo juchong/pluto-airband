@@ -37,7 +37,7 @@
 //!   q                   quit
 
 use airband_dsp::{
-    carrier_noise_threshold, decode_carrier, Agc, Denoise, LowPass, Notch, Squelch,
+    carrier_noise_threshold, decode_carrier, Agc, Denoise, HighShelf, LowPass, Notch, Squelch,
     SquelchConfig, SquelchMode, SquelchState, VoiceFilter, SAMPLE_SCALE,
 };
 use anyhow::{Context, Result};
@@ -66,7 +66,7 @@ use std::{
 };
 
 mod dfn;
-use dfn::DfnEnhancer;
+use dfn::{DfnEnhancer, DfnParams};
 
 /// Per-channel audio rate: the channelizer is fed IQ at Fs = 14 Msps and
 /// decimates by 640 (128 lane CIC * 5 audio) -> 21875 sps. (Older bitstreams used
@@ -171,6 +171,30 @@ struct Args {
     /// (toggle live with `D`). Heavy inference; runs only while squelch is open.
     #[arg(long)]
     dfn: bool,
+    /// DeepFilterNet local-SNR floor in dB: frames below this are muted. DFN's
+    /// stock value (-10) chops faint speech frame-by-frame ("garble"); -20 keeps
+    /// even very quiet mumbles. Raise toward -10 to gate weak/noisy frames harder.
+    #[arg(long, default_value_t = -20.0, allow_hyphen_values = true)]
+    dfn_min_snr: f32,
+    /// DeepFilterNet max noise attenuation in dB (>=100 = unlimited). The cap mixes
+    /// some of the noisy signal back so a frame is never fully muted — this keeps
+    /// noise-like consonants (CH/S/F) from being chopped. Lower = less chopping but
+    /// more residual noise; raise toward 100 for deeper suppression.
+    #[arg(long, default_value_t = 15.0)]
+    dfn_atten_lim: f32,
+    /// DeepFilterNet post-filter beta (0 = off; ~0.02 trims residual musical noise).
+    #[arg(long, default_value_t = 0.02)]
+    dfn_pf_beta: f32,
+    /// Post-DFN brightness: high-shelf gain (dB) above `--presence-hz` to restore
+    /// the upper voice band the denoiser rolls off (de-muffle). 0 = off; `p` toggles.
+    #[arg(long, default_value_t = 8.0, allow_hyphen_values = true)]
+    presence_db: f64,
+    /// Corner frequency (Hz) of the post-DFN brightness high-shelf.
+    #[arg(long, default_value_t = 1600.0)]
+    presence_hz: f64,
+    /// Transition Q of the post-DFN brightness high-shelf.
+    #[arg(long, default_value_t = 0.707)]
+    presence_q: f64,
     /// Notch (band-stop) center frequency in Hz to kill a tonal spur (off if unset).
     #[arg(long)]
     notch: Option<f64>,
@@ -201,6 +225,10 @@ struct DspCfg {
     notch_freq: Option<f64>,
     notch_q: f64,
     denoise_floor_db: f32,
+    dfn: DfnParams,
+    presence_hz: f64,
+    presence_q: f64,
+    presence_db: f64,
 }
 
 /// State shared between the network reader thread, the audio source, and the UI.
@@ -236,6 +264,8 @@ struct Shared {
     lpf_on: AtomicBool,
     /// Toggle: DeepFilterNet enhancement on the played stream.
     dfn_on: AtomicBool,
+    /// Toggle: post-DFN presence (consonant) boost on the played stream.
+    presence_on: AtomicBool,
     /// Toggle: live FFT GUI window visible.
     fft_open: AtomicBool,
     /// Ring of the most recent played (post-DSP) samples of the active stream,
@@ -268,6 +298,7 @@ impl Shared {
             denoise_on: AtomicBool::new(toggles.denoise),
             lpf_on: AtomicBool::new(toggles.lpf),
             dfn_on: AtomicBool::new(toggles.dfn),
+            presence_on: AtomicBool::new(toggles.presence),
             fft_open: AtomicBool::new(false),
             fft_samples: Mutex::new(VecDeque::with_capacity(FFT_RING)),
             fft_raw: Mutex::new(VecDeque::with_capacity(FFT_RING)),
@@ -284,6 +315,7 @@ struct Toggles {
     denoise: bool,
     lpf: bool,
     dfn: bool,
+    presence: bool,
 }
 
 /// Per-sample DSP toggle snapshot handed to [`ChannelDsp::process`].
@@ -367,9 +399,37 @@ fn push_fft_raw(shared: &Shared, sample: f32) {
 /// the stream is inactive — DFN only runs while the squelch is open. Runs on the
 /// fully-processed (filtered + AGC-leveled) audio so the model sees a healthy,
 /// in-range signal.
+/// Smooth bounded clip in (-1, 1): identity below 0.8, then a tanh knee, so a
+/// presence-boosted peak can never clip the 16-bit output.
+#[inline]
+fn soft_clip(v: f32) -> f32 {
+    let t = 0.8f32;
+    let a = v.abs();
+    if a <= t {
+        v
+    } else {
+        v.signum() * (t + (1.0 - t) * ((a - t) / (1.0 - t)).tanh())
+    }
+}
+
+/// Post-DFN presence (consonant) boost on the played sample, then a soft clip.
+/// Toggled by `presence_on`; the IIR is reset while the stream is idle so it
+/// starts each transmission clean.
+fn apply_presence(shared: &Shared, presence: &mut HighShelf, sample: f32, active: bool) -> f32 {
+    if !active {
+        presence.reset();
+        return sample;
+    }
+    if !shared.presence_on.load(Ordering::Relaxed) {
+        return sample;
+    }
+    soft_clip(presence.process(sample as f64) as f32)
+}
+
 fn apply_dfn(
     shared: &Shared,
     dfn: &mut Option<DfnEnhancer>,
+    params: DfnParams,
     rate: u32,
     sample: f32,
     active: bool,
@@ -378,7 +438,7 @@ fn apply_dfn(
         return sample;
     }
     if dfn.is_none() {
-        match DfnEnhancer::new(rate as f64) {
+        match DfnEnhancer::new(rate as f64, params) {
             Ok(e) => *dfn = Some(e),
             Err(err) => {
                 eprintln!("DeepFilterNet init failed: {err:#}");
@@ -544,6 +604,13 @@ fn reader_loop(shared: Arc<Shared>, addr: String, n: usize, cfg: DspCfg, mix: bo
     // DeepFilterNet enhancer (lazy: built on first enable) plus its input leveler.
     // One instance on the played stream, not per channel.
     let mut dfn: Option<DfnEnhancer> = None;
+    // Post-DFN brightness (high-shelf) lift on the played stream; gated by presence_on.
+    let mut presence = HighShelf::new(
+        cfg.rate as f64,
+        cfg.presence_hz,
+        cfg.presence_q,
+        cfg.presence_db,
+    );
 
     while shared.running.load(Ordering::Relaxed) {
         match TcpStream::connect(&addr) {
@@ -643,7 +710,8 @@ fn reader_loop(shared: Arc<Shared>, addr: String, n: usize, cfg: DspCfg, mix: bo
                                 let raw_s: f32 = raw_mix_buf.iter().sum::<f32>().clamp(-1.0, 1.0);
                                 let any_open =
                                     (0..n).any(|c| shared.sq_open[c].load(Ordering::Relaxed));
-                                let s = apply_dfn(&shared, &mut dfn, cfg.rate, s, any_open);
+                                let s = apply_dfn(&shared, &mut dfn, cfg.dfn, cfg.rate, s, any_open);
+                                let s = apply_presence(&shared, &mut presence, s, any_open);
                                 push_audio(&shared, s);
                                 push_fft(&shared, s);
                                 push_fft_raw(&shared, raw_s);
@@ -662,11 +730,12 @@ fn reader_loop(shared: Arc<Shared>, addr: String, n: usize, cfg: DspCfg, mix: bo
                         continue;
                     }
                     shared.sel_state.store(state_code(st), Ordering::Relaxed);
-                    // Chain: filters -> DFN -> AGC. DFN runs on the pre-AGC signal
-                    // so it denoises before the makeup gain (avoids garbling quiet
-                    // speech that the AGC would otherwise pump up first).
+                    // Chain: filters -> AGC -> DFN -> presence boost. DFN sees the
+                    // filtered, AGC-leveled (in-range) signal; the presence EQ then
+                    // lifts the ~2 kHz consonant band of the cleaned speech.
                     let out = dsps[chan].process(sample, open, just_opened, above, opt);
-                    let out = apply_dfn(&shared, &mut dfn, cfg.rate, out, open);
+                    let out = apply_dfn(&shared, &mut dfn, cfg.dfn, cfg.rate, out, open);
+                    let out = apply_presence(&shared, &mut presence, out, open);
                     push_audio(&shared, out);
                     push_fft(&shared, out);
                     push_fft_raw(&shared, sample as f32 / SAMPLE_SCALE as f32);
@@ -770,13 +839,14 @@ fn render(
     };
     let sq = format!("{sq:<7}");
     let flags = format!(
-        "{} {} {} {} {} {} {}",
+        "{} {} {} {} {} {} {} {}",
         if shared.agc_on.load(Ordering::Relaxed) { "AGC" } else { "agc" },
         if shared.filter_on.load(Ordering::Relaxed) { "BPF" } else { "bpf" },
         if shared.notch_on.load(Ordering::Relaxed) { "NOTCH" } else { "notch" },
         if shared.denoise_on.load(Ordering::Relaxed) { "NR" } else { "nr" },
         if shared.lpf_on.load(Ordering::Relaxed) { "LPF" } else { "lpf" },
         if shared.dfn_on.load(Ordering::Relaxed) { "DFN" } else { "dfn" },
+        if shared.presence_on.load(Ordering::Relaxed) { "PRES" } else { "pres" },
         if shared.fft_open.load(Ordering::Relaxed) { "FFT" } else { "fft" },
     );
     queue!(
@@ -786,7 +856,7 @@ fn render(
             "Pluto airband live listener — {status} — {vol} — sq:{sq} — {flags} — {mode} — {records} recs\r\n"
         )),
         ResetColor,
-        Print("↑/↓ select  0-9+Enter jump  +/- vol  m mute  s squelch  a agc  f bpf  n notch  d nr  l lpf  D dfn  g fft  F follow  q quit\r\n"),
+        Print("↑/↓ select  0-9+Enter jump  +/- vol  m mute  s squelch  a agc  f bpf  n notch  d nr  l lpf  D dfn  p pres  g fft  F follow  q quit\r\n"),
     )?;
     if monitor == Monitor::Follow {
         let skipped: Vec<String> = (0..n)
@@ -879,6 +949,7 @@ fn main() -> Result<()> {
         denoise: false,
         lpf: false,
         dfn: true,
+        presence: args.presence_db != 0.0,
     };
     let cfg = DspCfg {
         rate: args.rate,
@@ -890,6 +961,14 @@ fn main() -> Result<()> {
         notch_freq: args.notch,
         notch_q: args.notch_q,
         denoise_floor_db: args.denoise_floor_db,
+        dfn: DfnParams {
+            min_snr_db: args.dfn_min_snr,
+            atten_lim_db: args.dfn_atten_lim,
+            pf_beta: args.dfn_pf_beta,
+        },
+        presence_hz: args.presence_hz,
+        presence_q: args.presence_q,
+        presence_db: args.presence_db,
     };
 
     // ~0.4 s of queued audio caps playback latency on channel switches.
@@ -1073,6 +1152,10 @@ fn run_terminal(
                     KeyCode::Char('D') => {
                         let now = !shared.dfn_on.load(Ordering::Relaxed);
                         shared.dfn_on.store(now, Ordering::Relaxed);
+                    }
+                    KeyCode::Char('p') => {
+                        let now = !shared.presence_on.load(Ordering::Relaxed);
+                        shared.presence_on.store(now, Ordering::Relaxed);
                     }
                     KeyCode::Char('F') => {
                         // Toggle scanner; mix is fixed at startup (reader-side).

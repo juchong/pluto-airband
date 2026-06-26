@@ -56,6 +56,24 @@ impl Biquad {
         )
     }
 
+    /// RBJ cookbook 2nd-order high-shelf: `gain_db` boost/cut above the `f0` (Hz)
+    /// corner, transition steepness set by `q`.
+    fn high_shelf(f0: f64, fs: f64, q: f64, gain_db: f64) -> Biquad {
+        let a = 10f64.powf(gain_db / 40.0);
+        let w0 = 2.0 * PI * f0 / fs;
+        let (cos_w0, sin_w0) = (w0.cos(), w0.sin());
+        let alpha = sin_w0 / (2.0 * q);
+        let two_sqrt_a_alpha = 2.0 * a.sqrt() * alpha;
+        Biquad::norm(
+            a * ((a + 1.0) + (a - 1.0) * cos_w0 + two_sqrt_a_alpha),
+            -2.0 * a * ((a - 1.0) + (a + 1.0) * cos_w0),
+            a * ((a + 1.0) + (a - 1.0) * cos_w0 - two_sqrt_a_alpha),
+            (a + 1.0) - (a - 1.0) * cos_w0 + two_sqrt_a_alpha,
+            2.0 * ((a - 1.0) - (a + 1.0) * cos_w0),
+            (a + 1.0) - (a - 1.0) * cos_w0 - two_sqrt_a_alpha,
+        )
+    }
+
     /// RBJ cookbook 2nd-order low-pass at `f0` (Hz) with quality factor `q`.
     fn low_pass(f0: f64, fs: f64, q: f64) -> Biquad {
         let w0 = 2.0 * PI * f0 / fs;
@@ -146,6 +164,34 @@ impl LowPass {
     pub fn new(fs: f64, cutoff: f64) -> LowPass {
         LowPass {
             stage: Biquad::low_pass(cutoff, fs, std::f64::consts::FRAC_1_SQRT_2),
+        }
+    }
+
+    #[inline]
+    pub fn process(&mut self, x: f64) -> f64 {
+        self.stage.process(x)
+    }
+
+    pub fn reset(&mut self) {
+        self.stage.reset();
+    }
+}
+
+/// High-shelf "brightness" EQ — boosts (or cuts) everything above `corner`. Used
+/// to restore the upper voice band (~2-3.4 kHz consonants) that a neural denoiser
+/// rolls off on weak speech, making pilots sound muffled. Applied after the
+/// denoiser so it lifts cleaned speech, not raw noise.
+#[derive(Clone)]
+pub struct HighShelf {
+    stage: Biquad,
+}
+
+impl HighShelf {
+    /// High-shelf at `corner` Hz, transition `q`, `gain_db` boost (+) or cut (-),
+    /// at sample rate `fs` Hz.
+    pub fn new(fs: f64, corner: f64, q: f64, gain_db: f64) -> HighShelf {
+        HighShelf {
+            stage: Biquad::high_shelf(corner, fs, q, gain_db),
         }
     }
 

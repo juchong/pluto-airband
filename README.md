@@ -298,9 +298,9 @@ squelch on *every* channel so the meter shows which frequencies are active. Inte
 keys: `↑/↓` (or `j`/`k`, `[`/`]`) step channels, type a number then `Enter` to jump,
 `+`/`-` adjust volume, `m` mutes, `s` toggles squelch, `a` toggles AGC, `f` toggles
 the band-pass, `l` toggles the **2.5 kHz low-pass**, `n` toggles a configured notch,
-`d` toggles **noise reduction**, `D` toggles **DeepFilterNet** (see below), `g`
-toggles a **live FFT window** (see below), `F` toggles **follow** (scanner) mode,
-`q` quits.
+`d` toggles **noise reduction**, `D` toggles **DeepFilterNet** (see below), `p`
+toggles the **post-DFN brightness boost**, `g` toggles a **live FFT window** (see
+below), `F` toggles **follow** (scanner) mode, `q` quits.
 `--monitor single|follow|mix` selects single-channel, scanner, or sum-of-open-
 channels playback. The per-channel meter shows **carrier level in dB over the
 cross-channel noise reference** (`dB·c`) — idle channels sit ~0, a keyed station
@@ -317,6 +317,27 @@ while the squelch is open** (the inference is expensive and there is nothing to
 enhance in muted silence), adding ~tens of ms of latency. It complements the
 spectral `d` denoiser — try either or both. First enable loads the model (a
 one-time ~½ s hitch).
+
+DFN's stock config (`--dfn-min-snr` −10, unlimited attenuation) mangles weak
+airband speech two ways: it mutes any frame below the local-SNR floor (chopping
+quiet/low-SNR speech into silence — the "garbled mumble") and, with unlimited
+attenuation, it fully guts frames it judges as noise — which includes noise-like
+consonants (CH/S/F), so they get chopped. The tuned defaults fix both:
+
+- `--dfn-min-snr` (default **−20**) — the mute floor; lower keeps fainter speech,
+  raise toward −10 to gate weak frames harder.
+- `--dfn-atten-lim` (default **15** dB) — caps the maximum attenuation so a frame
+  is never fully muted (`enh = (1−m)·enhanced + m·noisy`, `m = 10^(−dB/20)`),
+  which preserves consonants. **Lower** (e.g. 12) for less chopping but more
+  residual noise; **raise** (toward 100 = unlimited) for deeper suppression.
+- `--dfn-pf-beta` (default **0.02**) — DFN's post-filter for trimming residual
+  musical noise; `0` disables.
+
+**Brightness boost (`p`).** A high-shelf EQ applied to the cleaned speech *after*
+DFN, restoring the upper voice band (~2–3.4 kHz consonants) that the denoiser
+rolls off on weak signals (the "muffled" symptom). On by default; tune with
+`--presence-db` (default **8**, shelf gain), `--presence-hz` (default **1600**,
+corner), and `--presence-q` (default **0.707**). Set `--presence-db 0` to disable.
 
 **Live FFT window (`g`) — debugging.** Pops up a native GUI plotting a **Welch** PSD
 (2048-pt Hann, ~7 averaged segments) of the active channel's post-DSP audio, so you

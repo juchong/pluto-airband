@@ -480,7 +480,11 @@ on the played stream **by default** — the host band-pass/LPF/notch/spectral-de
 instead start off so DFN cleans up alone. The DFN3 model is embedded and run at its
 native 48 kHz via streaming resampling from 21875 sps, **after** the filter+AGC chain
 and **only while the squelch is open** (NN inference is expensive); it adds ~tens of
-ms of latency and complements the spectral denoiser. A **live FFT window** (`g`
+ms of latency and complements the spectral denoiser. DFN is tuned for weak airband
+speech via `--dfn-min-snr` (−20 dB mute floor, keeps faint speech), `--dfn-atten-lim`
+(15 dB attenuation cap so noise-like consonants are never fully chopped), and
+`--dfn-pf-beta`; a post-DFN high-shelf **brightness** boost (`p` key) restores the
+upper voice band the denoiser rolls off (the "muffled" symptom). A **live FFT window** (`g`
 key) plots a Welch PSD of the active post-DSP audio with a hover crosshair
 (frequency/magnitude) and a locked Y axis — a debugging aid for the host filters. The
 voice band-pass is on by default but does not remove the RF spur "buzz" (see §7).

@@ -56,6 +56,32 @@ impl LinResampler {
     }
 }
 
+/// Tunable DeepFilterNet runtime parameters (applied to `DfTract` after load).
+#[derive(Clone, Copy, Debug)]
+pub struct DfnParams {
+    /// Local-SNR floor in dB. DFN treats any frame whose estimated local SNR is
+    /// below this as noise-only and applies a **zero mask** (mutes the hop). Its
+    /// stock value (-10) chops quiet/low-SNR speech into silence frame-by-frame —
+    /// the "garbled mumble" artifact — so we lower it to keep faint speech.
+    pub min_snr_db: f32,
+    /// Maximum noise attenuation in dB (>= 100 = unlimited). Lower values mix some
+    /// of the noisy signal back in, trading suppression depth for fewer artifacts.
+    pub atten_lim_db: f32,
+    /// Post-filter beta (0 = off). A small value (~0.02) trims residual musical
+    /// noise around the speech for a crisper result.
+    pub pf_beta: f32,
+}
+
+impl Default for DfnParams {
+    fn default() -> Self {
+        DfnParams {
+            min_snr_db: -20.0,
+            atten_lim_db: 15.0,
+            pf_beta: 0.02,
+        }
+    }
+}
+
 /// DeepFilterNet enhancer operating on a single mono stream at `native_rate`.
 pub struct DfnEnhancer {
     df: DfTract,
@@ -74,9 +100,16 @@ pub struct DfnEnhancer {
 }
 
 impl DfnEnhancer {
-    /// Loads the embedded DeepFilterNet3 model and builds the resamplers.
-    pub fn new(native_rate: f64) -> Result<DfnEnhancer> {
-        let df = DfTract::default(); // bundled DFN3 model (default-model feature)
+    /// Loads the embedded DeepFilterNet3 model, applies `params`, and builds the
+    /// resamplers.
+    pub fn new(native_rate: f64, params: DfnParams) -> Result<DfnEnhancer> {
+        let mut df = DfTract::default(); // bundled DFN3 model (default-model feature)
+        // Keep faint speech instead of zero-gating it (the main "garble" fix), and
+        // optionally enable the post-filter / cap attenuation. These are plain
+        // public knobs / setters on DfTract.
+        df.min_db_thresh = params.min_snr_db;
+        df.set_atten_lim(params.atten_lim_db);
+        df.set_pf_beta(params.pf_beta);
         let hop = df.hop_size;
         let sr = df.sr as f64;
         // ~2 DFN hops of native audio as a jitter cushion before steady output.
@@ -172,7 +205,7 @@ mod tests {
         // resample/hop pipeline primes without inference errors. (Output values
         // are not asserted: DFN correctly suppresses synthetic non-speech toward
         // zero; real enhancement is validated on live RF.)
-        let mut e = DfnEnhancer::new(21875.0).expect("DFN model should load");
+        let mut e = DfnEnhancer::new(21875.0, DfnParams::default()).expect("DFN model should load");
         for i in 0..21875 {
             let x = (i as f32 * 0.02).sin() * 0.1;
             let _ = e.process_sample(x);

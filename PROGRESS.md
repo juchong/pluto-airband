@@ -1078,6 +1078,26 @@ Captures via `airband-reader` (minimal-DSP: `--squelch off --no-agc --no-filter
   instead pumped the inter-word noise floor to full scale (loud hiss). Both were tried
   and reverted; DFN-after-AGC is the shipped arrangement.
 
+### DFN tuning for weak-speech intelligibility (2026-06-26)
+- Once DFN was running after the filter+AGC chain, the remaining problems were
+  weak-signal artifacts. Tuned `DfTract`'s exposed knobs (set in `dfn.rs`,
+  CLI-overridable) by ear against live traffic:
+  - **`--dfn-min-snr` −10 → −20 dB.** DFN zero-masks any frame below this local-SNR
+    floor; −10 chopped quiet/low-SNR speech frame-by-frame ("garbled mumble").
+  - **`--dfn-atten-lim` 100 → 15 dB.** Unlimited attenuation fully guts frames DFN
+    judges as noise — which includes noise-like consonants (CH/S/F), chopping them.
+    The cap mixes `m = 10^(−dB/20)` of the noisy signal back so a frame is never
+    fully muted. 12 dB killed the chopping but was slightly noisy; **15 dB** is the
+    sweet spot (voice "sounds great", minimal residual noise).
+  - **`--dfn-pf-beta` 0.02** post-filter for residual musical noise.
+- **Post-DFN brightness high-shelf (`p` key)**, new `HighShelf` in `airband-dsp`:
+  the denoiser rolls off the upper voice band on weak speech ("muffled"); a
+  high-shelf (default +8 dB above 1600 Hz, Q 0.707) applied to the *cleaned* speech
+  restores ~2–3.4 kHz consonants, followed by a soft clip so the boost can't clip.
+  (An earlier 2 kHz peaking bell was too narrow; replaced by the shelf.)
+- All knobs are live/CLI-tunable: `--dfn-min-snr`, `--dfn-atten-lim`, `--dfn-pf-beta`,
+  `--presence-db/-hz/-q`; `p` toggles brightness, `D` toggles DFN.
+
 ## Next steps
 - **Buzz spurs are characterized** (see "Buzz spur taxonomy", 2026-06-24): the
   dominant 126.000 MHz tooth is the AD9361 sample-clock 9th harmonic (9×14 MHz), plus
