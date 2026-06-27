@@ -18,9 +18,38 @@
 //! ```
 
 use crate::icecast::{IcecastConfig, TlsMode};
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
 use std::path::Path;
+
+/// Expands `${NAME}` references in a feeds-file string against the process
+/// environment, so secrets (passwords) never need to live in the committed
+/// `feeds.json`. Mirrors the `${AIRBAND_*}` template style of the RTLSDR-Airband
+/// config. A missing variable is a hard error (fail fast rather than silently
+/// streaming with an empty password). `$` not followed by `{` is literal.
+fn expand_env(s: &str, ctx: &str) -> Result<String> {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let end = after
+            .find('}')
+            .ok_or_else(|| anyhow!("{ctx}: unterminated `${{` in {s:?}"))?;
+        let name = &after[..end];
+        let val = std::env::var(name)
+            .map_err(|_| anyhow!("{ctx}: environment variable `{name}` (referenced as ${{{name}}}) is not set"))?;
+        out.push_str(&val);
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
+/// `expand_env` over an optional string.
+fn expand_env_opt(s: Option<String>, ctx: &str) -> Result<Option<String>> {
+    s.map(|v| expand_env(&v, ctx)).transpose()
+}
 
 #[derive(Deserialize)]
 struct FeedsFile {
@@ -88,22 +117,22 @@ fn parse(json: &str, in_rate: u32, n_channels: usize) -> Result<Vec<IcecastConfi
                 n_channels
             );
         }
-        let tls = TlsMode::parse(&f.tls).map_err(|e| anyhow::anyhow!("feeds[{i}]: {e}"))?;
-        let name = f
-            .name
+        let tls = TlsMode::parse(&f.tls).map_err(|e| anyhow!("feeds[{i}]: {e}"))?;
+        let ctx = format!("feeds[{i}]");
+        let name = expand_env_opt(f.name, &ctx)?
             .unwrap_or_else(|| format!("Pluto airband ch{}", f.channel));
         out.push(IcecastConfig {
-            host: f.server,
+            host: expand_env(&f.server, &ctx)?,
             port: f.port,
-            mount: f.mountpoint,
-            user: f.username,
-            password: f.password,
+            mount: expand_env(&f.mountpoint, &ctx)?,
+            user: expand_env(&f.username, &ctx)?,
+            password: expand_env(&f.password, &ctx)?,
             bitrate: f.bitrate,
             out_rate: f.samplerate,
             in_rate,
             name,
-            genre: f.genre,
-            description: f.description,
+            genre: expand_env_opt(f.genre, &ctx)?,
+            description: expand_env_opt(f.description, &ctx)?,
             tls,
             tls_insecure: f.tls_insecure,
             channel: f.channel,
@@ -183,5 +212,34 @@ mod tests {
     #[test]
     fn rejects_empty() {
         assert!(parse(r#"{ "feeds": [] }"#, 15625, 21).is_err());
+    }
+
+    #[test]
+    fn expands_env_in_secrets() {
+        std::env::set_var("TEST_FEED_PW_OK", "s3cr3t");
+        let json = r#"{ "feeds": [
+            { "channel": 0, "server": "h", "mountpoint": "/m.mp3",
+              "password": "${TEST_FEED_PW_OK}" }
+        ] }"#;
+        let v = parse(json, 15625, 21).unwrap();
+        assert_eq!(v[0].password, "s3cr3t");
+    }
+
+    #[test]
+    fn missing_env_var_is_an_error() {
+        let json = r#"{ "feeds": [
+            { "channel": 0, "server": "h", "mountpoint": "/m.mp3",
+              "password": "${TEST_FEED_PW_DEFINITELY_UNSET}" }
+        ] }"#;
+        assert!(parse(json, 15625, 21).is_err());
+    }
+
+    #[test]
+    fn literal_password_without_braces_is_unchanged() {
+        let json = r#"{ "feeds": [
+            { "channel": 0, "server": "h", "mountpoint": "/m.mp3", "password": "plain$pw" }
+        ] }"#;
+        let v = parse(json, 15625, 21).unwrap();
+        assert_eq!(v[0].password, "plain$pw");
     }
 }

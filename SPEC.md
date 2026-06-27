@@ -606,7 +606,14 @@ are in **`BUILD.md`**; image contents and addressing invariants in
   (§6.4) and **deployed on the tower Pi** (`rf-pi`): the all-channel `feeds.json`
   feeds the local Icecast under the `deploy/airband-feeds.service` systemd unit
   (auto-start + auto-restart), validated end-to-end (21/21 mounts, 0 drops; a TLS
-  feed proven). What remains is unattended hardening (per-feed supervision/alerting)
+  feed proven). `feeds.json` now carries the live KSEA/KRNT/S50 plan and fans the
+  16 LiveATC channels out to `audio-in.liveatc.net:8010` alongside the local
+  Icecast; **passwords are `${ENV_VAR}` references** expanded at load, so the file
+  holds no secrets — they live in the systemd `EnvironmentFile`
+  (`/etc/airband-feeds.env`). The Pi runs a plain **git checkout built on-device**
+  (never `rsync`); update with `git pull` + `cargo build --release -p
+  airband-reader` + service restart (see README → *Run the feeder as a service*).
+  What remains is unattended hardening (per-feed supervision/alerting)
   and field validation against a live LiveATC mount. NB: the Pluto serves a
   **single client** on `:30000` — run exactly one reader per device.
 - **Squelch/AGC:** implemented on the host (`airband-dsp`, §6.4). A coarse

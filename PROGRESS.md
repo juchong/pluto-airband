@@ -1193,6 +1193,57 @@ Captures via `airband-reader` (minimal-DSP: `--squelch off --no-agc --no-filter
   run exactly one reader per device, and clean up with `pkill -x airband-reader`
   (process-name match), never `pkill -f` (self-matches the controlling shell).
 
+### Squelch quantization-floor fix + carrier metering + git-based Pi deploy (2026-06-27)
+- **Fix: false squelch opens on empty channels.** On a channel with no signal the
+  demod sits at the **ADC quantization floor** (mostly-zero samples), so the
+  AutoSnr/VOX noise-floor EWMA in `airband-dsp/squelch.rs` collapsed toward
+  `NOISE_EPSILON` (~3e-5 against `2**23` full scale). That drove the open threshold
+  (`snr_ratio × floor`) to ~0, so a single 1-LSB tick keyed the squelch and fed
+  AGC/DeepFilterNet pure quantization noise → "robotic" static on idle channels.
+  Added `MIN_NOISE_FLOOR = 4.0` (raw LSB) and clamped the tracked floor to it:
+  keeps the threshold (~11 LSB at the 9 dB default) above quantization noise while
+  staying far below any real transmission, so adaptation is unaffected once genuine
+  receiver noise exists. New regression test `quantization_floor_does_not_false_open`;
+  all 19 `airband-dsp` tests pass. Shared crate, but only the pathological
+  dead-channel case changes — `airband-listen`'s active-channel behavior is unchanged.
+- **Carrier dB·c metering in `airband-reader`.** Ported `airband-listen`'s
+  signal-presence metric: each channel's decoded FPGA carrier level vs the
+  cross-channel median noise reference, shown as `carrier (dB·c)` in stats (replacing
+  the misleading `floor(dBFS)`) and exported as the `airband_carrier_dbc` gauge.
+- **Deploy procedure now git-based (no rsync).** The `rf-pi` checkout was a plain
+  rsync'd tree; converted it to a tracked **git clone** at `/home/pi/pluto-airband`
+  (build cache + secret `feeds.json` preserved; `git update-index --skip-worktree
+  feeds.json` so pulls keep the live passwords). Update flow: commit/push from the
+  workstation → on the Pi `git pull` + stop service + `cargo build --release -p
+  airband-reader` (stop frees all 4 cores) + start. Deployed both fixes this way;
+  service `active`, all 21 mounts reconnected, Pluto connected. README/SPEC updated
+  with the procedure.
+
+### Merged LiveATC feed plan + env-var secrets + ch19/20 retune (2026-06-27)
+- **Merged the prior RTLSDR-Airband config into `feeds.json`.** Now the live
+  KSEA/KRNT/S50 plan: 37 feeds = 21 local `icecast.chongflix.tv` mounts + 16
+  LiveATC fan-out mounts (`audio-in.liveatc.net:8010`, 16 kbps, leading-slash
+  mounts since the reader sends `mount` verbatim). Station names/descriptions
+  carried over per frequency. Dropped RTLSDR-only knobs (`ampfactor`, `bandwidth`,
+  device/`tau`/`lowpass`/`highpass`) — Pluto handles gain via AGC and bandwidth via
+  the FPGA channelizer.
+- **Secrets via `${ENV_VAR}` expansion** (`feeds.rs`): `${NAME}` in any feeds-file
+  string (server/mount/user/password/name/genre/description) is expanded from the
+  environment at load; an unset referenced var is a hard error. `feeds.json` ships
+  with `${AIRBAND_ICECAST_PASSWORD}` / `${AIRBAND_LIVEATC_PASSWORD}` so it holds
+  **no secrets and is safe to commit**. The systemd unit loads
+  `EnvironmentFile=/etc/airband-feeds.env` (root:root, 600, gitignored;
+  `deploy/airband-feeds.env.example` is the tracked template). `*.env` added to
+  `.gitignore`. New tests cover expand/missing-var/literal-`$`. This replaces the
+  earlier `skip-worktree` approach.
+- **Channel-plan retune** (`firmware/airband.json`): index 19 `127.100 → 127.750`
+  (KBFI ATIS), index 20 `128.500 → 126.950` (KSEA ASOS at RNT). Both inside
+  `center ± 7 MHz` and clear of the 126.000 spur; array positions kept so the
+  channel-index→mount mapping is unchanged. **Requires deploying the updated
+  `/root/airband.json` to the Pluto + `maia-httpd` restart** to actually retune.
+  Frequency labels also corrected: ch0 118.050 = S50 AWOS, ch10 122.950 = KBFI
+  UNICOM, ch11 122.975 = S50 CTAF.
+
 ## Next steps
 - **Buzz spurs are characterized** (see "Buzz spur taxonomy", 2026-06-24): the
   dominant 126.000 MHz tooth is the AD9361 sample-clock 9th harmonic (9×14 MHz), plus

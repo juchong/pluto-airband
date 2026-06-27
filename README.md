@@ -236,10 +236,18 @@ file and the `--icecast-*` flags can be used together (the flags add one more
 feed). Each feed runs its own encoder + auto-reconnecting source thread, and
 falls behind (drops audio) rather than blocking the others if a server stalls.
 
-A ready-to-edit **all-channel template** ships at [`feeds.json`](feeds.json) (one
-entry per channel of the built-in plan; change the server/password/mounts). The
-file is **strict JSON — no comments**; the `//` annotations below are illustrative
-only and must be removed in the real file:
+The committed [`feeds.json`](feeds.json) is the **live KSEA/KRNT/S50 plan**: every
+channel of the built-in plan feeds the local Icecast, and the 16 channels with a
+LiveATC mount also fan out to `audio-in.liveatc.net:8010`. **Passwords are not
+stored in the file** — they are written as `${AIRBAND_ICECAST_PASSWORD}` /
+`${AIRBAND_LIVEATC_PASSWORD}` and expanded from the environment at load time
+(`${NAME}` works in `server`, `mountpoint`, `username`, `password`, `name`,
+`genre`, and `description`; a referenced-but-unset variable is a hard error). So
+the file is safe to commit, and the secrets live only in the systemd
+`EnvironmentFile` (see *Run the feeder as a service* below).
+
+The file is **strict JSON — no comments**; the `//` annotations below are
+illustrative only and must be removed in the real file:
 
 ```jsonc
 {
@@ -269,7 +277,7 @@ Per-feed options (defaults in parentheses):
 | `port` | Server port (`8000`). |
 | `mountpoint` | **Required.** Mount path, e.g. `/KXXX.mp3`. |
 | `username` | Source username (`"source"`). |
-| `password` | Source password (`""`). |
+| `password` | Source password (`""`). Supports `${ENV_VAR}` expansion — keep real passwords out of the committed file (see the env-file workflow below). |
 | `name` | ICY stream name shown in directories (`"Pluto airband chN"`). |
 | `genre` | ICY genre tag (unset). |
 | `description` | ICY description tag (unset). |
@@ -294,7 +302,30 @@ silently going quiet.
 #### Run the feeder as a service (Raspberry Pi)
 
 For a tower deployment, run the all-channel feeder under **systemd** so it
-auto-starts on boot and restarts on crash. A ready unit ships at
+auto-starts on boot and restarts on crash. The deployment is a plain **git
+checkout** at `/home/pi/pluto-airband` that is built **on the Pi** — never
+`rsync` source onto it, so `git pull` always works and the tree stays in a known
+state.
+
+**Initial setup** (one time, as the `pi` user):
+
+```bash
+git clone https://github.com/juchong/pluto-airband.git /home/pi/pluto-airband
+cd /home/pi/pluto-airband
+
+# Build only the streamer (airband-listen needs ALSA and isn't built headless).
+cargo build --release -p airband-reader
+
+# feeds.json carries NO secrets: passwords are written as ${AIRBAND_ICECAST_PASSWORD}
+# / ${AIRBAND_LIVEATC_PASSWORD} and expanded from the environment at startup, so the
+# file is safe to commit and pull. Put the real passwords in a root-only env file
+# (never committed; *.env is gitignored) that the systemd unit loads:
+sudo cp deploy/airband-feeds.env.example /etc/airband-feeds.env
+sudo $EDITOR /etc/airband-feeds.env        # fill in AIRBAND_ICECAST/LIVEATC_PASSWORD
+sudo chown root:root /etc/airband-feeds.env && sudo chmod 600 /etc/airband-feeds.env
+```
+
+A ready unit ships at
 [`deploy/airband-feeds.service`](deploy/airband-feeds.service); it runs
 `airband-reader … --feeds /home/pi/pluto-airband/feeds.json` as the `pi` user.
 Install it (adjust paths if your checkout differs):
@@ -313,6 +344,24 @@ The unit sets `Restart=always` with `StartLimitIntervalSec=0` (never give up) an
 `KillSignal=SIGINT` so `stop` triggers the reader's graceful shutdown. Because the
 reader reconnects to both the Pluto and Icecast on its own, a restart only fires
 on an actual crash.
+
+**Updating a deployment.** Commit and push from your workstation, then on the Pi
+pull and rebuild. Stop the service first so the build gets all four cores (a
+running 21-channel reader otherwise starves the compiler), then restart:
+
+```bash
+cd /home/pi/pluto-airband
+git pull --ff-only
+sudo systemctl stop airband-feeds
+cargo build --release -p airband-reader
+sudo systemctl start airband-feeds
+journalctl -u airband-feeds -n 30 --no-pager   # confirm "ready" + all mounts connect
+```
+
+`feeds.json` carries no secrets (passwords come from `/etc/airband-feeds.env`), so
+`git pull` updates it cleanly; only `cargo build` artifacts under `host/target/`
+are reused for an incremental build. To change a password, edit the env file and
+`systemctl restart airband-feeds` — no pull or rebuild needed.
 
 > **One reader per Pluto.** The Pluto serves a **single client** on `:30000`;
 > running several `airband-reader` instances against it at once makes them fight
@@ -612,7 +661,7 @@ the request/response schema.
 | `host/airband-reader/` | host reader: router + per-channel workers, demux, drop detection, DFN/presence DSP, split recording, Icecast/UDP/metrics |
 | `host/airband-listen/` | interactive listener: live DSP playback, scanner/mix modes, per-channel meters |
 | `feeds.json` | all-channel Icecast feeds template (one entry per built-in channel) |
-| `deploy/` | deployment assets: `airband-feeds.service` systemd unit for the Pi feeder |
+| `deploy/` | deployment assets: `airband-feeds.service` systemd unit + `airband-feeds.env.example` (secrets template) for the Pi feeder |
 | `maia-sdr/` | our Maia SDR fork (gitignored here; the airband HDL + `maia-httpd` integration) |
 | `plutosdr-fw/` | Pluto firmware assembler (gitignored; pinned upstream) |
 

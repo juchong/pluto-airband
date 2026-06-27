@@ -10,6 +10,11 @@ StartLimitIntervalSec=0
 Type=simple
 User=pi
 WorkingDirectory=/home/pi/pluto-airband/host
+# Source/LiveATC passwords are referenced as ${AIRBAND_*_PASSWORD} in feeds.json
+# and expanded from the environment at startup, so no secret lives in the repo.
+# Create this file as root:root, chmod 600 (see deploy/airband-feeds.env.example);
+# it must NOT be committed to git.
+EnvironmentFile=/etc/airband-feeds.env
 ExecStart=/home/pi/pluto-airband/host/target/release/airband-reader plutoplus.chongflix.tv:30000 --feeds /home/pi/pluto-airband/feeds.json
 # airband-reader reconnects to the Pluto and to Icecast on its own, so this only
 # fires on a real crash. Wait between restarts so a wedged Pluto isn't hammered.
