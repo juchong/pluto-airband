@@ -4,7 +4,8 @@
 //! framed-audio records produced by the FPGA `AudioFramer`:
 //!
 //! ```text
-//!   bits [31:0]  : audio sample, signed, sign-extended to 32 bits
+//!   bits [23:0]  : audio sample, signed, 24-bit two's complement
+//!   bits [31:24] : carrier level (8-bit minifloat of the AM carrier; 0 = none)
 //!   bits [39:32] : channel index (0..N-1)
 //!   bits [63:40] : per-channel sample sequence counter (wraps at 2**24)
 //! ```

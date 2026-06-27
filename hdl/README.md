@@ -89,7 +89,7 @@ recovers a clean low-rate audio tone at the expected frequency. Plot at
 `out/am_audio.png` (git-ignored).
 
 `audio_decim`/`cic_stages` are parameters; nothing here hard-codes the rate. The
-shipping receiver uses **`audio_decim=7` → 15 625 sps** (14 MHz / 128 / 7); see
+shipping receiver uses **`audio_decim=5` → 21 875 sps** (14 MHz / 128 / 5); see
 `SPEC.md` §4.2.
 
 ## `synth_estimate.py`
@@ -320,7 +320,7 @@ stage has a duty cycle that must stay < 1:
 **Important:** the OOC config (`dec-64`, `119-tap`) was for *resource* measurement
 and does **not** close real-time timing (`duty_fir ≈ 1.75`). The recommended
 deployment config is **`chans_per_lane=4`, `lane_decim=128`, cleanup `ntaps=63`
-→ 6 lanes**, with `audio_decim=7` giving **15.6 ksps** audio (all duties < 0.9).
+→ 6 lanes**, with `audio_decim=5` giving **21.9 ksps** audio (all duties < 0.9).
 
 ```bash
 python realtime_budget.py     # prints the duty table + cycle-accurate stress test

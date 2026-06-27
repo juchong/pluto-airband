@@ -471,7 +471,7 @@ ssh rfpi 'dfu-util -a firmware.dfu -e'                  # named alt (bare -e err
 # 3. Test after boot (~min for sshd/maia-httpd): SD enumerates + mounts, the
 #    stream is full-rate, the plan loads, and the SSH host key is now stable.
 ssh root@plutoplus 'ls -l /dev/mmcblk0* ; grep /mnt/sdcard /proc/mounts ; ps w | grep [m]aia-httpd'
-airband-reader plutoplus:30000          # expect 21 channels (or AWOS-only fallback), ~15625 sps
+airband-reader plutoplus:30000          # expect 21 channels (or AWOS-only fallback), ~21875 sps
 ```
 
 Success = `dfu-util` prints `Done!` with `exit=0` (a second `-D` failing at 0 % is
@@ -601,8 +601,9 @@ Verify over SSH (`sshpass -p analog ssh root@192.168.2.1`) — or over serial
 (`firmware/pluto_setup_env.py` logs in the same way): clean `dmesg`
 (no `watchdog`/`panic`), `maia_sdr_airband@19000000` reserved node present,
 `maia-httpd` running, then on the host run `airband-reader 192.168.2.1:30000`
-and confirm **~15625 sps/channel** (= 14 MHz / 128 / 7) — half that (7813) means
-an old/half-rate bitstream is still loaded.
+and confirm **~21875 sps/channel** (= 14 MHz / 128 / 5) — any other rate (e.g.
+15625 = an old `audio_decim=7` bitstream, or ~10937 = a half-rate bitstream) means
+the wrong/old bitstream is still loaded.
 
 ### CRITICAL: the AD9361 front-end is locked read-only under `--airband`
 
@@ -667,22 +668,15 @@ LSB** (i.e. ~ −90 to −100 dBFS at 24-bit). Two things were eating it:
    | **manual 71 dB** | **71 dB** | **~280** |
 
    Fixed **manual gain** wins by ~5× over the AGC modes for weak-signal recovery.
-   The **operational gain is 12 dB**, set in the SD config (`firmware/airband.json`
-   → `/mnt/sdcard/airband.json`), tuned for an external LNA. (The `maia-httpd`
-   `AirbandConfig::default` fallback, used only when no SD config is mounted, is a
-   deliberately minimal AWOS-only **0 dB** — not for operational use.) The
-   receiver is **internal-noise-limited** (the ch11 audio floor is identical with the
-   antenna or a 50 Ω load, Δ0.4 dB, and rises ~1 dB per +6 dB of gain → the floor is
-   ADC quantization + the conducted comb, not antenna noise). A controlled sweep on the
-   continuous 118.050 AWOS carrier showed audio SNR **~1 dB at 0 dB → ~10 dB at 6 dB →
-   ~12 dB at 12 dB**, plateauing to 42 dB: at 0 dB the wanted signal is *at* the
-   quantization floor, so ~12 dB is the minimum that lifts voice clear (and with the
-   LNA it does not clip the ADC: 0 %, ~7 dB headroom). The external LNA still matters
-   for SFDR (low system NF; lets the internal gain stage — the dominant comb/noise
-   generator — run lower) but does **not** replace the ~12 dB internal gain. History:
-   71 → 48 (clipping knee) → 0 (wrong — quantization-starved) → **12**. On a *bare*
-   front end (no LNA) raise toward the **48 dB** clipping knee.
-   To apply a config without reflashing, write it to the **SD card** and restart
+   The gain is **adjustable** — set `gain_db` in the SD config (`firmware/airband.json`
+   → `/mnt/sdcard/airband.json`); the firmware's **baked-in default (no SD card) is
+   0 dB** (`AirbandConfig::default`, a deliberately minimal AWOS-only fallback). The
+   receiver is **internal-noise-limited** (the idle audio floor is the same with the
+   antenna or a 50 Ω load, Δ0.4 dB, and barely moves with gain → it is ADC
+   quantization + the conducted comb, not antenna noise), so `gain_db` only needs to
+   lift voice clear of that floor: with an **external LNA** ~12 dB is plenty (no
+   clipping); on a **bare** front end raise it higher, toward the ~48 dB ADC-clipping
+   knee. To apply a config without reflashing, write it to the **SD card** and restart
    (the receiver loads `--airband-config /mnt/sdcard/airband.json`):
 
    ```sh
@@ -862,7 +856,7 @@ Then from the host, confirm a live, gap-free 21-channel stream:
 ```bash
 cargo build --release --manifest-path host/Cargo.toml
 host/target/release/airband-reader 192.168.2.1:30000
-# expect: 21 channels, ~15625 sps each, 0 dropped samples
+# expect: 21 channels, ~21875 sps each, 0 dropped samples
 ```
 
 A healthy result is: clean boot (no panic/watchdog), `--airband` in the running

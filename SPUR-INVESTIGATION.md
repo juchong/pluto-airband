@@ -90,8 +90,11 @@ number of teeth, leaving a much cleaner floor — but the primary teeth remain:
 
 ![Band snapshot, 50 Ω termination, gain 48](firmware/diagnostics/out/band_50ohm-term_gain48_2026-06-24.png)
 
-The default gain was changed to **48 dB** as a result (built-in default + the
-`firmware/airband.json` template).
+These sweeps characterized the gain trade-off; the gain itself is **adjustable** —
+set `gain_db` in the SD-card `firmware/airband.json` — and the firmware's **baked-in
+default (no SD card) is 0 dB**. As a starting point an external LNA wants a low
+`gain_db` (~12 dB) and a bare front end more (toward the ~48 dB clipping knee); see
+[How to fix](#how-to-fix).
 
 ## 5. Input power is not the source
 
@@ -179,16 +182,15 @@ Fix by mechanism (cheapest first). Full detail in
 [`firmware/diagnostics/README.md`](firmware/diagnostics/README.md).
 
 **Config / host (no reflash)**
-1. **External LNA + modest internal gain** (default **12 dB**) — the AD9361's internal
-   gain stage is the dominant comb/intermod/noise generator, so run a clean low-NF
-   external LNA up front and keep internal gain low. But note the receiver is
-   *internal-noise-limited* (the audio floor is identical with the antenna or a 50 Ω
-   load, and barely moves with gain → it is ADC quantization + comb), so the internal
-   gain must still be high enough (~12 dB with the LNA) to lift the wanted signal clear
-   of quantization: a controlled AWOS-carrier sweep shows audio SNR ~1 dB at 0 dB,
-   ~10–12 dB by 6–12 dB, then a plateau. 0 dB starves the ADC; 12 dB does not clip
-   (~7 dB headroom). The biggest further win is front-end **dynamic range** — a SAW
-   airband band-pass + low-NF LNA. (Bare front end, no LNA: ~48 dB clipping knee.)
+1. **External LNA + modest internal gain** — the AD9361's internal gain stage is the
+   dominant comb/intermod/noise generator, so run a clean low-NF external LNA up front
+   and keep internal gain low. The gain is **adjustable** (`gain_db` on the SD card;
+   baked-in default 0 dB): the receiver is *internal-noise-limited* (the audio floor is
+   the same with the antenna or a 50 Ω load and barely moves with gain → it is ADC
+   quantization + comb), so `gain_db` only needs to lift voice clear of that floor —
+   with the LNA ~12 dB does that without clipping; a bare front end needs more (toward
+   the ~48 dB clipping knee). The biggest further win is front-end **dynamic range** —
+   a SAW airband band-pass + low-NF LNA.
 2. **Feed audio over USB, not GbE** — kills the 125 MHz PHY clock (Pluto+).
 3. **Host per-channel notch** (`airband-dsp::Notch`) at the fixed audio beat for any
    channel with an in-passband spur.
@@ -250,10 +252,10 @@ PLUTO_GAIN=48 $PY lo_track_test.py "$PLUTO_HOST"
   a low-spur OCXO.
 - **Waterfall ≠ audio:** wideband teeth in guard gaps are cosmetic; only spurs within
   ~±3.4 kHz of a carrier are audible.
-- The AD9361 built-in default gain (71 → 48 → 0 → **12 dB**) lives in the maia-sdr fork
-  (`maia-httpd/src/airband.rs`), separate from this repo. History: 71 was the
-  weak-signal max but clipped the wideband ADC ~15 %; 48 is the clipping knee; 0 (an
-  earlier over-correction toward minimum internal gain) proved *quantization-starved* —
-  the receiver is internal-noise-limited (antenna ≈ 50 Ω load), so at 0 dB the wanted
-  signal sits at the ADC quantization floor (audio SNR ~1 dB). **12 dB** (with an
-  external LNA) is the minimum that lifts voice clear of quantization without clipping.
+- **Gain is adjustable; the firmware's baked-in default is 0 dB.** The operational
+  gain is set by `gain_db` in the SD-card `firmware/airband.json`; only when no SD card
+  is present does `maia-httpd` (`AirbandConfig::default`, in the maia-sdr fork) fall
+  back to **0 dB**. The sweeps above characterize the trade-off: ~71 dB clips the
+  wideband ADC ~15 %, ~48 dB is the clipping knee, and 0 dB leaves the wanted signal at
+  the ADC quantization floor (the receiver is internal-noise-limited). As a starting
+  point ~12 dB suits an external LNA and a bare front end wants more.

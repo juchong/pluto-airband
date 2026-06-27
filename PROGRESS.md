@@ -1305,6 +1305,34 @@ ramfs. All FIT-only (no gateware change) → `plutoplus.dfu`-only reflash.
   flash the fingerprint changes once (fresh key on the empty jffs2 store) — clear
   the stale `known_hosts` entry that one time.
 
+### Drop AWOS + carrier squelch + 30 dB on bare front end (2026-06-27)
+Config/deploy only — no firmware or host-binary rebuild.
+
+- **maia-httpd had crashed** (steady-state, not the boot race the bounded
+  `patch_maia_respawn.py` covers): web `:8000` dead, audio `:30000` refused, the Pi
+  reader stuck reconnecting → **no audio reached the squelch** (this presented as
+  "VOX rarely breaks squelch"). Restarted `S60maia-httpd`; `:30000`/`:8000` back,
+  gain 30 dB, SD plan loaded. *Open item:* steady-state maia-httpd supervision.
+- **118.050 AWOS removed from the operational plan.** It is a continuous AWOS
+  carrier we don't want to track/stream. Dropped from `firmware/airband.json`
+  `channels_hz`/`channel_labels` (21→**20** channels). The **baked-in fallback**
+  `AirbandConfig::default` (AWOS-only, 0 dB) is intentionally **left unchanged** —
+  it stays the "SD plan didn't load" indicator (per the maintainer; do not edit it).
+- **Channel reindex.** The FPGA always frames 21 positional channels (frame index =
+  position in `channels_hz`), so dropping channel 0 shifts every channel −1
+  (119.200 → frame ch0 … 126.950 → frame ch19; position 20 stale). `feeds.json`
+  reindexed −1 (AWOS mount removed) and the service now runs `--channels 20`.
+- **Carrier squelch is now the deployed default.** `deploy/airband-feeds.service`
+  ExecStart gains `--squelch carrier --squelch-snr 15`: gate on the FPGA AM-carrier
+  byte (cross-channel median noise reference) instead of voice-band VOX, so keyed
+  transmissions open reliably. 15 dB clears the conducted-comb idle spread
+  (idle channels measured ~10–12 dB·c; real traffic 35–60 dB·c) — tunable in the
+  unit file. The `airband-reader` *binary* default stays `--squelch auto`.
+- **Operating gain 30 dB.** `firmware/airband.json` `gain_db` 12 → **30** to match
+  the live SD card (current bare high-gain-antenna front end, no external LNA), so
+  redeploying the template no longer reverts the gain. Docs updated
+  (`README.md` channel-plan/deploy, `SPEC.md` §5).
+
 ## Next steps
 - **Buzz spurs are characterized** (see "Buzz spur taxonomy", 2026-06-24): the
   dominant 126.000 MHz tooth is the AD9361 sample-clock 9th harmonic (9×14 MHz), plus

@@ -8,11 +8,12 @@
 
 ## What this is
 
-A **21-channel VHF airband (AM aircraft voice) receiver** running entirely on an
-Analog Devices ADALM-Pluto. One wideband AD9361 capture is split into 21 narrow
-channels inside the Pluto FPGA, each channel is AM-demodulated to audio on-chip,
-and only demodulated audio is streamed off the device over the network. The
-intended end use is a multi-channel audio feeder for **liveatc.net**.
+A **21-channel VHF airband (AM aircraft voice) receiver** running entirely on a
+[Pluto+](https://github.com/plutoplus/plutoplus) (an open-hardware ADALM-Pluto
+derivative; §2.4). One wideband AD9361 capture is split into 21 narrow channels
+inside the Pluto+ FPGA, each channel is AM-demodulated to audio on-chip, and only
+demodulated audio is streamed off the device over the network. The intended end
+use is a multi-channel audio feeder for **liveatc.net**.
 
 **Why an FPGA channelizer (not a host channelizer).** The goal is *contiguous*
 coverage of the whole airband from a single tuner. The prior feeder used an
@@ -32,7 +33,7 @@ off-device.
 
 | Criterion | Status |
 |---|---|
-| Pluto firmware exposing many independently-tuned AM channels | **Done — 21 channels, mono, 24-bit, 15625 sps** |
+| Pluto firmware exposing many independently-tuned AM channels | **Done — 21 channels, mono, 24-bit, 21875 sps** |
 | Demodulated audio reaches a host over the Pluto link, within USB 2.0 | **Done — framed audio over TCP `:30000`, well under USB 2.0** |
 | 24/7 stability at an antenna site | **Partially — gap-free + auto-start on boot; long soak pending** |
 | Pi-side daemon encodes each channel and pushes to liveatc Icecast | **Done — `airband-reader` has a built-in LAME→Icecast source client (16 kbps mono 22050 Hz); soak pending** |
@@ -55,18 +56,21 @@ the FPGA:
 - Pluto host link is **USB 2.0**: ~480 Mbps ≈ 60 MB/s, realistically ~40–50 MB/s.
 - Wideband IQ = `sample_rate × 4 bytes/s`: 14 Msps → 56 MB/s, 61.44 Msps →
   ~246 MB/s. Neither fits comfortably with overhead.
-- **Demodulated audio**: 15625 sps mono, packed 8 bytes/sample = 125 KB/s/channel;
-  21 channels ≈ 2.6 MB/s raw, trivial over USB. **This is the chosen path.**
+- **Demodulated audio**: 21875 sps mono, packed 8 bytes/sample = 175 KB/s/channel;
+  21 channels ≈ 3.7 MB/s raw, trivial over USB. **This is the chosen path.**
 
 Because the FPGA produces audio (not IQ), RTLSDR-Airband — whose pipeline is
 strictly IQ-in → channelize → demodulate → audio-out — has no role downstream. We
 write a small host reader instead.
 
 ### 2.3 Hardware target (known-good, not an open question)
+The deployed board is a **Pluto+** (§2.4); the ADALM-Pluto is the alternate build
+target. Both share the same SoC and RFIC silicon:
+
 - **SoC:** Xilinx Zynq-7010 (dual ARM Cortex-A9 PS + Artix-7-class PL).
-- **RFIC:** a genuine ADI AD9363 from a genuine ADALM-Pluto, with the "unlock"
-  register written so it operates with **AD9364-class range and wide contiguous
-  bandwidth**. The AD9363 and AD9364 are the same silicon die; the practical
+- **RFIC:** a genuine ADI AD9363 (the same part used in the ADALM-Pluto), with the
+  "unlock" register written so it operates with **AD9364-class range and wide
+  contiguous bandwidth**. The AD9363 and AD9364 are the same silicon die; the practical
   AD9364 prerequisite (a more accurate clock source) is present on this unit.
   - Sensitivity / noise figure at ~120 MHz are valid and equal to the datasheet's
     800 MHz characterization point (the datasheet only characterizes 800 MHz /
@@ -75,13 +79,13 @@ write a small host reader instead.
 - **Net effect:** front-end capability is not a project risk. The single
   feasibility gate that mattered was FPGA resource fit (§4), which passed.
 
-### 2.4 Hardware variant: Pluto+
-The receiver also targets the **Pluto+** (the open `plutoplus/plutoplus` board).
-It is the **same XC7Z010 die** as the ADALM-Pluto — a different package
-(`xc7z010clg400-1`) with a different MIO pinout, but identical FPGA resources, so
-the 21-channel design fits unchanged (no resource re-fit; build with
-`TARGET=plutoplus`, see `BUILD.md`). The Pluto+ adds three things this project
-cares about:
+### 2.4 Deployed hardware: Pluto+
+The deployed board is the **Pluto+** (the open `plutoplus/plutoplus` board; build
+with `TARGET=plutoplus`, see `BUILD.md`). It is the **same XC7Z010 die** as the
+ADALM-Pluto — a different package (`xc7z010clg400-1`) with a different MIO pinout,
+but identical FPGA resources, so the 21-channel design fits unchanged (no resource
+re-fit). Relative to the USB-only ADALM-Pluto, the Pluto+ adds three things this
+project cares about:
 
 - **Gigabit Ethernet** — a higher-bandwidth alternative to the USB link.
   `maia-httpd` binds `0.0.0.0:30000`, so the framed-audio stream is served on
@@ -128,7 +132,7 @@ the airband channelizer generalizes by time-multiplexing.
         Antenna (airband BPF / FM-notch recommended as front-end hygiene)
                      │
    ┌─────────────────┴───────────────────────────────────────────────┐
-   │  ADALM-Pluto (Zynq-7010)                                          │
+   │  Pluto+ (Zynq-7010)                                               │
    │                                                                   │
    │  AD9361  ──12-bit IQ @ 14 Msps──►  PL (FPGA), sync clock 62.5 MHz │
    │  LO 123.438 MHz                    │                               │
@@ -139,7 +143,7 @@ the airband channelizer generalizes by time-multiplexing.
    │                │                 → 63-tap cleanup FIR         │    │
    │                │   → round-robin collector                    │    │
    │                │   → TdmAmBackend: CORDIC |I+jQ| → DC block   │    │
-   │                │                 → CIC audio dec-7            │    │
+   │                │                 → CIC audio dec-5            │    │
    │                │   → AudioFramer (64-bit records)             │    │
    │                │   → cyclic DmaStreamWrite → DDR ring         │    │
    │                └───────────────────┬─────────────────────────┘    │
@@ -177,10 +181,10 @@ These are the exact constants baked into the shipping bitstream.
 | Channels per lane (`chans_per_lane`) | **4** | → `ceil(21/4)` = **6 lanes** (`[4,4,4,3,3,3]`) |
 | Input | **12-bit IQ @ 14 Msps** | AD9361 delivers the working rate directly (no separate front-end decimator) |
 | Lane decimation (`decimation`) | **128** | channel rate = 14 MHz / 128 = 109375 sps |
-| Cleanup FIR | **63-tap complex, folded** | `design_cic_compensation(128, 3, 63, 0.22, 0.46)`, `out_shift=17`; inverts CIC droop + channel selectivity |
+| Cleanup FIR | **63-tap complex, folded** | `design_cic_compensation(128, 3, 63, 0.15, 0.24)`, `out_shift=17`; inverts CIC droop and doubles as the channel-select filter, set to the full AM voice bandwidth (~±8 kHz at the 109375 sps channel rate: flat through ~6 kHz, −1.6 dB @8 kHz, −102 dB at the 25 kHz adjacent channel) |
 | AM magnitude | **CORDIC vectoring**, 12 iterations | ripple-free `|I+jQ|`; no angle-dependent gain modulation (multiplier-free) |
 | DC block | one-pole high-pass, `dcblock_k=10` | strips the carrier-DC term left by the detector |
-| Audio decimation (`audio_decim`) | **7**, CIC order (`cic_stages`) **4** | audio rate = 109375 / 7 = **15625 sps** |
+| Audio decimation (`audio_decim`) | **5**, CIC order (`cic_stages`) **4** | audio rate = 109375 / 5 = **21875 sps** (order-4 CIC droop −1.3 dB @3.4 kHz, −4.2 dB @6 kHz) |
 | Audio sample width | **24-bit** signed | scaled to 16-bit on the host |
 | NCO width | 24-bit | per-channel tuning words written via a flat register interface |
 | PL clock | **62.5 MHz** (`sync`) | design is timing-closed at this rate |
@@ -195,7 +199,7 @@ all 6 lanes. Each channel's path:
 ```
 14 Msps IQ ─► NCO complex mix ─► CIC ÷128 ─► 63-tap complex cleanup FIR ─►
    (tune f-LO to DC)            109.375 ksps   (un-droop + selectivity)
-─► CORDIC |I+jQ| ─► one-pole DC block ─► CIC ÷7 (order 4) ─► 15.625 ksps audio
+─► CORDIC |I+jQ| ─► one-pole DC block ─► CIC ÷5 (order 4) ─► 21.875 ksps audio
    (M=12, ×5/8 gain fix)  (strip carrier DC)                  (24-bit, signed)
 ```
 
@@ -214,8 +218,8 @@ all 6 lanes. Each channel's path:
   replaced an alpha-max-beta-min estimator whose ~10% angle ripple modulated each
   off-tuned carrier into ~−30 dBc demod spurs.
 - **DC block + audio CIC:** a one-pole leaky-integrator high-pass removes the
-  carrier-amplitude DC term the detector leaves, then an order-4 CIC decimates ÷7
-  to **15625 sps** mono audio (`14e6 / 128 / 7`).
+  carrier-amplitude DC term the detector leaves, then an order-4 CIC decimates ÷5
+  to **21875 sps** mono audio (`14e6 / 128 / 5`).
 
 The AM back-end is itself folded over all 21 channels (one datapath, per-channel
 DC/CIC state in BRAM); the magnitude is shared combinational logic.
@@ -229,8 +233,13 @@ The receiver reads its config from the **SD card** at startup —
 The web config UI reads/writes this same SD file, so edits persist. If the card
 is missing/unformatted/unmounted, `maia-httpd` falls back to a **deliberately
 minimal built-in default — a single channel (118.050 AWOS) at 0 dB gain** — so a
-faint, single AWOS channel is the obvious cue that the SD plan did not load. The
-SD config is the source of truth (persistence model in §8.1); the operational
+faint, single AWOS channel is the obvious cue that the SD plan did not load. That
+fallback is the only place 118.050 AWOS appears: it is deliberately **excluded**
+from the operational plan (a continuous AWOS carrier we don't track), so the live
+plan is **20 channels**. The FPGA still frames **21 positional channels**
+(`N_CHANNELS`); the frame channel index = position in `channels_hz`, so with 20
+entries the trailing position is stale and the host reader runs `--channels 20`.
+The SD config is the source of truth (persistence model in §8.1); the operational
 values below are what `firmware/airband.json` ships:
 
 - **LO / capture center:** 123.438 MHz.
@@ -241,33 +250,24 @@ values below are what `firmware/airband.json` ships:
   of the filter skirts. (Channel selection and the LO choice — placing the zero-IF
   DC/LO-leakage spur in a guard gap — are derived in `hdl/capture_window.py`.)
 - **Gain:** one shared RX gain serves all 21 channels (no per-channel *RF* AGC;
-  per-channel audio AGC is done on the host, §6.4); fixed **manual gain** (the
-  AD9361 AGC modes settle on wideband power and starve weak channels). The SD
-  config ships **12 dB**, tuned for an external LNA (the built-in fallback is
-  0 dB — minimal by design, not for operational use); the 12 dB choice is set by
-  two measured facts:
-  - **The receiver is internal-noise-limited, not antenna/thermal-limited.** The
-    channel-11 idle audio floor is identical with the antenna or a **50 Ω termination**
-    (−92.9 vs −93.3 dBFS, Δ0.4 dB) and rises only ~1 dB per +6 dB of gain. So the
-    audio floor is **ADC quantization + the conducted comb (§7)**, downstream of the
-    gain — a quieter antenna environment cannot lower it.
-  - **At 0 dB the wanted signal sits at that floor.** A controlled gain sweep on the
-    continuous 118.050 AWOS carrier (carrier-over-noise, same signal throughout)
-    measured audio SNR **~1 dB at 0 dB → ~10 dB at 6 dB → ~12 dB at 12 dB**, plateauing
-    through 42 dB. ~12 dB is therefore the minimum internal gain that lifts voice clear
-    of quantization; with the external LNA the wideband ADC does not clip (0 %, ~7 dB
-    headroom).
-
-  The external LNA still matters — a clean low-NF stage ahead of the Pluto sets the
-  system noise figure (Friis) and lets the AD9361's internal gain stage (the dominant
-  comb/intermod generator, §7) run lower — but it does **not** substitute for the
-  ~12 dB internal gain needed to clear quantization. Because the limit is internal
-  dynamic range, the largest further gains come from a **front-end SAW airband
-  band-pass + low-NF LNA** (so strong out-of-band signals don't starve the 12-bit
-  ADC), not a quieter site. On a *bare* front end (no LNA) raise toward the **48 dB**
-  clipping knee (a sweep, `firmware/diagnostics/floor_sweep.py`, shows the **71 dB**
-  near-ceiling clips ~13–15 % of the wideband ADC). Higher RX gain does raise the
-  conducted comb (§7), but it stays in the channel-plan guard gaps.
+  per-channel audio AGC is done on the host, §6.4); fixed **manual gain**, set by
+  `gain_db` in the SD-card `airband.json` (the AD9361 AGC modes settle on wideband
+  power and starve weak channels). It is **adjustable** — edit `gain_db` and restart
+  the receiver; the firmware's **baked-in default (no SD card) is 0 dB**. The
+  receiver is **internal-noise-limited, not antenna/thermal-limited**: the idle audio
+  floor is the same with the antenna or a 50 Ω termination (Δ0.4 dB) and rises only
+  ~1 dB per +6 dB of gain, so it is **ADC quantization + the conducted comb (§7)**
+  downstream of the gain — a quieter site cannot lower it, and `gain_db` only needs to
+  lift voice clear of that floor. Tune it to the front end:
+  - **External LNA (recommended):** a low `gain_db` (~12 dB) clears quantization
+    without clipping; the LNA sets the system noise figure (Friis) and lets the
+    AD9361's internal gain stage (the dominant comb/intermod generator, §7) run low.
+    The biggest further win is a **SAW airband band-pass + low-NF LNA** so strong
+    out-of-band signals don't starve the 12-bit ADC.
+  - **Bare front end (no LNA):** raise `gain_db` higher — toward the ~48 dB
+    ADC-clipping knee (`firmware/diagnostics/floor_sweep.py` finds it; the ~71 dB
+    near-ceiling clips ~13–15 % of the wideband ADC), accepting a more prominent comb
+    that still falls in the channel-plan guard gaps.
 
 While `maia-httpd` runs with `--airband`, the AD9361 front-end is **locked
 read-only** (`/api/ad9361` is a no-op and the web UI disables RF controls) so the
@@ -302,10 +302,11 @@ it becomes power-cycle-persistent at the next firmware flash.
 
 ### 5.2 Reference-oscillator calibration (per unit)
 
-The Pluto's 40 MHz reference is an uncalibrated oscillator (the ADALM-Pluto's bare
-XO; the Pluto+ has a 0.5 ppm VCTCXO that drifts far less). Its ppm error shifts
-every tuned frequency proportionally, so it is corrected once per unit via the
-u-boot env var **`ad936x_ext_refclk_override`**: the `adi_loadvals` boot script does
+The 40 MHz reference's ppm error shifts every tuned frequency proportionally. The
+Pluto+'s 0.5 ppm VCTCXO usually needs **no** correction (re-measure only if a known
+carrier shows drift); a bare ADALM-Pluto's uncalibrated XO does. Correct it once per
+unit via the u-boot env var **`ad936x_ext_refclk_override`**: the `adi_loadvals`
+boot script does
 `fdt set /clocks/clock@0 clock-frequency <value>`, so the AD9361 driver computes its
 PLL/decimation from the *true* reference and the nominal 123.438 MHz LO / 14 MHz Fs
 are hit exactly (all 21 channels corrected together; the channelizer NCO math is
@@ -422,8 +423,9 @@ adapted to the fact that the FPGA already AM-demodulates and DC-blocks the audio
 is: **squelch** (EWMA noise-floor tracking → SNR/manual threshold, with an
 open-delay/hang state machine; mutes inter-transmission static) → **voice
 band-pass** (4th-order Butterworth, 300-3400 Hz) → a standalone **low-pass**
-(2nd-order Butterworth, default −3 dB at 2.5 kHz, `--lpf-hz`; airband AM voice has
-no usable energy above ~3.4 kHz so a tighter corner trims hiss) → optional
+(2nd-order Butterworth, off by default; `--lpf-hz` sets the −3 dB corner, e.g.
+2500 — airband AM voice has no usable energy above ~3.4 kHz so a tighter corner
+trims hiss) → optional
 **notch** (2nd-order band-stop for a tonal spur) → **AM AGC** (loudness
 normalization with a bounded soft-clip and click-free fade on close). All units
 work in raw 24-bit sample magnitude; level metering is reported in dBFS.

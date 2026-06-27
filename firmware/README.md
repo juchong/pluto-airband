@@ -27,7 +27,8 @@ ring depends on. For the actual procedures see:
 Frame layout (little-endian 64-bit word, see `hdl/audio_framer.py`):
 
 ```
-bits [31:0]  audio sample (signed, sign-extended to 32 bits; 24-bit content)
+bits [23:0]  audio sample (signed, 24-bit two's complement)
+bits [31:24] carrier level (8-bit minifloat of the AM carrier; 0 = none/old bitstream)
 bits [39:32] channel index (0..20)
 bits [63:40] per-channel sequence counter (wraps at 2**24; gap = dropped samples)
 ```
@@ -43,10 +44,11 @@ synthesis/timing check.
 
 ### Hardware variants (`TARGET`)
 
-The build defaults to `TARGET=pluto` (ADALM-Pluto, `xc7z010clg225-1`). Set
-`TARGET=plutoplus` for the **Pluto+** (the open `plutoplus/plutoplus` board):
-same XC7Z010 die, different package (`xc7z010clg400-1`), plus Gigabit Ethernet,
-microSD, and a 0.5 ppm VCTCXO. The airband design is unchanged across variants —
+The deployed target is the **Pluto+** (`TARGET=plutoplus`, the open
+`plutoplus/plutoplus` board: `xc7z010clg400-1`, Gigabit Ethernet, microSD, 0.5 ppm
+VCTCXO). The build *default* is `TARGET=pluto` (the USB-only ADALM-Pluto,
+`xc7z010clg225-1`), so pass `TARGET=plutoplus` explicitly. The airband design is
+unchanged across variants —
 the Pluto+ project shares the pluto `system_top.v` and sources its
 `system_bd.tcl` (so the airband HP0 DMA wiring carries over), and its
 `zynq-plutoplus-maiasdr.dts` `#include`s the shared `zynq-pluto-sdr-maiasdr.dtsi`

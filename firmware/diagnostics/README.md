@@ -35,7 +35,7 @@ clock, the 40 MHz reference 3rd harmonic) coupling into the RX — **not** anten
 | `spur_classify.py` | Captures at two LO frequencies and classifies each peak as fixed-offset (LO-relative synth spur) vs fixed-absolute (clock harmonic / EMI / real RF). | gain + LO |
 | `samplerate_spur_test.py` | Older Fs sweep (absolute-frequency recurrence). Superseded by `clock_shift_test.py` for the alias/digital classification. | gain + LO + Fs |
 | `gain_sweep.py` | Sweeps RX gain; reports ADC RMS/peak/clip% and low-freq wideband AM. | gain |
-| `floor_sweep.py` | Sweeps RX gain; per gain reports clip%, wideband PSD noise floor, SFDR, and strong-peak count. Used to set the manual gain just below ADC clipping (the 71→48 dB change). | gain |
+| `floor_sweep.py` | Sweeps RX gain; per gain reports clip%, wideband PSD noise floor, SFDR, and strong-peak count. Finds the ADC-clipping knee (~48 dB) for choosing the adjustable `gain_db`. | gain |
 | `measure_offset.py` | **Coarse clock calibration.** Measures a known AM carrier's frequency error (e.g. a commissioned AWOS) and derives the 40 MHz reference ppm error + the `ad936x_ext_refclk_override` value. ~1 ppm — a bring-up step before `lte_calibrate.py`. | recorder only |
 | `lte_calibrate.py` | **Precise clock calibration (~0.01 ppm).** Tunes to an LTE downlink center and measures the carrier frequency offset by cyclic-prefix autocorrelation. `--selftest` validates the estimator with no hardware; omit `--freq` to auto-scan US bands; `--apply` programs the override, reboots, and re-measures. | gain + LO |
 | `lo_band_am.py` | At a fixed clean gain, compares wideband level + low-freq AM across LO bands. | gain + LO |
