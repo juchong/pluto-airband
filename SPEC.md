@@ -469,8 +469,9 @@ continuous file. With `--no-agc`, fixed-gain output is scaled to 16-bit via
 Independently of the recording mode it can also stream live: **Icecast** MP3 (LAME
 source client, classic `SOURCE` protocol, 16 kbps mono 22050 Hz for LiveATC),
 **UDP** s16 PCM, and a **Prometheus** `/metrics` endpoint. The Icecast feeder
-takes a JSON **feeds file** (`--feeds`) that maps any number of channels to one
-or more servers (a channel may fan out to several servers), with per-feed
+takes a JSON **feeds file** (`--feeds`, strict JSON — no comments) that maps any
+number of channels to one or more servers (a channel may fan out to several
+servers), with per-feed
 `name`/`genre`/`description`, `bitrate`/`samplerate`, and `tls`
 (`disabled`/`transport`/`upgrade`/`auto`/`auto_no_plain`, plus a testing-only
 `tls_insecure`); the handshake response is checked so a rejected source
@@ -598,9 +599,13 @@ are in **`BUILD.md`**; image contents and addressing invariants in
 ## 9. Remaining work
 
 - **Long-duration soak** for 24/7 antenna-site stability (USB/TCP streaming,
-  thermal/power, watchdog/restart, monitoring). The Icecast source client itself is
-  built (§6.4); what remains is unattended hardening (multi-mount feeds, service
-  supervision) and field validation against a live LiveATC mount.
+  thermal/power, watchdog/restart, monitoring). The Icecast source client is built
+  (§6.4) and **deployed on the tower Pi** (`rf-pi`): the all-channel `feeds.json`
+  feeds the local Icecast under the `deploy/airband-feeds.service` systemd unit
+  (auto-start + auto-restart), validated end-to-end (21/21 mounts, 0 drops; a TLS
+  feed proven). What remains is unattended hardening (per-feed supervision/alerting)
+  and field validation against a live LiveATC mount. NB: the Pluto serves a
+  **single client** on `:30000` — run exactly one reader per device.
 - **Squelch/AGC:** implemented on the host (`airband-dsp`, §6.4). A coarse
   power-squelch could still move into the FPGA later to cut link bandwidth, but the
   host chain already gates audio and normalizes level.

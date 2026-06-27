@@ -1,0 +1,27 @@
+[Unit]
+Description=Pluto airband multichannel Icecast feeder (airband-reader --feeds)
+Documentation=https://github.com/juchong/pluto-airband
+After=network-online.target
+Wants=network-online.target
+# The Pluto serves a single client; never give up retrying if it restarts.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/pluto-airband/host
+ExecStart=/home/pi/pluto-airband/host/target/release/airband-reader plutoplus.chongflix.tv:30000 --feeds /home/pi/pluto-airband/feeds.json
+# airband-reader reconnects to the Pluto and to Icecast on its own, so this only
+# fires on a real crash. Wait between restarts so a wedged Pluto isn't hammered.
+Restart=always
+RestartSec=5
+# The reader traps SIGINT for a graceful shutdown (close feeds/recorders); use it
+# for `systemctl stop` instead of the default SIGTERM.
+KillSignal=SIGINT
+TimeoutStopSec=15
+# Single instance is inherent to a systemd service; keep memory/FD headroom for
+# 21 eager DeepFilterNet models (~10-15 MB each) plus encoders.
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target

@@ -18,7 +18,7 @@ what is left).
 | 5. AM demod block | **done** (envelope mag + DC-block + audio decimate, chain verified) |
 | 6. Single-channel end-to-end | **done** (verified on hardware as part of the 21-ch stream) |
 | 7. Multi-channel | **done** — 21 channels live on hardware, gap-free TCP stream, auto-start |
-| 8. Pi streamer | host reader + built-in Icecast(LAME)/UDP source clients done (`host/airband-reader`); live LiveATC mount validation + supervision pending |
+| 8. Pi streamer | **done + deployed** — host reader on `rf-pi` feeds all 21 channels to the local Icecast (`feeds.json` + `deploy/airband-feeds.service`, auto-start/restart), end-to-end validated; live LiveATC mount validation + per-feed supervision pending |
 | 9. Hardening | host DSP done (squelch/AGC/band-pass/notch in `host/airband-dsp`); 24/7 soak + feed supervision not started |
 
 ## Done
@@ -1167,6 +1167,32 @@ Captures via `airband-reader` (minimal-DSP: `--squelch off --no-agc --no-filter
   vs 3/21 before. Default VOX+DFN run: ch0 AWOS loud (−18.4 dBFS RMS, −1.5 peak),
   0 drops. `airband-dfn` (3) + `airband-reader` (13) tests pass.
 
+### Live Pi 5 deployment + all-channel Icecast feeds (2026-06-26)
+- **End-to-end validated on the tower Pi (`rf-pi`, Pi 5 / 8 GB)** against the live
+  Pluto+ (`plutoplus.chongflix.tv:30000`). Built `airband-reader` only (the Pi is
+  headless; `airband-listen` needs ALSA, which isn't installed). Stats: 21 ch @
+  ~21875 sps, **0 drops**; VOX squelch keys the active channels (ch0 AWOS etc.).
+- **TLS source proven:** single `--icecast-*` feed to `icecast.chongflix.tv:9344`
+  (`tls: transport`) connected, stayed up, and a listener pull of the mount returned
+  valid MP3 frames (`ff f3 …`) — full path Pluto RF → DFN → MP3 → Icecast → listener.
+- **All-channel feeds file** `feeds.json` (repo root): one entry per built-in
+  channel → the local Icecast plaintext source port (`:9343`), 32 kbps / 22050 Hz,
+  mounts keyed by frequency (`/pluto-118p050.mp3` …). **Strict JSON** — the parser
+  is `serde_json`, so the README's illustrative `//` comments must be removed in a
+  real file (README updated to say so). A clean single-reader run connected **all
+  21 mounts**, 0 drops, no errors.
+- **systemd unit** `deploy/airband-feeds.service` (installed on `rf-pi`,
+  enabled): runs the `--feeds` reader as `pi`, `Restart=always` +
+  `StartLimitIntervalSec=0`, `KillSignal=SIGINT` for graceful stop. Single instance
+  is inherent to the service.
+- **Gotcha — Pluto is single-client.** Several concurrent readers (leftover
+  backgrounded test processes that outlived their SSH sessions because the binary
+  traps SIGINT) fought over the `:30000` socket and **wedged `maia-httpd`** (both
+  `:8000` and `:30000` refused; device still pinged). Recovered with
+  `/etc/init.d/S60maia-httpd restart` on the Pluto. Lessons baked into the README:
+  run exactly one reader per device, and clean up with `pkill -x airband-reader`
+  (process-name match), never `pkill -f` (self-matches the controlling shell).
+
 ## Next steps
 - **Buzz spurs are characterized** (see "Buzz spur taxonomy", 2026-06-24): the
   dominant 126.000 MHz tooth is the AD9361 sample-clock 9th harmonic (9×14 MHz), plus
@@ -1180,9 +1206,12 @@ Captures via `airband-reader` (minimal-DSP: `--squelch off --no-agc --no-filter
   to do: a better antenna for weaker fields, and per-site tuning of `gain_db` /
   `--shift` (lower gain if a strong local signal ever overloads the front-end).
 - **LiveATC feeder validation** (`SPEC.md` §9): the Icecast source client is built
-  (`airband-reader --icecast-*`); remaining is validating against a real LiveATC
-  mount and adding multi-mount/per-feed supervision.
+  and now **validated end-to-end** on `rf-pi` — all 21 channels feed the local
+  Icecast (`feeds.json` + `deploy/airband-feeds.service`), plus a single TLS feed
+  proven. Remaining is validating against a real **LiveATC** mount and per-feed
+  supervision/alerting.
 - **Hardening** (`SPEC.md` §9): host squelch/AGC/band-pass/notch are done
-  (`airband-dsp`); remaining is 24/7 soak and reconnection/feed supervision.
+  (`airband-dsp`) and the feeder runs under systemd (auto-restart); remaining is
+  24/7 soak and per-feed supervision.
 - **Optional:** add the deferred 133.65 MHz outlier (needs Fs≈20 MHz / 8 lanes /
   recentered LO — a separate window decision, `SPEC.md` §5).

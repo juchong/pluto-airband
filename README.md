@@ -236,6 +236,11 @@ file and the `--icecast-*` flags can be used together (the flags add one more
 feed). Each feed runs its own encoder + auto-reconnecting source thread, and
 falls behind (drops audio) rather than blocking the others if a server stalls.
 
+A ready-to-edit **all-channel template** ships at [`feeds.json`](feeds.json) (one
+entry per channel of the built-in plan; change the server/password/mounts). The
+file is **strict JSON — no comments**; the `//` annotations below are illustrative
+only and must be removed in the real file:
+
 ```jsonc
 {
   "feeds": [
@@ -285,6 +290,37 @@ proxy that accepts the `SOURCE` method, use `tls: "transport"` against the
 HTTPS port. If the source connection is rejected (wrong password, bad mount,
 etc.) the reader now logs the server's HTTP status and reconnects, rather than
 silently going quiet.
+
+#### Run the feeder as a service (Raspberry Pi)
+
+For a tower deployment, run the all-channel feeder under **systemd** so it
+auto-starts on boot and restarts on crash. A ready unit ships at
+[`deploy/airband-feeds.service`](deploy/airband-feeds.service); it runs
+`airband-reader … --feeds /home/pi/pluto-airband/feeds.json` as the `pi` user.
+Install it (adjust paths if your checkout differs):
+
+```bash
+sudo cp deploy/airband-feeds.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now airband-feeds.service
+systemctl status airband-feeds            # state
+journalctl -u airband-feeds -f            # live logs + per-channel stats
+sudo systemctl restart airband-feeds      # apply a feeds.json edit
+sudo systemctl stop airband-feeds         # graceful stop (SIGINT closes feeds)
+```
+
+The unit sets `Restart=always` with `StartLimitIntervalSec=0` (never give up) and
+`KillSignal=SIGINT` so `stop` triggers the reader's graceful shutdown. Because the
+reader reconnects to both the Pluto and Icecast on its own, a restart only fires
+on an actual crash.
+
+> **One reader per Pluto.** The Pluto serves a **single client** on `:30000`;
+> running several `airband-reader` instances against it at once makes them fight
+> over the socket and can wedge `maia-httpd` (recover with
+> `ssh root@<pluto> /etc/init.d/S60maia-httpd restart`). The systemd unit enforces
+> a single instance — don't also run a manual reader against the same device. When
+> cleaning up stray readers, match by process **name** (`pkill -x airband-reader`),
+> not `pkill -f` (which self-matches the shell running it).
 
 ### Multi-channel enhancement on the Pi 5 (DeepFilterNet for every feed)
 
@@ -575,6 +611,8 @@ the request/response schema.
 | `host/airband-dfn/` | shared DeepFilterNet enhancer + presence brightness (used by both binaries) |
 | `host/airband-reader/` | host reader: router + per-channel workers, demux, drop detection, DFN/presence DSP, split recording, Icecast/UDP/metrics |
 | `host/airband-listen/` | interactive listener: live DSP playback, scanner/mix modes, per-channel meters |
+| `feeds.json` | all-channel Icecast feeds template (one entry per built-in channel) |
+| `deploy/` | deployment assets: `airband-feeds.service` systemd unit for the Pi feeder |
 | `maia-sdr/` | our Maia SDR fork (gitignored here; the airband HDL + `maia-httpd` integration) |
 | `plutosdr-fw/` | Pluto firmware assembler (gitignored; pinned upstream) |
 
