@@ -371,6 +371,101 @@ value means the random fallback is still in play).
 > can never collide with a globally assigned vendor MAC. For a router DHCP
 > reservation, key it to the pinned MAC — now that it is stable across reboots.
 
+### SD-card configuration (channel plan + gain)
+
+The airband channel plan and front-end gain live on the Pluto+'s **microSD card**
+(`/mnt/sdcard/airband.json`), not in the volatile ramfs. This survives power
+cycles and reflashes, and the web config UI reads/writes the same file. The
+built-in default is intentionally minimal — **one channel (118.050 AWOS) at
+0 dB** — so a faint, single AWOS channel is the obvious cue that the SD plan did
+not load (`AirbandConfig::default` in the fork's `maia-httpd/src/airband.rs`).
+
+Three FIT-only pieces (all wired into `build_firmware_full.sh`, so they apply on
+every `TARGET=plutoplus` build — no manual edits):
+
+1. **Devicetree card-detect** (`firmware/apply_sdcard_devicetree.py`): the stock
+   `&sdhci0` node enables the SD controller but declares **no card-detect**, so
+   the kernel never enumerates a card (`mmc0` registers, but no `/dev/mmcblk0`).
+   The patch adds `broken-cd;` (poll for a card) + `no-1-8-v;` (3.3 V signalling).
+2. **Mount on boot** (`firmware/patch_sdcard_mount.py`): injects a mount into the
+   `S60maia-httpd` `start)` case (before the daemon launch) that mounts the card
+   at `/mnt/sdcard` (FAT32, else ext4; partition `mmcblk0p1` else whole-device).
+3. **Config path**: the build appends `--airband-config /mnt/sdcard/airband.json`
+   to the `maia-httpd` launch lines.
+
+**Format + seed the card** (the kernel has **no exFAT** — reformat to FAT32):
+
+```sh
+# After the broken-cd image is flashed, /dev/mmcblk0 appears. Either pull the
+# card and format it FAT32 on any computer, or on-device if mkfs.vfat exists:
+ssh root@plutoplus 'mkfs.vfat -n PLUTOCFG /dev/mmcblk0p1'   # or /dev/mmcblk0 (whole device)
+# copy the channel plan to the card root as airband.json:
+cat firmware/airband.json | ssh root@plutoplus 'cat > /mnt/sdcard/airband.json'
+ssh root@plutoplus 'reboot'   # init mounts the card; maia-httpd loads the plan
+```
+
+Verify: `ssh root@plutoplus 'ls -l /dev/mmcblk0* ; grep /mnt/sdcard /proc/mounts'`
+then `airband-reader <ip>:30000` shows the full 21-channel plan (vs the AWOS-only
+fallback if the card is absent/unformatted).
+
+### Persistent SSH host key + key-based auth
+
+The rootfs is ramfs, so dropbear's `-R` regenerates a **new host key every boot**
+(fingerprint churn / `known_hosts` warnings) and `/root/.ssh` is wiped.
+`firmware/patch_dropbear_persist.py` (wired into `build_firmware_full.sh`, patches
+the `S50dropbear` package init) restores/generates the host key on the persistent
+**jffs2** NVM (`/mnt/jffs2/dropbear`, `mtd2` — survives power cycles **and**
+`firmware.dfu` reflashes) and copies it into `/etc/dropbear` before dropbear
+starts, and seeds `/root/.ssh/authorized_keys` from jffs2 each boot.
+
+Pubkey auth is already compiled in; this only adds persistence. Enable key login
+(one-time, persists — no private keys live in the repo):
+
+```sh
+ssh root@plutoplus 'mkdir -p /mnt/jffs2/dropbear && \
+  echo "ssh-ed25519 AAAA... you@host" >> /mnt/jffs2/dropbear/authorized_keys'
+ssh root@plutoplus reboot   # init copies it to /root/.ssh with strict perms
+```
+
+> **Disabling password auth (optional, later).** Once key login is confirmed
+> working, add `-s` (all users) or `-g` (root only) to `DROPBEAR_ARGS` in
+> `S50dropbear`, rebuild, and reflash `plutoplus.dfu` only (FIT-only; env
+> preserved). It is reversible: the serial console (`getty` on `ttyPS0`) always
+> gives a root login independent of dropbear, so `-s` cannot lock you out.
+
+### Flashing from the Raspberry Pi (build → DFU → flash → test)
+
+The canonical "Flashing over DFU" procedure below assumes `dfu-util` on the
+**Mac** over USB. With the Pluto+ installed in its outdoor chassis it is instead
+USB-tethered to the **Raspberry Pi** (`rfpi`), so flash from there. The change is
+FIT-only (devicetree + init + `maia-httpd`, no gateware) → **`plutoplus.dfu`
+only**, no `boot.dfu`, no u-boot env re-apply.
+
+```sh
+# 1. Build on the server (pushes pulled; bitstream unchanged but it's the only
+#    builder). Verify the provenance OK line, then copy the FIT to the Pi.
+ssh administrator@<server> 'cd ~/pluto-build/airband && \
+  nohup bash firmware/build_firmware_full.sh > ~/pluto-build/fwbuild.log 2>&1 & echo PID=$!'
+# ... wait ~20 min (see phase table) ...
+scp administrator@<server>:~/pluto-build/plutosdr-fw/build/plutoplus.dfu .
+
+# 2. On the Pi: install dfu-util (once), enter DFU, flash, detach.
+ssh rfpi 'sudo apt-get install -y dfu-util'
+ssh rfpi 'ssh root@plutoplus device_reboot sf'          # over Ethernet; USB re-enumerates as DFU
+ssh rfpi 'until dfu-util -l 2>/dev/null | grep -q alt=; do sleep 1; done; dfu-util -l | grep alt='
+ssh rfpi 'dfu-util -a firmware.dfu -D plutoplus.dfu' ; echo "exit=$?"   # foreground; expect "Done!"
+ssh rfpi 'dfu-util -a firmware.dfu -e'                  # named alt (bare -e errors: >1 alt)
+
+# 3. Test after boot (~min for sshd/maia-httpd): SD enumerates + mounts, the
+#    stream is full-rate, the plan loads, and the SSH host key is now stable.
+ssh root@plutoplus 'ls -l /dev/mmcblk0* ; grep /mnt/sdcard /proc/mounts ; ps w | grep [m]aia-httpd'
+airband-reader plutoplus:30000          # expect 21 channels (or AWOS-only fallback), ~15625 sps
+```
+
+Success = `dfu-util` prints `Done!` with `exit=0` (a second `-D` failing at 0 % is
+the first write having succeeded — see the DFU rules below). If `/dev/mmcblk0`
+does not appear, recheck the `broken-cd` devicetree patch landed in the FIT.
+
 ### Running a build from an agent (launch detached + wait-and-check)
 
 The build outlives the SSH session and far outlives a single tool-call timeout,
@@ -412,7 +507,7 @@ this section.)
 
 | What changed | Flash | Why |
 |---|---|---|
-| Devicetree / kernel / rootfs / `--airband` host-side (a **FIT-only** build): MAC pin, channel plan, gain default, the front-end lock, etc. | **`firmware.dfu` only** (`pluto.dfu` / `plutoplus.dfu`) | Leaves `mtd0` **and the u-boot env untouched** → the clock calibration (`ad936x_ext_refclk_override`), `usb_ethernet_mode`, and AD9364 attrs all survive. No re-apply step, no env risk. |
+| Devicetree / kernel / rootfs / `--airband` host-side (a **FIT-only** build): MAC pin, SD card-detect (`broken-cd`), SD-mount + SSH-persist init scripts, fallback default, the front-end lock, etc. | **`firmware.dfu` only** (`pluto.dfu` / `plutoplus.dfu`) | Leaves `mtd0` **and the u-boot env untouched** → the clock calibration (`ad936x_ext_refclk_override`), `usb_ethernet_mode`, and AD9364 attrs all survive. No re-apply step, no env risk. |
 | HDL / bitstream / block-design / address-map | **both** `boot.dfu` **and** `firmware.dfu` | The PL bitstream lives in `BOOT.BIN` (`mtd0`); flashing only the FIT leaves **stale gateware**. `boot.dfu` then **wipes the env** → re-apply afterward (step 5). |
 
 Rule of thumb: a change under `maia-hdl/` (gateware) is a `boot.dfu` change;
@@ -560,8 +655,10 @@ LSB** (i.e. ~ −90 to −100 dBFS at 24-bit). Two things were eating it:
    | **manual 71 dB** | **71 dB** | **~280** |
 
    Fixed **manual gain** wins by ~5× over the AGC modes for weak-signal recovery.
-   The **shipped built-in default is 12 dB** (`maia-httpd` `AirbandConfig::default`,
-   what runs when `/root/airband.json` is absent), tuned for an external LNA. The
+   The **operational gain is 12 dB**, set in the SD config (`firmware/airband.json`
+   → `/mnt/sdcard/airband.json`), tuned for an external LNA. (The `maia-httpd`
+   `AirbandConfig::default` fallback, used only when no SD config is mounted, is a
+   deliberately minimal AWOS-only **0 dB** — not for operational use.) The
    receiver is **internal-noise-limited** (the ch11 audio floor is identical with the
    antenna or a 50 Ω load, Δ0.4 dB, and rises ~1 dB per +6 dB of gain → the floor is
    ADC quantization + the conducted comb, not antenna noise). A controlled sweep on the
@@ -573,15 +670,16 @@ LSB** (i.e. ~ −90 to −100 dBFS at 24-bit). Two things were eating it:
    generator — run lower) but does **not** replace the ~12 dB internal gain. History:
    71 → 48 (clipping knee) → 0 (wrong — quantization-starved) → **12**. On a *bare*
    front end (no LNA) raise toward the **48 dB** clipping knee.
-   To apply a config without reflashing, drop it on the device and restart:
+   To apply a config without reflashing, write it to the **SD card** and restart
+   (the receiver loads `--airband-config /mnt/sdcard/airband.json`):
 
    ```sh
-   cat firmware/airband.json | ssh root@192.168.2.1 'cat > /root/airband.json'
+   cat firmware/airband.json | ssh root@192.168.2.1 'cat > /mnt/sdcard/airband.json'
    ssh root@192.168.2.1 /etc/init.d/S60maia-httpd restart
    ```
 
    (The Pluto's dropbear has no `sftp-server`, so `scp` fails — pipe over `ssh`,
-   or `scp -O`.)
+   or `scp -O`. `/root/airband.json` is no longer read; see "SD-card configuration".)
 
 2. **Audio level.** With the AGC on (default), `airband-reader`/`airband-listen`
    normalize loudness automatically — no manual makeup needed. Only with `--no-agc`

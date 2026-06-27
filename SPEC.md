@@ -222,8 +222,16 @@ DC/CIC state in BRAM); the magnitude is shared combinational logic.
 
 ## 5. Front-end configuration and channel plan
 
-The receiver reads `/root/airband.json` at startup (template:
-`firmware/airband.json`), falling back to built-in defaults:
+The receiver reads its config from the **SD card** at startup —
+`/mnt/sdcard/airband.json` (the init script mounts the card and passes
+`--airband-config /mnt/sdcard/airband.json`; the canonical file is
+`firmware/airband.json`). The card must be **FAT32** (the kernel has no exFAT).
+The web config UI reads/writes this same SD file, so edits persist. If the card
+is missing/unformatted/unmounted, `maia-httpd` falls back to a **deliberately
+minimal built-in default — a single channel (118.050 AWOS) at 0 dB gain** — so a
+faint, single AWOS channel is the obvious cue that the SD plan did not load. The
+SD config is the source of truth (persistence model in §8.1); the operational
+values below are what `firmware/airband.json` ships:
 
 - **LO / capture center:** 123.438 MHz.
 - **Sample rate:** 14 MHz — **fixed**; the channelizer's decimation/filters are
@@ -234,9 +242,10 @@ The receiver reads `/root/airband.json` at startup (template:
   DC/LO-leakage spur in a guard gap — are derived in `hdl/capture_window.py`.)
 - **Gain:** one shared RX gain serves all 21 channels (no per-channel *RF* AGC;
   per-channel audio AGC is done on the host, §6.4); fixed **manual gain** (the
-  AD9361 AGC modes settle on wideband power and starve weak channels). The shipped
-  default is **12 dB**, tuned for an external LNA, and the choice is set by two
-  measured facts:
+  AD9361 AGC modes settle on wideband power and starve weak channels). The SD
+  config ships **12 dB**, tuned for an external LNA (the built-in fallback is
+  0 dB — minimal by design, not for operational use); the 12 dB choice is set by
+  two measured facts:
   - **The receiver is internal-noise-limited, not antenna/thermal-limited.** The
     channel-11 idle audio floor is identical with the antenna or a **50 Ω termination**
     (−92.9 vs −93.3 dBFS, Δ0.4 dB) and rises only ~1 dB per +6 dB of gain. So the
@@ -346,8 +355,8 @@ fabric. (For a consumer-facing summary of the output stream — the contract for
 writing your own client — see `README.md` → "Audio output interface".)
 
 ### 6.1 Configuration (one-time, at start)
-On boot with `--airband`, `maia-httpd` reads `/root/airband.json` (or built-in
-defaults) and:
+On boot with `--airband`, `maia-httpd` reads `/mnt/sdcard/airband.json` from the
+SD card (or the built-in AWOS-only 0 dB fallback if no card is mounted) and:
 1. Sets the AD9361 **sampling frequency** (14 MHz), **RX RF bandwidth** (= Fs),
    and **RX LO** (123.438 MHz).
 2. Sets the gain: `agc: "manual"` → manual gain mode + `gain_db` (12 dB default,
@@ -541,7 +550,7 @@ keep the displays responsive the page requests a faster spectrometer output rate
 | Endpoint | Purpose |
 |---|---|
 | `GET /api/airband` | Returns the persisted (pending) config: `center_hz`, `samp_rate`, `rf_bandwidth`, `gain_db`, `agc`, `channels` (`[{freq_hz, label?}]`), `poll_ms`, plus capability/read-only fields `max_channels` (21), `samp_rate_locked` (`true`), `enabled` (receiver active), and `needs_restart` (persisted ≠ running). |
-| `PATCH /api/airband` | Merges the provided fields, **validates** (≤ `max_channels` channels, each within `center_hz ± samp_rate/2`, `gain_db ∈ [0, 77]`, `poll_ms ≥ 1`; `samp_rate` cannot be changed), and persists the merged config to `/root/airband.json`. Returns the updated config. |
+| `PATCH /api/airband` | Merges the provided fields, **validates** (≤ `max_channels` channels, each within `center_hz ± samp_rate/2`, `gain_db ∈ [0, 77]`, `poll_ms ≥ 1`; `samp_rate` cannot be changed), and persists the merged config to the SD-card file (`/mnt/sdcard/airband.json`). Returns the updated config. |
 | `POST /api/system/restart` | Restarts the `maia-httpd` service (detached, ~1 s delay) so a freshly saved config is applied. If unavailable, reboot manually. |
 
 The config handlers only read/write the JSON file — they never touch the radio
@@ -598,6 +607,34 @@ Vivado **2023.2**, Amaranth **0.5.8**). Flashing is independent of building:
 `dfu-util` over USB from the Mac. Full environment, build, and flash procedures
 are in **`BUILD.md`**; image contents and addressing invariants in
 **`firmware/README.md`**.
+
+### 8.1 Persistent state (ramfs vs jffs2 vs SD)
+
+The rootfs is **ramfs** (`root=/dev/ram0`), reconstituted from the FIT image on
+every boot, so anything written to `/etc` or `/root` is **lost on power-off**.
+Three partitions on the QSPI flash plus the SD card hold the durable state:
+
+| Store | Device | Survives power cycle | Survives `firmware.dfu` reflash | Holds |
+|---|---|---|---|---|
+| rootfs | ramfs (from `mtd3` FIT) | no | rewritten | OS, init scripts, built-in defaults |
+| u-boot env | `mtd1` | yes | yes | clock cal, USB mode, AD9364 attrs |
+| jffs2 NVM | `mtd2` (`/mnt/jffs2`) | yes | **yes** (only `mtd3` is rewritten) | TLS certs, **SSH host key + `authorized_keys`** |
+| SD card | `/dev/mmcblk0` (`/mnt/sdcard`, FAT32) | yes | yes | **airband channel plan + gain** (`airband.json`) |
+
+Consequences, both addressed by this design:
+
+- **Airband config** lives on the **SD card** (`/mnt/sdcard/airband.json`), not in
+  ramfs. The init script mounts the card (requires `broken-cd` in the `&sdhci0`
+  devicetree node — the stock DT enables the controller but declares no
+  card-detect, so the kernel never enumerates a card) and points `maia-httpd` at
+  it. The built-in fallback is intentionally AWOS-only at 0 dB.
+- **SSH host key** would otherwise be regenerated every boot: the dropbear init
+  launches with `-R` (create-if-missing) into ramfs `/etc/dropbear`, so the
+  fingerprint churned on each power-cycle and key-based auth could not persist.
+  The init now restores/generates the host key on jffs2 and seeds
+  `/root/.ssh/authorized_keys` from jffs2 before dropbear starts (pubkey auth is
+  compiled in; password auth is left enabled and can be disabled later with
+  dropbear `-s`/`-g`).
 
 ## 9. Remaining work
 

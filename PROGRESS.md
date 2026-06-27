@@ -1244,6 +1244,39 @@ Captures via `airband-reader` (minimal-DSP: `--squelch off --no-agc --no-filter
   Frequency labels also corrected: ch0 118.050 = S50 AWOS, ch10 122.950 = KBFI
   UNICOM, ch11 122.975 = S50 CTAF.
 
+### SD-card config + persistent SSH (2026-06-27)
+Moved the airband channel plan/gain onto the Pluto+'s **microSD card** and made
+the SSH identity persistent — both were lost on power-off because the rootfs is
+ramfs. All FIT-only (no gateware change) → `plutoplus.dfu`-only reflash.
+
+- **SD config is the source of truth.** `maia-httpd` now loads
+  `--airband-config /mnt/sdcard/airband.json`; the web `/api/airband` GET/PATCH
+  reads/writes the same SD file (single path knob in `args.rs` → both startup
+  load and the web handlers). `firmware/airband.json` is the canonical SD file
+  (full 21-ch plan, corrected freqs, `channel_labels`, `gain_db 12`).
+- **Built-in default shrunk to an obvious fallback.** `AirbandConfig::default`
+  (fork `maia-httpd/src/airband.rs`) is now **one channel — 118.050 AWOS — at
+  0 dB** (was the 21-ch plan at 12 dB): a faint single AWOS channel = "the SD
+  plan did not load". Operational gain (12 dB w/ LNA) lives on the card.
+- **SD card-detect.** The stock `&sdhci0` DT enables the controller but declares
+  no card-detect, so the kernel never enumerated a card (`mmc0` up, no
+  `/dev/mmcblk0`). `firmware/apply_sdcard_devicetree.py` adds `broken-cd` +
+  `no-1-8-v`. Card must be **FAT32** (kernel has no exFAT).
+  `firmware/patch_sdcard_mount.py` mounts it at `/mnt/sdcard` in `S60maia-httpd`
+  before the daemon launches; the build appends the `--airband-config` arg.
+- **Persistent SSH host key + key auth.** dropbear's `-R` regenerated a new host
+  key every boot (fingerprint churn) and `/root/.ssh` was wiped.
+  `firmware/patch_dropbear_persist.py` (patches the `S50dropbear` package init)
+  restores/generates the host key on **jffs2** (`/mnt/jffs2/dropbear`, `mtd2` —
+  survives power cycles and `firmware.dfu` reflashes) and seeds
+  `authorized_keys` from jffs2 each boot. Pubkey auth was already compiled in;
+  password auth left enabled (disable later with dropbear `-s`/`-g`).
+- All four patchers wired into `firmware/build_firmware_full.sh`; validated
+  against the real build-server `S60maia-httpd` / `S50dropbear` / Pluto+ `.dts`
+  (idempotent, `sh -n` clean). Docs updated: `BUILD.md` (SD config, SSH
+  persistence, "Flashing from the Raspberry Pi" procedure, future
+  password-disable, flash table), `SPEC.md` §5/§6.1/§6.5/§8.1, `README.md`.
+
 ## Next steps
 - **Buzz spurs are characterized** (see "Buzz spur taxonomy", 2026-06-24): the
   dominant 126.000 MHz tooth is the AD9361 sample-clock 9th harmonic (9×14 MHz), plus

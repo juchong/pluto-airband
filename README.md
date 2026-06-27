@@ -539,10 +539,14 @@ the airband band no matter what the browser does.
 
 ## Channel plan
 
-The receiver reads `/root/airband.json` on the Pluto at startup; if absent it uses
-the `maia-httpd` **built-in defaults** shown below. A ready-to-copy template is at
-`firmware/airband.json` (identical to these built-in defaults; the **12 dB** default
-is tuned for an external LNA — raise `gain_db` on a bare front end, see **Gain** below):
+The receiver reads its config from the **SD card** (`/mnt/sdcard/airband.json`) at
+startup — the canonical file is `firmware/airband.json`, copied to the card's root
+(the card must be **FAT32**; the kernel has no exFAT). The web config page reads
+and writes this same file. If no card is mounted, `maia-httpd` falls back to a
+**minimal built-in default — one channel (118.050 AWOS) at 0 dB** — so hearing
+only a faint, single AWOS channel is the obvious sign the SD plan did not load.
+The shipped `firmware/airband.json` uses **`gain_db: 12.0`** (tuned for an external
+LNA — raise it on a bare front end, see **Gain** below):
 
 ```jsonc
 {
@@ -592,12 +596,18 @@ Rules:
   comb; see
   [`firmware/diagnostics/README.md`](firmware/diagnostics/README.md)).
 
-Apply a new plan:
+Apply a new plan — edit it on the SD card (the persistent source of truth):
 
 ```bash
-scp firmware/airband.json root@192.168.2.1:/root/airband.json   # password: analog
+# Mount the FAT32 SD card on any computer and copy the file to its root as
+# airband.json, then reinsert and reboot the Pluto. Or, in place on the device:
+cat firmware/airband.json | ssh root@192.168.2.1 'cat > /mnt/sdcard/airband.json'  # password: analog
 ssh root@192.168.2.1 /etc/init.d/S60maia-httpd restart
 ```
+
+(The Pluto's dropbear has no `sftp-server`, so `scp` fails — pipe over `ssh`, or
+`scp -O`. Editing `/root/airband.json` no longer takes effect: the receiver now
+loads `--airband-config /mnt/sdcard/airband.json`.)
 
 ### Web config page (recommended)
 
@@ -638,9 +648,10 @@ here:
 
 ![Front-end settings with locked center frequency and sample rate, and a bounded gain field](docs/images/airband-frontend.png)
 
-Saving **persists `/root/airband.json`** and shows a banner; click **Restart
-receiver** (or reboot) to apply — the channelizer NCOs are programmed once at
-startup, so a restart is required. The page drives the
+Saving **persists `/mnt/sdcard/airband.json`** (on the SD card, so it survives
+power cycles and reflashes) and shows a banner; click **Restart receiver** (or
+reboot) to apply — the channelizer NCOs are programmed once at startup, so a
+restart is required. The page drives the
 [`/api/airband` REST API](SPEC.md#65-web-config-api-and-page); see `SPEC.md` for
 the request/response schema.
 

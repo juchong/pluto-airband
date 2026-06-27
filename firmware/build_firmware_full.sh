@@ -140,6 +140,13 @@ if [ "$TARGET" = "plutoplus" ] && [ -f "$TARGET_DTS" ]; then
     git -C linux checkout -- "arch/arm/boot/dts/zynq-plutoplus-maiasdr.dts" 2>/dev/null || true
     python3 "$AIRBAND_REPO/firmware/apply_mac_devicetree.py" \
         "$TARGET_DTS" "${PLUTO_MAC:-02:0a:35:00:01:22}"
+    # Enable SD-card detection on the microSD slot (&sdhci0). The stock DT
+    # enables the controller but declares no card-detect, so the kernel never
+    # probes a card (no /dev/mmcblk0). broken-cd makes it poll; no-1-8-v keeps
+    # 3.3 V signalling. This lets maia-httpd load /mnt/sdcard/airband.json (the
+    # persistent channel plan + gain). DT (FIT) change -> $TARGET.dfu-only.
+    echo "== enabling Pluto+ SD card detect (broken-cd) =="
+    python3 "$AIRBAND_REPO/firmware/apply_sdcard_devicetree.py" "$TARGET_DTS"
 fi
 
 # 3b. Auto-start airband: append --airband to the maia-httpd init script so the
@@ -148,6 +155,22 @@ S60=buildroot/board/$TARGET/S60maia-httpd
 if [ -f "$S60" ] && ! grep -q -- '--airband' "$S60"; then
     sed -i 's#--ca-cert /mnt/jffs2/maia-sdr-ca.crt#--ca-cert /mnt/jffs2/maia-sdr-ca.crt --airband#' "$S60"
     echo "== patched $S60: maia-httpd now auto-starts with --airband =="
+fi
+
+# 3b-2. Point maia-httpd at the SD-card config (channel plan + gain persist on
+#     the card, not in the volatile rootfs). The launch lines end with
+#     `--airband`, so append the config arg there. Must run BEFORE the SD-mount
+#     patch below (whose comment also contains the literal "--airband-config",
+#     which would otherwise trip the idempotency guard).
+if [ -f "$S60" ] && ! grep -q -- '--airband-config' "$S60"; then
+    sed -i 's#--airband$#--airband --airband-config /mnt/sdcard/airband.json#' "$S60"
+    echo "== patched $S60: maia-httpd reads --airband-config /mnt/sdcard/airband.json =="
+fi
+
+# 3b-3. Mount the SD card at /mnt/sdcard in the start) case, before the daemon
+#     launch, so the config is available when maia-httpd reads it. Idempotent.
+if [ -f "$S60" ]; then
+    python3 "$AIRBAND_REPO/firmware/patch_sdcard_mount.py" "$S60"
 fi
 
 # 3c. Quiet the AD9361 TX on boot (this is a receive-only build). The Pluto comes
@@ -171,6 +194,20 @@ fi
 #     Idempotent (airband-respawn marker). Software-only init-script change.
 if [ -f "$S60" ]; then
     python3 "$AIRBAND_REPO/firmware/patch_maia_respawn.py" "$S60"
+fi
+
+# 3e. Persist the SSH host key + authorized_keys across power cycles. The rootfs
+#     is ramfs, so dropbear's `-R` regenerates a NEW host key every boot (the
+#     fingerprint churns) and /root/.ssh is wiped. Patch the dropbear init script
+#     to restore/generate them on the jffs2 NVM (/mnt/jffs2, mtd2; survives power
+#     cycles AND firmware.dfu reflashes) before dropbear starts. Pubkey auth is
+#     already compiled in; this only adds persistence (password auth left on).
+#     Reset then patch so the change tracks the script across rebuilds. The
+#     dropbear init is a buildroot package default (no board override).
+S50DB=buildroot/package/dropbear/S50dropbear
+if [ -f "$S50DB" ]; then
+    git -C buildroot checkout -- "package/dropbear/S50dropbear" 2>/dev/null || true
+    python3 "$AIRBAND_REPO/firmware/patch_dropbear_persist.py" "$S50DB"
 fi
 
 # 4. Full build inside the maia-sdr-devel container (Vivado from /opt/Xilinx
