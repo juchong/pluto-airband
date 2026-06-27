@@ -25,6 +25,21 @@ const NOISE_DECAY: f32 = 0.97;
 const NOISE_UPDATE_INTERVAL: u64 = 16;
 /// Small additive term so the noise floor can never collapse to exactly zero.
 const NOISE_EPSILON: f32 = 1e-6;
+/// Hard lower bound on the tracked noise floor, in **raw 24-bit sample units**.
+///
+/// The floor re-estimates toward the *minimum* level seen while shut. On a
+/// channel with no signal the demodulated audio sits at the ADC **quantization
+/// floor** — mostly-zero samples with sparse ±1–2 LSB ticks — so without a floor
+/// the EWMA collapses toward `NOISE_EPSILON / (1 - NOISE_DECAY) ≈ 3e-5` (≈ 0
+/// against the `2**23` full scale). The open threshold (`snr_ratio × floor`) then
+/// becomes ~0 and a single 1-LSB quantization tick false-opens the squelch —
+/// which downstream AGC/DeepFilterNet amplify into "robotic" static. Pinning the
+/// floor at a few LSB keeps the threshold (e.g. ~11 LSB at the 9 dB default) above
+/// quantization noise on an empty channel while staying far below any genuine
+/// transmission (tens–hundreds of LSB), so adaptation is unaffected once real
+/// receiver noise is present. `NOISE_EPSILON` (carried from RTLSDR-Airband's
+/// normalized [0,1] domain) is far too small to serve this role in raw units.
+const MIN_NOISE_FLOOR: f32 = 4.0;
 
 /// How the open/close threshold is chosen.
 #[derive(Clone, Copy, Debug)]
@@ -242,7 +257,9 @@ impl Squelch {
         // not pull the floor up under itself.
         if !self.is_open() && self.sample_count.is_multiple_of(NOISE_UPDATE_INTERVAL) {
             let m = self.level.min(self.noise_floor);
-            self.noise_floor = self.noise_floor * NOISE_DECAY + m * (1.0 - NOISE_DECAY) + NOISE_EPSILON;
+            self.noise_floor = (self.noise_floor * NOISE_DECAY + m * (1.0 - NOISE_DECAY)
+                + NOISE_EPSILON)
+                .max(MIN_NOISE_FLOOR);
         }
 
         let thr = self.threshold();
@@ -366,6 +383,34 @@ mod tests {
         assert!(end < start, "floor should drop ({start} -> {end})");
         assert!(end < 80.0, "floor should approach the input level (~50), got {end}");
         assert!(!sq.is_open(), "quiet input must keep squelch shut");
+    }
+
+    #[test]
+    fn quantization_floor_does_not_false_open() {
+        // A dead channel sits at the demod quantization floor: mostly-zero
+        // samples with sparse 1-2 LSB ticks. The adaptive floor must not collapse
+        // and let those ticks false-open the squelch (which would otherwise feed
+        // AGC/DeepFilterNet pure quantization noise -> "robotic" static).
+        let mut sq = auto(15625, 9.0);
+        let mut opened = false;
+        for i in 0..1_000_000u64 {
+            let mag = match i % 7 {
+                0 => 1.0,
+                3 => 2.0,
+                _ => 0.0,
+            };
+            sq.process(mag);
+            if sq.is_open() {
+                opened = true;
+                break;
+            }
+        }
+        assert!(!opened, "empty quantization-floor channel must stay shut");
+        assert!(
+            sq.noise_floor() >= MIN_NOISE_FLOOR,
+            "floor must not collapse below MIN_NOISE_FLOOR, got {}",
+            sq.noise_floor()
+        );
     }
 
     #[test]
