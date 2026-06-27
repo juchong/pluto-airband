@@ -1291,8 +1291,19 @@ ramfs. All FIT-only (no gateware change) → `plutoplus.dfu`-only reflash.
   `board/pluto/post-build.sh`, reached via the `board/plutoplus -> pluto`
   symlink, reinstalls them every build). Reworked step 3e to stage a patched
   `board/$TARGET/S50dropbear` (from the pristine package source each build) and
-  append an install line to `post-build.sh`. Pending: rebuild + reflash + verify
-  host-key stability across a power cycle.
+  append an install line to `post-build.sh`.
+- **Rebuilt, reflashed, and SSH-verified on hardware (2026-06-27).** Second
+  `plutoplus.dfu` confirms `S50dropbear` now carries the `airband-ssh-persist`
+  block; host keys (ed25519/rsa/ecdsa) persist in `/mnt/jffs2/dropbear` and copy
+  to `/etc/dropbear` on boot. Host-key fingerprint is **stable across a power
+  cycle** (`SHA256:NL8Ou0…` on two consecutive boots; reconnected with the key
+  still pinned in `known_hosts`, no MITM warning). **Key-based passwordless login
+  verified** end-to-end (seeded an ephemeral pubkey into
+  `/mnt/jffs2/dropbear/authorized_keys`, logged in with `PasswordAuthentication=no`,
+  then removed the test key). Operators enable their own key by appending it to
+  `/mnt/jffs2/dropbear/authorized_keys` (one-time, persists). After the first
+  flash the fingerprint changes once (fresh key on the empty jffs2 store) — clear
+  the stale `known_hosts` entry that one time.
 
 ## Next steps
 - **Buzz spurs are characterized** (see "Buzz spur taxonomy", 2026-06-24): the
