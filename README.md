@@ -5,14 +5,35 @@ ADALM-Pluto derivative: same Zynq-7010 + AD9363, plus Gigabit Ethernet, microSD,
 and a 0.5 ppm VCTCXO) into a **21-channel VHF airband (AM aircraft voice)
 receiver**. A single wideband capture is split into many narrow channels entirely
 inside the Pluto+'s FPGA; each channel is AM-demodulated to audio on-chip and
-streamed off the device over the network — suitable for feeding multiple
+streamed off the device over the network — enough to feed many
 [LiveATC](https://www.liveatc.net/) audio streams from one SDR.
 
-> The same firmware also builds for the USB-only Analog Devices ADALM-Pluto
-> (`TARGET=pluto`); the Pluto+ is the deployed target and what the docs assume.
+A small **Rust host workspace** consumes that stream: it demuxes the channels,
+cleans up the audio (squelch, AGC, optional DeepFilterNet), and can record WAVs,
+play channels live, push MP3 to Icecast/LiveATC, or hand raw PCM to your own
+program.
 
-> **Status:** live on hardware — all 21 channels stream gap-free and the receiver
-> auto-starts on boot. See [Status & known limitations](#status--known-limitations).
+> The same firmware also builds for the USB-only Analog Devices ADALM-Pluto
+> (`TARGET=pluto`); the Pluto+ is the primary target and what these docs assume.
+
+> **Status:** runs on hardware with all 21 channels streaming gap-free and the
+> receiver auto-starting on boot. Known constraints are in
+> [Known limitations](#known-limitations).
+
+## What you need
+
+- A **Pluto+** (or an ADALM-Pluto) and `dfu-util` to flash it.
+- The two firmware images — build them yourself per [`BUILD.md`](BUILD.md), or
+  use a prebuilt image if you have one.
+- A **host** to run the receiver tools: any Linux/macOS machine or a Raspberry Pi
+  (a Pi 5 comfortably runs all 21 channels with DeepFilterNet). It needs a Rust
+  toolchain to build `host/`.
+- A VHF **antenna** for the airband. One capture covers a 14 MHz window (channels
+  within ~116.4–130.4 MHz; see [How it works](#how-it-works)). An airband band-pass
+  filter + a low-noise amplifier ahead of the device gives the biggest quality win
+  (see [Known limitations](#known-limitations)).
+- A **microSD card** (FAT32) if you want a persistent, custom channel plan on a
+  Pluto+; without one the firmware falls back to a single built-in channel.
 
 ## Documentation
 
@@ -20,8 +41,9 @@ This README is the hub. Each topic has a single home:
 
 | If you want to… | Go to |
 |---|---|
-| Flash a prebuilt image and listen (fastest path) | [Quick start](#quick-start) (below) |
+| Flash a device and listen (fastest path) | [Get started](#get-started) (below) |
 | Consume the audio stream from your own program | [Audio output interface](#audio-output-interface-write-your-own-client) (below) |
+| Run the Icecast feeder unattended on a Pi (systemd) | **[`deploy/README.md`](deploy/README.md)** |
 | Understand the design, constraints, and rationale | **[`SPEC.md`](SPEC.md)** — authoritative design spec |
 | Build firmware, flash, set up the dev/build env, troubleshoot | **[`BUILD.md`](BUILD.md)** |
 | Know what each FPGA/DSP block does | **[`hdl/README.md`](hdl/README.md)** |
@@ -59,12 +81,14 @@ This README is the hub. Each topic has a single home:
   dropped samples via the per-channel sequence counter.
 
 This is built **on top of** [Maia SDR](https://maia-sdr.org/); the airband DSP,
-DMA, and control live in our fork (`github.com/juchong/maia-sdr`, `pluto-airband`
+DMA, and control live in a fork (`github.com/juchong/maia-sdr`, `pluto-airband`
 branch). The Maia base (spectrometer/recorder/DDC) is preserved.
 
-## Status & known limitations
+## Known limitations
 
-- **Live on hardware:** 21 channels, gap-free TCP stream, auto-start on boot.
+These are inherent to the platform — worth understanding before you judge the
+audio or plan an install.
+
 - **Channel "buzz" is an internal (conducted) spur comb — not fixable in firmware
   or by antenna-side filtering.** Proven by capturing with the RX input terminated
   (**50 Ω, antenna disconnected**): a dense band-wide comb of on-board harmonics
@@ -75,7 +99,7 @@ branch). The Maia base (spectrometer/recorder/DDC) is preserved.
   is the 9th harmonic of the 14 MHz ADC sample clock**, plus a **125 MHz GbE clock**
   (Pluto+) and the **120 MHz reference 3rd harmonic** — all at fixed *absolute*
   frequencies. Effective levers: **lower RX gain**, **frequency planning** (keep
-  channels off those fixed lines — the shipped plan already does), and an **external
+  channels off those fixed lines when you build your plan), and an **external
   reference** (for the 120 MHz line); input power, enclosure shielding, and a switcher
   bead do not help. Full root-cause analysis and a diagnostic toolkit:
   [`firmware/diagnostics/README.md`](firmware/diagnostics/README.md).
@@ -103,16 +127,17 @@ branch). The Maia base (spectrometer/recorder/DDC) is preserved.
   measure coarsely against a known AM carrier
   ([`measure_offset.py`](firmware/diagnostics/README.md)), then precisely against an
   LTE downlink (`lte_calibrate.py`, ~0.01 ppm, GPS-disciplined). See `SPEC.md` §5.2.
-- **LiveATC feeder integration** is still pending — see `PROGRESS.md` → Next steps.
 
-## Quick start
+## Get started
 
-### 1. Flash a Pluto+
+### 1. Flash the firmware
 
-Prebuilt images come from the build server. Put the Pluto+ in DFU mode (power on
-while holding the button until the LED blinks slowly), then flash **both**
-partitions (after any FPGA change you must reflash `boot.dfu` too — the bitstream
-lives there and a mismatch hangs the receiver):
+Build the two firmware images per [`BUILD.md`](BUILD.md) (or use a prebuilt
+image): `boot.dfu` (FPGA bitstream + FSBL + bootloader) and the rootfs image
+(`plutoplus.dfu` for a Pluto+, `pluto.dfu` for an ADALM-Pluto). Put the device in
+DFU mode (power on while holding the button until the LED blinks slowly), then
+flash **both** partitions (after any FPGA change you must reflash `boot.dfu` too —
+the bitstream lives there and a mismatch hangs the receiver):
 
 ```bash
 cd firmware/build
@@ -135,7 +160,14 @@ are in **[`BUILD.md`](BUILD.md)** and [`firmware/README.md`](firmware/README.md)
 > `plutoplus.dfu`. The channel plan/gain then fall back to the built-in default
 > (no microSD), and per-unit clock calibration is needed (no VCTCXO).
 
-### 2. Listen
+### 2. Set your channels
+
+Put the frequencies you want and your RX gain in `airband.json` on the device's
+microSD card, or use the browser config page — see [Channel plan](#channel-plan).
+With no card the firmware uses a single built-in channel at 0 dB gain, which is
+enough to confirm the receiver works before you commit a full plan.
+
+### 3. Listen
 
 The host tools are a Cargo workspace (`host/`): two binaries (`airband-reader`,
 `airband-listen`) over shared libraries — `airband-dsp` (filters, squelch, AGC)
@@ -237,15 +269,15 @@ file and the `--icecast-*` flags can be used together (the flags add one more
 feed). Each feed runs its own encoder + auto-reconnecting source thread, and
 falls behind (drops audio) rather than blocking the others if a server stalls.
 
-The committed [`feeds.json`](feeds.json) is the **live KSEA/KRNT/S50 plan**: every
-channel of the built-in plan feeds the local Icecast, and the 16 channels with a
-LiveATC mount also fan out to `audio-in.liveatc.net:8010`. **Passwords are not
-stored in the file** — they are written as `${AIRBAND_ICECAST_PASSWORD}` /
-`${AIRBAND_LIVEATC_PASSWORD}` and expanded from the environment at load time
-(`${NAME}` works in `server`, `mountpoint`, `username`, `password`, `name`,
-`genre`, and `description`; a referenced-but-unset variable is a hard error). So
-the file is safe to commit, and the secrets live only in the systemd
-`EnvironmentFile` (see *Run the feeder as a service* below).
+The committed [`feeds.json`](feeds.json) is an **example** you adapt: it maps each
+channel to a mount on a local Icecast and fans the public channels out to a
+LiveATC ingest. **Keep passwords out of the file** — write them as `${ENV_VAR}`
+(e.g. `${AIRBAND_ICECAST_PASSWORD}`) and they are expanded from the environment at
+load time (`${NAME}` works in `server`, `mountpoint`, `username`, `password`,
+`name`, `genre`, and `description`; a referenced-but-unset variable is a hard
+error). The file is then safe to commit, with the secrets supplied only at run
+time (e.g. a systemd `EnvironmentFile` — see
+[`deploy/README.md`](deploy/README.md)).
 
 The file is **strict JSON — no comments**; the `//` annotations below are
 illustrative only and must be removed in the real file:
@@ -278,7 +310,7 @@ Per-feed options (defaults in parentheses):
 | `port` | Server port (`8000`). |
 | `mountpoint` | **Required.** Mount path, e.g. `/KXXX.mp3`. |
 | `username` | Source username (`"source"`). |
-| `password` | Source password (`""`). Supports `${ENV_VAR}` expansion — keep real passwords out of the committed file (see the env-file workflow below). |
+| `password` | Source password (`""`). Supports `${ENV_VAR}` expansion — keep real passwords out of the committed file (see [`deploy/README.md`](deploy/README.md)). |
 | `name` | ICY stream name shown in directories (`"Pluto airband chN"`). |
 | `genre` | ICY genre tag (unset). |
 | `description` | ICY description tag (unset). |
@@ -300,80 +332,19 @@ HTTPS port. If the source connection is rejected (wrong password, bad mount,
 etc.) the reader now logs the server's HTTP status and reconnects, rather than
 silently going quiet.
 
-#### Run the feeder as a service (Raspberry Pi)
+#### Run the feeder as a service
 
-For a tower deployment, run the all-channel feeder under **systemd** so it
-auto-starts on boot and restarts on crash. The deployment is a plain **git
-checkout** at `/home/pi/pluto-airband` that is built **on the Pi** — never
-`rsync` source onto it, so `git pull` always works and the tree stays in a known
-state.
-
-**Initial setup** (one time, as the `pi` user):
-
-```bash
-git clone https://github.com/juchong/pluto-airband.git /home/pi/pluto-airband
-cd /home/pi/pluto-airband
-
-# Build only the streamer (airband-listen needs ALSA and isn't built headless).
-cargo build --release -p airband-reader
-
-# feeds.json carries NO secrets: passwords are written as ${AIRBAND_ICECAST_PASSWORD}
-# / ${AIRBAND_LIVEATC_PASSWORD} and expanded from the environment at startup, so the
-# file is safe to commit and pull. Put the real passwords in a root-only env file
-# (never committed; *.env is gitignored) that the systemd unit loads:
-sudo cp deploy/airband-feeds.env.example /etc/airband-feeds.env
-sudo $EDITOR /etc/airband-feeds.env        # fill in AIRBAND_ICECAST/LIVEATC_PASSWORD
-sudo chown root:root /etc/airband-feeds.env && sudo chmod 600 /etc/airband-feeds.env
-```
-
-A ready unit ships at
-[`deploy/airband-feeds.service`](deploy/airband-feeds.service); it runs
-`airband-reader … --feeds /home/pi/pluto-airband/feeds.json --channels 20 --squelch carrier --squelch-snr 15`
-as the `pi` user. The deployed feed gates on the **FPGA carrier** (`--squelch
-carrier`), not voice VOX, so keyed transmissions open reliably; `--channels 20`
-matches the 20-channel operational plan (AWOS excluded). Install it (adjust paths
-if your checkout differs):
-
-```bash
-sudo cp deploy/airband-feeds.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now airband-feeds.service
-systemctl status airband-feeds            # state
-journalctl -u airband-feeds -f            # live logs + per-channel stats
-sudo systemctl restart airband-feeds      # apply a feeds.json edit
-sudo systemctl stop airband-feeds         # graceful stop (SIGINT closes feeds)
-```
-
-The unit sets `Restart=always` with `StartLimitIntervalSec=0` (never give up) and
-`KillSignal=SIGINT` so `stop` triggers the reader's graceful shutdown. Because the
-reader reconnects to both the Pluto and Icecast on its own, a restart only fires
-on an actual crash.
-
-**Updating a deployment.** Commit and push from your workstation, then on the Pi
-pull and rebuild. Stop the service first so the build gets all four cores (a
-running 21-channel reader otherwise starves the compiler), then restart:
-
-```bash
-cd /home/pi/pluto-airband
-git pull --ff-only
-sudo systemctl stop airband-feeds
-cargo build --release -p airband-reader
-sudo systemctl start airband-feeds
-journalctl -u airband-feeds -n 30 --no-pager   # confirm "ready" + all mounts connect
-```
-
-`feeds.json` carries no secrets (passwords come from `/etc/airband-feeds.env`), so
-`git pull` updates it cleanly; only `cargo build` artifacts under `host/target/`
-are reused for an incremental build. To change a password, edit the env file and
-`systemctl restart airband-feeds` — no pull or rebuild needed.
+To keep the all-channel feeder running unattended (auto-start on boot, restart on
+crash) — for example on a Raspberry Pi at a tower site — run it under **systemd**.
+The unit and a secrets-env template ship in `deploy/`, and the full setup/update
+runbook is in **[`deploy/README.md`](deploy/README.md)**.
 
 > **One reader per Pluto.** The Pluto serves a **single client** on `:30000`;
 > running several `airband-reader` instances against it at once makes them fight
 > over the socket and can wedge `maia-httpd` (recover with
-> `ssh root@<pluto> /etc/init.d/S60maia-httpd restart`). The systemd unit enforces
-> a single instance — don't also run a manual reader against the same device. When
-> cleaning up stray readers, match by process **name** (`pkill -x airband-reader`),
-> not `pkill -f` (which self-matches the shell running it).
+> `ssh root@<pluto> /etc/init.d/S60maia-httpd restart`). When cleaning up stray
+> readers, match by process **name** (`pkill -x airband-reader`), not `pkill -f`
+> (which self-matches the shell running it).
 
 ### Multi-channel enhancement on the Pi 5 (DeepFilterNet for every feed)
 
@@ -546,16 +517,14 @@ the airband band no matter what the browser does.
 ## Channel plan
 
 The receiver reads its config from the **SD card** (`/mnt/sdcard/airband.json`) at
-startup — the canonical file is `firmware/airband.json`, copied to the card's root
-(the card must be **FAT32**; the kernel has no exFAT). The web config page reads
-and writes this same file. If no card is mounted, `maia-httpd` falls back to a
-**minimal built-in default — one channel (118.050 AWOS) at 0 dB** — so hearing
-only a faint, single AWOS channel is the obvious sign the SD plan did not load.
-(That fallback is the *only* place 118.050 AWOS appears: it is deliberately
-**excluded** from the operational plan — a continuous AWOS carrier we don't track
-— so the live plan is **20 channels**.) `gain_db` is **adjustable** — edit it to
-suit your front end (see **Gain** below); the built-in default (no SD card) is
-**0 dB**:
+startup — copy your plan to the card's root as `airband.json` (the card must be
+**FAT32**; the kernel has no exFAT). The committed `firmware/airband.json` is an
+**example plan** (Seattle-area channels) to replace with your own; the web config
+page reads and writes the same file. If no card is mounted, `maia-httpd` falls
+back to a **minimal built-in default — one channel (118.050) at 0 dB** — so
+hearing only a single faint channel is the obvious sign the SD plan did not load.
+`gain_db` is **adjustable** — edit it to suit your front end (see **Gain** below);
+the built-in default (no SD card) is **0 dB**:
 
 ```jsonc
 {
@@ -565,7 +534,7 @@ suit your front end (see **Gain** below); the built-in default (no SD card) is
   "gain_db":     30.0,        // fixed manual gain — ADJUSTABLE; built-in default (no SD card) is 0 dB (see Gain)
   "agc":         "manual",    // "manual" | "slow_attack" | "fast_attack" | "hybrid"
   "poll_ms":     20,
-  "channels_hz": [ 119200000, 119900000, /* … up to 21; 118.050 AWOS excluded … */ 126950000 ]
+  "channels_hz": [ 119200000, 119900000, /* … your channels, up to 21 … */ 126950000 ]
 }
 ```
 
@@ -576,8 +545,8 @@ Rules:
   (i.e. 116.438–130.438 MHz). Out-of-window channels are rejected at startup. The
   FPGA always frames **21 positional channels**, so frame channel *index* = position
   in `channels_hz`; with fewer than 21 entries the trailing positions are stale, and
-  the host reader must run `--channels = len(channels_hz)` (currently **20**) to
-  ignore them. The deployed `feeds.json` channel indices track these positions.
+  the host reader must run `--channels = len(channels_hz)` to ignore them. Your
+  `feeds.json` channel indices refer to these same positions.
 - Changing `center_hz` re-tunes the whole window; keep all desired channels inside it.
 - **Gain:** one shared manual RX gain serves all channels (`agc: "manual"`; the
   AD9361 AGC modes settle on *wideband* power and starve weak channels). It is
@@ -662,9 +631,9 @@ the request/response schema.
 
 | Path | What |
 |---|---|
-| `README.md` | this hub: overview, status, quick start, channel plan, doc map |
+| `README.md` | this hub: overview, get-started, channel plan, doc map |
 | `SPEC.md` | the authoritative project spec (design, constraints, rationale) |
-| `BUILD.md` | dev/build env, build server, firmware build + flash, troubleshooting |
+| `BUILD.md` | dev/build env, firmware build + flash, troubleshooting |
 | `PROGRESS.md` | running engineering log + decisions |
 | `hdl/` | Amaranth HDL DSP blocks (channelizer, AM demod, framer) + sims; see `hdl/README.md` |
 | `firmware/` | build scripts, devicetree patch, channel-plan template, image notes (`firmware/README.md`) |
@@ -674,17 +643,17 @@ the request/response schema.
 | `host/airband-dfn/` | shared DeepFilterNet enhancer + presence brightness (used by both binaries) |
 | `host/airband-reader/` | host reader: router + per-channel workers, demux, drop detection, DFN/presence DSP, split recording, Icecast/UDP/metrics |
 | `host/airband-listen/` | interactive listener: live DSP playback, scanner/mix modes, per-channel meters |
-| `feeds.json` | all-channel Icecast feeds template (one entry per built-in channel) |
-| `deploy/` | deployment assets: `airband-feeds.service` systemd unit + `airband-feeds.env.example` (secrets template) for the Pi feeder |
-| `maia-sdr/` | our Maia SDR fork (gitignored here; the airband HDL + `maia-httpd` integration) |
+| `feeds.json` | example all-channel Icecast feeds file (adapt to your own mounts) |
+| `deploy/` | systemd feeder unit + secrets template + runbook (`deploy/README.md`) |
+| `maia-sdr/` | the Maia SDR fork (gitignored here; the airband HDL + `maia-httpd` integration) |
 | `plutosdr-fw/` | Pluto firmware assembler (gitignored; pinned upstream) |
 
 ## Building from source
 
-Firmware/bitstream are built on an x86-64 Linux server with Vivado 2023.2 (the Maia
+Firmware/bitstream are built on an x86-64 Linux host with Vivado 2023.2 (the Maia
 Docker images are amd64-only); HDL authoring and simulation run natively on macOS.
-The full recipe — Mac dev env, build server, Vivado volume, `libiio`, firmware
-build + flash — is in **[`BUILD.md`](BUILD.md)** (with image specifics in
+The full recipe — dev env, Vivado volume, `libiio`, firmware build + flash — is in
+**[`BUILD.md`](BUILD.md)** (with image specifics in
 [`firmware/README.md`](firmware/README.md)).
 
 ## Credits
