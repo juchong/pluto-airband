@@ -853,7 +853,7 @@ impl StatsPrinter {
         let elapsed = self.last.elapsed().as_secs_f64();
         if self.mode == Mode::Stats {
             println!("---- airband {elapsed:.1}s ----");
-            println!("  ch    sps   total      drops   peak(dBFS)  floor(dBFS)  tx");
+            println!("  ch    sps   total      drops   peak(dBFS)  carrier(dB·c)  tx");
         }
         let mut active = 0;
         let mut total_drops = 0u64;
@@ -875,10 +875,9 @@ impl StatsPrinter {
                 if self.mode == Mode::Stats {
                     let sps = interval_samples as f64 / elapsed;
                     let peak_db = level_to_dbfs(m.take_peak());
-                    let floor_db =
-                        level_to_dbfs(f32::from_bits(m.floor_bits.load(Ordering::Relaxed)));
+                    let cdb = metrics.carrier_dbc(i);
                     println!(
-                        "  {i:2}  {sps:6.0}  {total:9}  {drops:9}  {peak_db:9.1}  {floor_db:9.1}  {tx:4}"
+                        "  {i:2}  {sps:6.0}  {total:9}  {drops:9}  {peak_db:9.1}  {cdb:11.1}  {tx:4}"
                     );
                 }
             } else {
@@ -941,15 +940,23 @@ fn run_session(
         last_seq[ci] = Some(seq);
         metrics.channels[ci].note_sample(sample.unsigned_abs() as f32);
 
-        if carrier_mode {
-            last_carrier[ci] = decode_carrier(carrier);
-            since_carrier_update += 1;
-            if since_carrier_update >= CARRIER_UPDATE_FRAMES {
-                let thr =
-                    carrier_noise_threshold(&last_carrier, CARRIER_NOISE_PCT, carrier_snr_ratio);
-                carrier_thr.store(thr.to_bits(), Ordering::Relaxed);
-                since_carrier_update = 0;
+        // Always track the per-channel FPGA carrier and periodically recompute the
+        // cross-channel noise reference, so the stats meter can show carrier-over-
+        // noise (dB·c) — the same signal-presence metric airband-listen displays —
+        // regardless of squelch mode and independent of the demod audio level. In
+        // carrier-squelch mode the same reference (× SNR) also sets the threshold.
+        last_carrier[ci] = decode_carrier(carrier);
+        since_carrier_update += 1;
+        if since_carrier_update >= CARRIER_UPDATE_FRAMES {
+            let noise = carrier_noise_threshold(&last_carrier, CARRIER_NOISE_PCT, 1.0);
+            metrics.carrier_noise.store(noise.to_bits(), Ordering::Relaxed);
+            for (cm, &c) in metrics.channels.iter().zip(last_carrier.iter()) {
+                cm.set_carrier(c);
             }
+            if carrier_mode {
+                carrier_thr.store((noise * carrier_snr_ratio).to_bits(), Ordering::Relaxed);
+            }
+            since_carrier_update = 0;
         }
 
         // Unbounded, non-blocking handoff: never stall the socket, never drop.

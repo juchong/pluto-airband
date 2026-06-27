@@ -145,7 +145,7 @@ both binaries enhance audio identically). Build everything at once:
 cargo build --release --manifest-path host/Cargo.toml
 BIN=host/target/release/airband-reader
 
-# live link health + stats: sample rate, drops, level/floor (dBFS), transmissions
+# live link health + stats: sample rate, drops, audio peak (dBFS), carrier (dB·c), transmissions
 $BIN 192.168.2.1:30000
 
 # record one WAV per *transmission* (squelch-gated, timestamped, no dead air)
@@ -221,7 +221,7 @@ $BIN 192.168.2.1:30000 --feeds feeds.json
 # UDP s16le PCM of one channel to another host
 $BIN 192.168.2.1:30000 --udp-channel 0 --udp-dest 10.0.0.5:7355
 
-# Prometheus metrics (per-channel samples/drops/transmissions/level/floor/open)
+# Prometheus metrics (per-channel samples/drops/transmissions/level/floor/carrier-dBc/open)
 $BIN 192.168.2.1:30000 --metrics-port 9100   # scrape http://host:9100/metrics
 ```
 

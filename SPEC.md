@@ -461,7 +461,10 @@ and uses the per-channel sequence counter to count dropped samples. Defaults are
 **DFN-centric** (matching `airband-listen`): squelch `auto` (`--squelch-snr 9` dB),
 AGC + DeepFilterNet + presence on, with band-pass/LPF/notch/spectral-denoise off
 (enable with `--filter`/`--lpf-hz`/`--notch`/`--denoise`). Modes: `stats` (live
-link health + level/floor dBFS + transmission counts, default), `wav`, and `raw`.
+link health + audio peak dBFS + carrier dB·c + transmission counts, default — the
+carrier `dB·c` meter mirrors `airband-listen`: each channel's FPGA carrier level
+over the cross-channel median, so signal presence shows even when the demod audio
+is buried), `wav`, and `raw`.
 Recording defaults to **split-on-transmission** (one timestamped file per keyed
 transmission, gated by the squelch — no dead air); `--no-split` writes one
 continuous file. With `--no-agc`, fixed-gain output is scaled to 16-bit via

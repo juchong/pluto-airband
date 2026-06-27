@@ -26,6 +26,9 @@ pub struct ChannelMetric {
     pub floor_bits: AtomicU32,
     /// Peak audio magnitude since the last stats interval (raw units) as f32 bits.
     pub peak_bits: AtomicU32,
+    /// Latest decoded FPGA carrier level (raw units) as f32 bits — the meter
+    /// metric, like `airband-listen`. Independent of the demod audio level.
+    pub carrier_bits: AtomicU32,
     pub open: AtomicBool,
 }
 
@@ -38,8 +41,14 @@ impl ChannelMetric {
             level_bits: AtomicU32::new(0),
             floor_bits: AtomicU32::new(0),
             peak_bits: AtomicU32::new(0),
+            carrier_bits: AtomicU32::new(0),
             open: AtomicBool::new(false),
         }
+    }
+
+    /// Router: publish this channel's latest decoded FPGA carrier level (raw units).
+    pub fn set_carrier(&self, carrier: f32) {
+        self.carrier_bits.store(carrier.to_bits(), Ordering::Relaxed);
     }
 
     /// Router: count one received sample and track the interval peak magnitude.
@@ -84,13 +93,28 @@ impl ChannelMetric {
 /// All exported metrics.
 pub struct Metrics {
     pub channels: Vec<ChannelMetric>,
+    /// Cross-channel carrier noise reference (median, raw units) as f32 bits.
+    /// Each channel's carrier is metered in dB over this, so an idle channel sits
+    /// ~0 dB and a keyed station reads positive — matches `airband-listen`.
+    pub carrier_noise: AtomicU32,
 }
 
 impl Metrics {
     pub fn new(channels: usize) -> Arc<Metrics> {
         Arc::new(Metrics {
             channels: (0..channels).map(|_| ChannelMetric::new()).collect(),
+            carrier_noise: AtomicU32::new(0),
         })
+    }
+
+    /// Each channel's carrier in dB over the cross-channel noise reference
+    /// (`dB·c`), the same signal-presence metric `airband-listen` shows. Both
+    /// terms are clamped to ≥1 raw unit so an all-silent/old bitstream reads 0 dB.
+    pub fn carrier_dbc(&self, channel: usize) -> f32 {
+        let noise_ref = f32::from_bits(self.carrier_noise.load(Ordering::Relaxed)).max(1.0);
+        let carrier = f32::from_bits(self.channels[channel].carrier_bits.load(Ordering::Relaxed))
+            .max(1.0);
+        20.0 * (carrier / noise_ref).log10()
     }
 
     /// Renders the Prometheus text exposition for the current snapshot.
@@ -125,6 +149,11 @@ impl Metrics {
         for (c, m) in self.channels.iter().enumerate() {
             let f = f32::from_bits(m.floor_bits.load(Ordering::Relaxed));
             s.push_str(&format!("airband_noise_floor_dbfs{{channel=\"{c}\"}} {:.1}\n", level_to_dbfs(f)));
+        }
+        s.push_str("# HELP airband_carrier_dbc FPGA carrier level over the cross-channel noise reference (dB).\n");
+        s.push_str("# TYPE airband_carrier_dbc gauge\n");
+        for (c, _m) in self.channels.iter().enumerate() {
+            s.push_str(&format!("airband_carrier_dbc{{channel=\"{c}\"}} {:.1}\n", self.carrier_dbc(c)));
         }
         s.push_str("# HELP airband_squelch_open Whether the channel squelch is currently open.\n");
         s.push_str("# TYPE airband_squelch_open gauge\n");
