@@ -198,16 +198,37 @@ fi
 
 # 3e. Persist the SSH host key + authorized_keys across power cycles. The rootfs
 #     is ramfs, so dropbear's `-R` regenerates a NEW host key every boot (the
-#     fingerprint churns) and /root/.ssh is wiped. Patch the dropbear init script
-#     to restore/generate them on the jffs2 NVM (/mnt/jffs2, mtd2; survives power
+#     fingerprint churns) and /root/.ssh is wiped. Patch the dropbear init to
+#     restore/generate them on the jffs2 NVM (/mnt/jffs2, mtd2; survives power
 #     cycles AND firmware.dfu reflashes) before dropbear starts. Pubkey auth is
 #     already compiled in; this only adds persistence (password auth left on).
-#     Reset then patch so the change tracks the script across rebuilds. The
-#     dropbear init is a buildroot package default (no board override).
-S50DB=buildroot/package/dropbear/S50dropbear
-if [ -f "$S50DB" ]; then
+#
+#     IMPORTANT: unlike the board Sxx scripts above (which board/$TARGET ->
+#     board/pluto/post-build.sh reinstalls into the rootfs on EVERY build), the
+#     dropbear S50dropbear is installed by the buildroot PACKAGE during a cached
+#     install step -- so patching the package SOURCE is not re-copied on an
+#     incremental build, and the patch silently does not land. Instead, stage a
+#     patched copy as a BOARD file (derived from the pristine package source each
+#     build) and append an install line to post-build.sh so it overwrites the
+#     package's copy in the rootfs. Both paths resolve through the
+#     board/plutoplus -> board/pluto symlink. Idempotent.
+S50_PKG=buildroot/package/dropbear/S50dropbear
+S50_BOARD=buildroot/board/$TARGET/S50dropbear
+PB=buildroot/board/$TARGET/post-build.sh
+if [ -f "$S50_PKG" ]; then
     git -C buildroot checkout -- "package/dropbear/S50dropbear" 2>/dev/null || true
-    python3 "$AIRBAND_REPO/firmware/patch_dropbear_persist.py" "$S50DB"
+    cp "$S50_PKG" "$S50_BOARD"
+    python3 "$AIRBAND_REPO/firmware/patch_dropbear_persist.py" "$S50_BOARD"
+    if [ -f "$PB" ] && ! grep -q 'airband-ssh-persist' "$PB"; then
+        cat >> "$PB" <<'PBEOF'
+
+# airband-ssh-persist: install the jffs2-persistent dropbear init, overwriting the
+# package's S50dropbear (which lands via a cached package step and would otherwise
+# not pick up our patch). See firmware/patch_dropbear_persist.py.
+${INSTALL} -D -m 0755 ${BOARD_DIR}/S50dropbear ${TARGET_DIR}/etc/init.d/
+PBEOF
+        echo "== wired persistent S50dropbear install into $PB =="
+    fi
 fi
 
 # 4. Full build inside the maia-sdr-devel container (Vivado from /opt/Xilinx

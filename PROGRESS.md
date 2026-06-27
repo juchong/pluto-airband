@@ -1276,6 +1276,23 @@ ramfs. All FIT-only (no gateware change) → `plutoplus.dfu`-only reflash.
   (idempotent, `sh -n` clean). Docs updated: `BUILD.md` (SD config, SSH
   persistence, "Flashing from the Raspberry Pi" procedure, future
   password-disable, flash table), `SPEC.md` §5/§6.1/§6.5/§8.1, `README.md`.
+- **Built, flashed from the Pi, and verified on hardware (2026-06-27).** Built
+  `plutoplus.dfu` (provenance OK), entered DFU via `device_reboot sf`, flashed
+  `firmware.dfu` only with `sudo dfu-util` from `rfpi` (DFU needs root for USB
+  access; the device enumerates as `0456:b674` only in DFU mode). Reformatted the
+  SD `exFAT -> FAT` on-device with busybox `mkfs.vfat`, seeded `airband.json`.
+  Post-boot: `/mnt/sdcard` mounts, `maia-httpd` runs with
+  `--airband-config /mnt/sdcard/airband.json`, **RX gain reads 12 dB (= SD plan
+  loaded, not the 0 dB fallback)**.
+- **Build-mechanism fix for the SSH-persist patch.** The first build's
+  `S50dropbear` patch did **not** land: dropbear's init is installed by the
+  buildroot *package* during a cached step, so a source patch is not re-copied on
+  an incremental build (the board `Sxx` scripts work because
+  `board/pluto/post-build.sh`, reached via the `board/plutoplus -> pluto`
+  symlink, reinstalls them every build). Reworked step 3e to stage a patched
+  `board/$TARGET/S50dropbear` (from the pristine package source each build) and
+  append an install line to `post-build.sh`. Pending: rebuild + reflash + verify
+  host-key stability across a power cycle.
 
 ## Next steps
 - **Buzz spurs are characterized** (see "Buzz spur taxonomy", 2026-06-24): the

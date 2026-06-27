@@ -412,11 +412,23 @@ fallback if the card is absent/unformatted).
 
 The rootfs is ramfs, so dropbear's `-R` regenerates a **new host key every boot**
 (fingerprint churn / `known_hosts` warnings) and `/root/.ssh` is wiped.
-`firmware/patch_dropbear_persist.py` (wired into `build_firmware_full.sh`, patches
-the `S50dropbear` package init) restores/generates the host key on the persistent
-**jffs2** NVM (`/mnt/jffs2/dropbear`, `mtd2` — survives power cycles **and**
-`firmware.dfu` reflashes) and copies it into `/etc/dropbear` before dropbear
-starts, and seeds `/root/.ssh/authorized_keys` from jffs2 each boot.
+`firmware/patch_dropbear_persist.py` (wired into `build_firmware_full.sh`)
+restores/generates the host key on the persistent **jffs2** NVM
+(`/mnt/jffs2/dropbear`, `mtd2` — survives power cycles **and** `firmware.dfu`
+reflashes) and copies it into `/etc/dropbear` before dropbear starts, and seeds
+`/root/.ssh/authorized_keys` from jffs2 each boot.
+
+> **Why it's installed as a board file, not a package patch.** `S50dropbear` is
+> installed by the buildroot *package* during a stamped/cached step, so editing
+> the package source is **not** re-copied on an incremental build (the patch
+> silently does not land — unlike the board `Sxx` scripts, which
+> `board/pluto/post-build.sh` reinstalls into the rootfs every build). So the
+> build stages a patched copy at `board/$TARGET/S50dropbear` (derived from the
+> pristine package source each build) and appends an install line to
+> `post-build.sh` to overwrite the package's copy. After the **first** flash the
+> host key changes once (a fresh key is generated on the empty jffs2 store), then
+> stays stable forever; clear the stale client entry with
+> `ssh-keygen -R <host>` that one time.
 
 Pubkey auth is already compiled in; this only adds persistence. Enable key login
 (one-time, persists — no private keys live in the repo):
