@@ -38,7 +38,7 @@ from audio_framer import AudioFramer
 
 F_PL = 62.5e6          # PL sync clock (handoff §4.2)
 F_S = 16.0e6           # resolved capture rate (§8.2: 16 MHz to admit 133.65 MHz)
-N = 21                 # core channels
+N = 18                 # core channels (18 ch / 6 lanes; 21 ch -> 7 lanes overflows LUTs)
 
 
 def duties(Fs, Fpl, n, cpl, lane_decim, ntaps, am_cycles=23, fir_ovh=6):

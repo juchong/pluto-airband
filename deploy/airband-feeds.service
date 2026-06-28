@@ -15,17 +15,17 @@ WorkingDirectory=/home/pi/pluto-airband/host
 # Create this file as root:root, chmod 600 (see deploy/airband-feeds.env.example);
 # it must NOT be committed to git.
 EnvironmentFile=/etc/airband-feeds.env
-# --channels 21: the operational plan is now the full 21 positional channels
-# (AWOS 118.050 remains the firmware no-SD fallback only; 133.65 was added with the
-# 16 MHz capture). Must equal len(channels_hz) in the Pluto's
-# /mnt/sdcard/airband.json.
+# --channels 18: the operational plan is 18 positional channels (AWOS 118.050
+# remains the firmware no-SD fallback only; 133.65 was added with the 16 MHz
+# capture, which caps the channelizer at 18 ch / 6 lanes on the XC7Z010). Must
+# equal len(channels_hz) in the Pluto's /mnt/sdcard/airband.json.
 # --rate 20000: per-channel audio rate at the 16 MHz build (Fs / 160 / 5). Matches
 # the airband-reader default; passed explicitly so the unit is self-documenting.
 # --squelch carrier: gate on the FPGA AM-carrier byte (cross-channel noise
 # reference) instead of voice-band VOX, so keyed transmissions open reliably.
 # --squelch-snr 15: dB above the cross-channel carrier-noise median; ~15 clears
 # the conducted-comb idle spread (~12 dB.c) while staying well below real traffic.
-ExecStart=/home/pi/pluto-airband/host/target/release/airband-reader plutoplus.chongflix.tv:30000 --feeds /home/pi/pluto-airband/feeds.json --channels 21 --rate 20000 --squelch carrier --squelch-snr 15
+ExecStart=/home/pi/pluto-airband/host/target/release/airband-reader plutoplus.chongflix.tv:30000 --feeds /home/pi/pluto-airband/feeds.json --channels 18 --rate 20000 --squelch carrier --squelch-snr 15
 # airband-reader reconnects to the Pluto and to Icecast on its own, so this only
 # fires on a real crash. Wait between restarts so a wedged Pluto isn't hammered.
 Restart=always
@@ -35,7 +35,7 @@ RestartSec=5
 KillSignal=SIGINT
 TimeoutStopSec=15
 # Single instance is inherent to a systemd service; keep memory/FD headroom for
-# 21 eager DeepFilterNet models (~10-15 MB each) plus encoders.
+# 18 eager DeepFilterNet models (~10-15 MB each) plus encoders.
 LimitNOFILE=4096
 
 [Install]

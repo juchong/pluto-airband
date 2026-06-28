@@ -27,17 +27,18 @@ import pathlib
 OUT_DIR = pathlib.Path(__file__).parent / "out"
 
 # Target channels (MHz) -- the LIVE operational plan (firmware/airband.json) plus
-# 133.65, now admitted by widening the capture to 16 MHz. 21 channels total.
+# 133.65, now admitted by widening the capture to 16 MHz. 18 channels total
+# (capped at 18 ch / 6 lanes: 21 ch -> 7 lanes overflows the XC7Z010 LUTs).
 # (118.050 S50 AWOS is the firmware no-SD fallback only and is NOT operational.)
 CORE_CHANNELS_MHZ = sorted([
-    119.2, 119.9, 120.1, 120.4, 120.95, 121.5, 121.6, 121.7, 122.275, 122.95,
-    122.975, 123.9, 124.7, 125.6, 125.9, 126.25, 126.5, 126.875, 127.75, 126.95,
+    119.2, 119.9, 120.1, 120.4, 120.95, 121.5, 121.6, 121.7, 122.275,
+    122.975, 123.9, 124.7, 125.6, 125.9, 126.25, 126.5, 126.875,
     133.65,
 ])
 # 133.65 used to be a deferred outlier; it is now included (see DEPLOY_* below).
 OUTLIER_MHZ = []
 
-N_CORE = len(CORE_CHANNELS_MHZ)   # 21 operational channels (incl. 133.65)
+N_CORE = len(CORE_CHANNELS_MHZ)   # 18 operational channels (incl. 133.65)
 F_PL = 62.5e6                 # PL "sync" clock (handoff §4.2)
 
 # A channel must stay within this fraction of the half-band (|offset| < frac*W/2)
@@ -53,7 +54,7 @@ FS_CANDIDATES_MHZ = [12.0, 12.288, 14.0, 15.36, 16.0, 20.0]
 
 # Deployed capture window (see plan "Widen capture to 16 MHz"). 16 MHz admits
 # 133.65 at ~91% of the half-band (mild AD9361 edge droop, AGC-compensated), keeps
-# the channelizer at 7 lanes (cpl=3), and lands the internal sample-clock spur comb
+# the channelizer at 6 lanes (cpl=3), and lands the internal sample-clock spur comb
 # at the 8th harmonic = 128.000 MHz, clear of every channel.
 DEPLOY_CENTER_MHZ = 126.4
 DEPLOY_FS_MHZ = 16.0
@@ -138,7 +139,7 @@ def main():
         print(f"  {lo:.3f} .. {hi:.3f} MHz   (gap {w*1e3:.0f} kHz, "
               f"mid {0.5*(lo+hi):.4f} MHz)")
 
-    # The strict 80%-usable rule (for reference) on the full 21-channel list:
+    # The strict 80%-usable rule (for reference) on the full 18-channel list:
     center, fs, lanes = _report(
         f"Strict {USABLE_FRACTION:.0%}-usable auto-pick (reference)",
         CORE_CHANNELS_MHZ)
@@ -160,15 +161,15 @@ def main():
     print(f"  DC-to-nearest chan  : {dc_clear_khz:.0f} kHz "
           f"(> {CHANNEL_BW_HZ/1e3:.0f} kHz channel BW: "
           f"{'OK' if dc_clear_khz > CHANNEL_BW_HZ/1e3 else 'TOO CLOSE'})")
-    print(f"  time-mux lanes      : {dep_lanes}  (cpl=3 -> 7 lanes; <= the 8 the "
-          f"Z-7010 fits)")
+    print(f"  time-mux lanes      : {dep_lanes}  (cpl=3 -> 6 lanes; 7 lanes (21 ch) "
+          f"overflow the Z-7010 LUTs)")
 
     print("\n" + "=" * 70)
     print("RECOMMENDATION (deployed):")
     print(f"  center (LO) = {DEPLOY_CENTER_MHZ:.3f} MHz, Fs = {DEPLOY_FS_MHZ:.3f} MHz.")
     print(f"  All {len(ch)} channels (incl. 133.65) fit; both extremes sit at "
           f"~{100*max_off/half:.0f}% of the half-band. The strict 80%-usable rule "
-          f"would request {fs:.0f} MHz, but 16 MHz keeps the channelizer at 7 lanes,")
+          f"would request {fs:.0f} MHz, but 16 MHz keeps the channelizer at 6 lanes,")
     print("  lands the sample-clock spur comb at 128.000 MHz (clear of channels), and")
     print("  gives a round 20 kHz audio rate; 133.65 sees mild edge droop (AGC-comp).")
 

@@ -115,7 +115,7 @@ Yosys estimates to be re-confirmed with Vivado.
 
 ## `feasibility_25ch.py`
 
-The `SPEC.md` §4.1 resource-fit **GATE** for the operational channel set (21,
+The `SPEC.md` §4.1 resource-fit **GATE** for the operational channel set (18,
 including 133.65 MHz). Uses the measured per-block costs above plus a time-multiplexing
 throughput model to size a shared channelizer and compare against the Z-7010
 budget for several capture-window choices (§5). (Filename is historical — the
@@ -130,9 +130,11 @@ from source on the x86 server; LUT 5416/17600, FF 6493/35200, BRAM 29/60, DSP
 18/80, timing met). 22 independent DDCs (242 DSP / ~88 BRAM) do not fit, but a
 time-multiplexed channelizer fits the FREE budget (Z7010 − base) at every capture
 window — even the full ~19 MHz airband (7 lanes / 35 DSP / 78% of free LUT /
-65% of free BRAM). The resolved 16 MHz window runs **7 lanes** (`chans_per_lane=3`),
-the same area class (~78% LUT / ~65% BRAM in the model). Binding resources: BRAM36
-then LUT. AM back-end costs zero DSP.
+65% of free BRAM). The resolved 16 MHz window runs **6 lanes** (`chans_per_lane=3`,
+18 channels). The model's `~78% LUT` for 7 lanes proved optimistic — in Vivado the
+21-channel/7-lane build hit **18234 LUT > 17600** (over the die), so the plan is
+capped at 18 ch / 6 lanes (same lane count as the proven 14 MHz build). Binding
+resources: LUT then BRAM36. AM back-end costs zero DSP.
 
 ## `capture_window.py`
 
@@ -146,13 +148,14 @@ time-mux lane count. Re-run if the channel list changes.
 python capture_window.py
 ```
 
-Result (21 channels incl. 133.65, 119.2–133.65 MHz): **center 126.4 MHz, Fs = 16
+Result (18 channels incl. 133.65, 119.2–133.65 MHz): **center 126.4 MHz, Fs = 16
 MHz** (±8 MHz half-band; extreme channels ±7.25 MHz = 90.6%; ≥0.75 MHz edge guard;
-DC spur 100 kHz from the nearest channel), costing **7** of the ≤8 lanes the Z-7010
-fits. 133.65 lands at ~91% of the half-band: the strict 80%-usable rule would
-request 20 MHz, but 16 MHz is chosen to hold 7 lanes and seat the internal
-sample-clock comb at 128.000 MHz (a guard gap). Plot at `out/capture_window.png`
-(git-ignored).
+DC spur 100 kHz from the nearest channel), costing **6** lanes (`cpl=3`). 133.65
+lands at ~91% of the half-band: the strict 80%-usable rule would request 20 MHz, but
+16 MHz is chosen to seat the internal sample-clock comb at 128.000 MHz (a guard gap)
+and give a round 20 kHz audio rate. The channel count is capped at 18 because
+21 ch → 7 lanes overflows the XC7Z010 LUTs in Vivado. Plot at
+`out/capture_window.png` (git-ignored).
 
 ## `channelizer_lane.py`
 
@@ -258,8 +261,9 @@ of one deployment lane (5 ch, dec-64 CIC, complex 119-tap cleanup):
 
 **Timing MET: WNS +3.07 ns, 0 failing endpoints**, route clean. (Pre-BRAM/pre-pipeline
 this overflowed FFs at 38 980 and missed timing at −3.28 ns; BRAM-backed state +
-the 4-stage lane pipeline fixed both.) ~5 lanes cover the 21 core channels with
-large margin.
+the 4-stage lane pipeline fixed both.) 6 lanes cover the 18 core channels; the
+full 7-lane/21-channel build overflowed the die in Vivado (18234 LUT > 17600),
+which is why the plan caps at 18 ch / 6 lanes.
 
 ## `am_backend_tdm.py`
 
@@ -294,7 +298,8 @@ channel + monotonic per-channel sequence preserved through the staging FIFO.
 wideband IQ → N `ChannelizerCore` lanes (same stream broadcast) → round-robin
 collector → `TdmAmBackend` → `AudioFramer` → DMA stream. Channels are balanced
 across `ceil(N/chans_per_lane)` lanes; the shipping config is `chans_per_lane=3`,
-so 21 → **7 lanes** `[3,3,3,3,3,3,3]`. One lane sweeps all its channels per input
+so 18 → **6 lanes** `[3,3,3,3,3,3]` (21 ch → 7 lanes overflows the XC7Z010 LUTs).
+One lane sweeps all its channels per input
 sample, so `chans_per_lane` is bounded by `Fpl/Fs` (≈3.91 here). Per-channel
 NCO tuning words are written through a flat register interface
 (`freq_wren`/`freq_waddr`=global channel/`freq_wdata`), routed to the owning lane.
@@ -323,7 +328,7 @@ stage has a duty cycle that must stay < 1:
 **Important:** the OOC config (`dec-64`, `119-tap`) was for *resource* measurement
 and does **not** close real-time timing (`duty_fir ≈ 1.75`). The recommended
 deployment config is **`chans_per_lane=3`, `lane_decim=160`, cleanup `ntaps=63`
-→ 7 lanes**, with `audio_decim=5` giving **20.0 ksps** audio (duties
+→ 6 lanes** (18 channels), with `audio_decim=5` giving **20.0 ksps** audio (duties
 lane=0.77 / fir=0.33 / am=0.77, all < 0.9).
 
 ```bash

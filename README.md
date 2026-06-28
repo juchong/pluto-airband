@@ -2,7 +2,7 @@
 
 Turn a [Pluto+](https://github.com/plutoplus/plutoplus) (an open-hardware
 ADALM-Pluto derivative: same Zynq-7010 + AD9363, plus Gigabit Ethernet, microSD,
-and a 0.5 ppm VCTCXO) into a **21-channel VHF airband (AM aircraft voice)
+and a 0.5 ppm VCTCXO) into an **18-channel VHF airband (AM aircraft voice)
 receiver**. A single wideband capture is split into many narrow channels entirely
 inside the Pluto+'s FPGA; each channel is AM-demodulated to audio on-chip and
 streamed off the device over the network — enough to feed many
@@ -16,7 +16,7 @@ program.
 > The same firmware also builds for the USB-only Analog Devices ADALM-Pluto
 > (`TARGET=pluto`); the Pluto+ is the primary target and what these docs assume.
 
-> **Status:** runs on hardware with all 21 channels streaming gap-free and the
+> **Status:** runs on hardware with all 18 channels streaming gap-free and the
 > receiver auto-starting on boot. Known constraints are in
 > [Known limitations](#known-limitations).
 
@@ -26,7 +26,7 @@ program.
 - The two firmware images — build them yourself per [`BUILD.md`](BUILD.md), or
   use a prebuilt image if you have one.
 - A **host** to run the receiver tools: any Linux/macOS machine or a Raspberry Pi
-  (a Pi 5 comfortably runs all 21 channels with DeepFilterNet). It needs a Rust
+  (a Pi 5 comfortably runs all 18 channels with DeepFilterNet). It needs a Rust
   toolchain to build `host/`.
 - A VHF **antenna** for the airband. One capture covers a 16 MHz window (channels
   within ~118.4–134.4 MHz; see [How it works](#how-it-works)). An airband band-pass
@@ -60,7 +60,7 @@ This README is the hub. Each topic has a single home:
  │  AD9361 RF  ──IQ──▶  FPGA (PL)                         │        │  airband-reader (Rust)     │
  │  LO 126.4 MHz        ┌───────────────────────────────┐│  TCP   │  • demux by channel        │
  │  Fs  16 MHz          │ ReceiverTop:                   ││ :30000 │  • drop detection (seq)    │
- │                      │  channelizer (21 ch, TDM DDC)  ││──────▶ │  • 24→16-bit scale         │
+ │                      │  channelizer (18 ch, TDM DDC)  ││──────▶ │  • 24→16-bit scale         │
  │                      │  → AM demod (|I+jQ|, DC block) ││ framed │  • WAV / raw / live stats  │
  │                      │  → audio decimate → framer     ││ 64-bit └────────────────────────────┘
  │                      │  → cyclic DMA → DDR ring       ││ records
@@ -105,7 +105,7 @@ audio or plan an install.
   reference** (for the 120 MHz line); input power, enclosure shielding, and a switcher
   bead do not help. Full root-cause analysis and a diagnostic toolkit:
   [`firmware/diagnostics/README.md`](firmware/diagnostics/README.md).
-- **Single shared, adjustable RX gain.** One fixed manual RX gain serves all 21
+- **Single shared, adjustable RX gain.** One fixed manual RX gain serves all 18
   channels (the AD9361 AGC modes settle on *wideband* power and starve weak
   narrowband channels). It is **adjustable** — edit `gain_db` in the SD-card
   `airband.json` and restart the receiver; the firmware's **baked-in default (no SD
@@ -353,11 +353,11 @@ runbook is in **[`deploy/README.md`](deploy/README.md)**.
 `airband-reader` runs the **same enhancement chain as `airband-listen`** on
 **every** streamed channel — VOX squelch (voice-band) → AGC → **DeepFilterNet** →
 **presence brightness** → soft clip, with the band-pass/LPF/notch/spectral-denoise
-**off by default** (DFN-centric, enable per the flags above) — so all 21 Icecast
+**off by default** (DFN-centric, enable per the flags above) — so all 18 Icecast
 mounts sound like the tuned single-channel listener, and the *identical* enhanced
 audio goes to Icecast, UDP, and WAV recordings.
 
-To keep this real-time across 21 channels on the Raspberry Pi 5 (4× Cortex-A76)
+To keep this real-time across 18 channels on the Raspberry Pi 5 (4× Cortex-A76)
 the reader is a **router + per-channel worker** pipeline:
 
 - A **router thread** reads the TCP stream, detects drops, maintains the
@@ -536,17 +536,17 @@ the built-in default (no SD card) is **0 dB**:
   "gain_db":     30.0,        // fixed manual gain — ADJUSTABLE; built-in default (no SD card) is 0 dB (see Gain)
   "agc":         "manual",    // "manual" | "slow_attack" | "fast_attack" | "hybrid"
   "poll_ms":     20,
-  "channels_hz": [ 119200000, 119900000, /* … your channels, up to 21 … */ 126950000, 133650000 ]
+  "channels_hz": [ 119200000, 119900000, /* … your channels, up to 18 … */ 126875000, 133650000 ]
 }
 ```
 
 Rules:
 - **`samp_rate` must remain `16000000`.** The channelizer's filters/decimation are
   baked into the FPGA bitstream for this rate; changing it requires an HDL rebuild.
-- Up to **21** entries in `channels_hz`, each within `center_hz ± samp_rate/2`
+- Up to **18** entries in `channels_hz`, each within `center_hz ± samp_rate/2`
   (i.e. 118.4–134.4 MHz). Out-of-window channels are rejected at startup. The
-  FPGA always frames **21 positional channels**, so frame channel *index* = position
-  in `channels_hz`; with fewer than 21 entries the trailing positions are stale, and
+  FPGA always frames **18 positional channels**, so frame channel *index* = position
+  in `channels_hz`; with fewer than 18 entries the trailing positions are stale, and
   the host reader must run `--channels = len(channels_hz)` to ignore them. Your
   `feeds.json` channel indices refer to these same positions.
 - Changing `center_hz` re-tunes the whole window; keep all desired channels inside it.
@@ -602,7 +602,7 @@ here:
 
 - **Add / remove / reorder / relabel** channels; drag a marker (or edit the MHz
   field) to move a channel; "Add peak" snaps a new channel onto the strongest
-  visible signal. A slot counter enforces the **21**-channel limit.
+  visible signal. A slot counter enforces the **18**-channel limit.
 - **Zoom & pan:** type a frequency to auto-zoom to it, scroll-wheel to zoom
   (tuned to stay gentle on trackpads/touchscreens), drag to pan, or use the
   **full-band minimap** to jump around. Known RF spur and DC bands are shaded so

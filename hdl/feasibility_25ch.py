@@ -2,8 +2,9 @@
 """Z-7010 feasibility model for the airband AM channelizer (§4.2 GATE).
 
 (Filename is historical: the planning target was N=25. The operational channel list
-is now 21 -- all "need to have", including 133.65 MHz, which the 16 MHz capture
-admits (it was formerly a deferred outlier).)
+is now 18 -- all "need to have", including 133.65 MHz, which the 16 MHz capture
+admits (it was formerly a deferred outlier). The count is capped at 18 because
+21 ch -> 7 lanes overflows the XC7Z010 LUTs in Vivado.)
 
 This is the resource/timing feasibility GATE from the handoff doc: does the
 multichannel AM receiver fit in the Pluto's XC7Z010 programmable logic?
@@ -66,7 +67,8 @@ FIR_CLEANUP_DSP = 2    # one folded MAC engine for the per-lane CIC droop-comp +
 # MultiStageDecimator folds to ~14 DSP (vs ~43 for one long FIR), paid once.
 FRONTEND = {"DSP48E1": 14, "LUT": 1144, "FF": 1175, "BRAM36": 2}
 
-N = 21                 # operational channel count (incl. 133.65 MHz)
+N = 18                 # operational channel count (incl. 133.65 MHz; capped at
+                       # 18 ch / 6 lanes -- 21 ch -> 7 lanes overflows the Z-7010 LUTs)
 F_S = 62.5e6           # PL "sync" clock (handoff §4.2)
 AUDIO_HZ = 16_000      # 16 ksps (open decision §8.3; 8 ksps only relaxes this)
 
@@ -166,7 +168,8 @@ def main():
           f"{', '.join(str(w)+' MHz' for w in feasible_windows)} "
           f"(even the full ~19 MHz airband fits, the tightest case).")
     print("Resolved (§8.2, see capture_window.py): center 126.4 MHz, Fs ~16 MHz "
-          "-> 7 lanes (chans_per_lane=3) for the 21 channels (incl. 133.65 MHz).")
+          "-> 6 lanes (chans_per_lane=3) for 18 channels (incl. 133.65 MHz; 21 ch")
+    print("    -> 7 lanes overflows the Z-7010 LUTs in Vivado, so the plan caps at 18).")
     print("\nStatus / caveats:")
     print("  * front end + per-channel CIC droop-comp/selectivity FIR + multistage")
     print("    front end + folded one-MAC TDM cleanup FIR are all built and verified")

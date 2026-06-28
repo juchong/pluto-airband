@@ -8,9 +8,9 @@
 
 ## What this is
 
-A **21-channel VHF airband (AM aircraft voice) receiver** running entirely on a
+An **18-channel VHF airband (AM aircraft voice) receiver** running entirely on a
 [Pluto+](https://github.com/plutoplus/plutoplus) (an open-hardware ADALM-Pluto
-derivative; §2.4). One wideband AD9361 capture is split into 21 narrow channels
+derivative; §2.4). One wideband AD9361 capture is split into 18 narrow channels
 inside the Pluto+ FPGA, each channel is AM-demodulated to audio on-chip, and only
 demodulated audio is streamed off the device over the network. The intended end
 use is a multi-channel audio feeder for **liveatc.net**.
@@ -33,7 +33,7 @@ off-device.
 
 | Criterion | Status |
 |---|---|
-| Pluto firmware exposing many independently-tuned AM channels | **Done — 21 channels, mono, 24-bit, 20000 sps** |
+| Pluto firmware exposing many independently-tuned AM channels | **Done — 18 channels, mono, 24-bit, 20000 sps** |
 | Demodulated audio reaches a host over the Pluto link, within USB 2.0 | **Done — framed audio over TCP `:30000`, well under USB 2.0** |
 | 24/7 stability at an antenna site | **Partially — gap-free + auto-start on boot; long soak pending** |
 | Pi-side daemon encodes each channel and pushes to liveatc Icecast | **Done — `airband-reader` has a built-in LAME→Icecast source client (16 kbps mono 22050 Hz); soak pending** |
@@ -47,7 +47,7 @@ non-airband modes (NFM is a possible future per-channel option, not implemented)
 VHF airband voice (118–136.975 MHz) is **amplitude modulation** (A3E DSB full
 carrier) on 25 kHz channel spacing. The demodulator is an **AM envelope detector**
 (magnitude of the complex baseband), not an FM arctangent-differentiator. This is
-why the per-channel DSP is cheap enough to replicate 21×.
+why the per-channel DSP is cheap enough to replicate 18×.
 
 ### 2.2 The interface-bandwidth argument (why demod is on the FPGA)
 Shipping wideband IQ to the host does not fit the link, so demod *must* happen on
@@ -57,7 +57,7 @@ the FPGA:
 - Wideband IQ = `sample_rate × 4 bytes/s`: 16 Msps → 64 MB/s, 61.44 Msps →
   ~246 MB/s. Neither fits comfortably with overhead.
 - **Demodulated audio**: 20000 sps mono, packed 8 bytes/sample = 160 KB/s/channel;
-  21 channels ≈ 3.4 MB/s raw, trivial over USB. **This is the chosen path.**
+  18 channels ≈ 2.9 MB/s raw, trivial over USB. **This is the chosen path.**
 
 Because the FPGA produces audio (not IQ), RTLSDR-Airband — whose pipeline is
 strictly IQ-in → channelize → demodulate → audio-out — has no role downstream. We
@@ -83,7 +83,7 @@ target. Both share the same SoC and RFIC silicon:
 The deployed board is the **Pluto+** (the open `plutoplus/plutoplus` board; build
 with `TARGET=plutoplus`, see `BUILD.md`). It is the **same XC7Z010 die** as the
 ADALM-Pluto — a different package (`xc7z010clg400-1`) with a different MIO pinout,
-but identical FPGA resources, so the 21-channel design fits unchanged (no resource
+but identical FPGA resources, so the 18-channel design fits unchanged (no resource
 re-fit). Relative to the USB-only ADALM-Pluto, the Pluto+ adds three things this
 project cares about:
 
@@ -177,8 +177,8 @@ These are the exact constants baked into the shipping bitstream.
 
 | Parameter | Value | Notes |
 |---|---|---|
-| Channels (`n_channels`) | **21** | indices 0..20 |
-| Channels per lane (`chans_per_lane`) | **3** | → `ceil(21/3)` = **7 lanes** (`[3,3,3,3,3,3,3]`) |
+| Channels (`n_channels`) | **18** | indices 0..17 (capped at 18: 21 ch → 7 lanes overflows the XC7Z010 LUTs) |
+| Channels per lane (`chans_per_lane`) | **3** | → `ceil(18/3)` = **6 lanes** (`[3,3,3,3,3,3]`) |
 | Input | **12-bit IQ @ 16 Msps** | AD9361 delivers the working rate directly (no separate front-end decimator) |
 | Lane decimation (`decimation`) | **160** | channel rate = 16 MHz / 160 = 100000 sps |
 | Cleanup FIR | **63-tap complex, folded** | `design_cic_compensation(160, 3, 63, 0.164, 0.2625)`, `out_shift=17`; inverts CIC droop and doubles as the channel-select filter, set to the full AM voice bandwidth (~±8 kHz at the 100000 sps channel rate: flat through ~6 kHz, −1.1 dB @8 kHz, ~−95 dB at the 25 kHz adjacent channel) |
@@ -194,7 +194,7 @@ each stage (see `hdl/README.md`).
 
 ### 4.3 Per-channel signal flow and sample rates
 A single 12-bit IQ stream at **16 Msps** (zero-IF, LO 126.4 MHz) is broadcast to
-all 7 lanes. Each channel's path:
+all 6 lanes. Each channel's path:
 
 ```
 16 Msps IQ ─► NCO complex mix ─► CIC ÷160 ─► 63-tap complex cleanup FIR ─►
@@ -221,7 +221,7 @@ all 7 lanes. Each channel's path:
   carrier-amplitude DC term the detector leaves, then an order-4 CIC decimates ÷5
   to **20000 sps** mono audio (`16e6 / 160 / 5`).
 
-The AM back-end is itself folded over all 21 channels (one datapath, per-channel
+The AM back-end is itself folded over all 18 channels (one datapath, per-channel
 DC/CIC state in BRAM); the magnitude is shared combinational logic.
 
 ## 5. Front-end configuration and channel plan
@@ -236,21 +236,22 @@ minimal built-in default — a single channel (118.050 AWOS) at 0 dB gain** — 
 faint, single AWOS channel is the obvious cue that the SD plan did not load. That
 fallback is the only place 118.050 AWOS appears: it is deliberately **excluded**
 from the operational plan (a continuous AWOS carrier we don't track). With 133.65
-MHz added (the 16 MHz capture), the live plan now fills all **21 channels**
-(`N_CHANNELS`); the frame channel index = position in `channels_hz`, so the host
-reader runs `--channels 21`.
+MHz added (the 16 MHz capture), the live plan fills **18 channels**
+(`N_CHANNELS`; capped at 18 because 21 ch → 7 lanes overflows the XC7Z010 LUTs);
+the frame channel index = position in `channels_hz`, so the host reader runs
+`--channels 18`.
 The SD config is the source of truth (persistence model in §8.1); the operational
 values below are what `firmware/airband.json` ships:
 
 - **LO / capture center:** 126.4 MHz.
 - **Sample rate:** 16 MHz — **fixed**; the channelizer's decimation/filters are
   baked into the bitstream for this rate. Changing it requires an HDL rebuild.
-- **Capture window:** center ± 8 MHz = 118.4–134.4 MHz. The 21 channels span
+- **Capture window:** center ± 8 MHz = 118.4–134.4 MHz. The 18 channels span
   119.2–133.65 MHz; every channel sits inside the central ~91% of the band (the
   119.2 and 133.65 extremes at ~90.6%), clear of the filter skirts. (Channel
   selection and the LO choice — placing the zero-IF DC/LO-leakage spur in a guard
   gap — are derived in `hdl/capture_window.py`.)
-- **Gain:** one shared RX gain serves all 21 channels (no per-channel *RF* AGC;
+- **Gain:** one shared RX gain serves all 18 channels (no per-channel *RF* AGC;
   per-channel audio AGC is done on the host, §6.4); fixed **manual gain**, set by
   `gain_db` in the SD-card `airband.json` (the AD9361 AGC modes settle on wideband
   power and starve weak channels). It is **adjustable** — edit `gain_db` and restart
@@ -310,7 +311,7 @@ unit via the u-boot env var **`ad936x_ext_refclk_override`**: the `adi_loadvals`
 boot script does
 `fdt set /clocks/clock@0 clock-frequency <value>`, so the AD9361 driver computes its
 PLL/decimation from the *true* reference and the nominal 126.4 MHz LO / 16 MHz Fs
-are hit exactly (all 21 channels corrected together; the channelizer NCO math is
+are hit exactly (all 18 channels corrected together; the channelizer NCO math is
 unchanged). `/clocks/clock@0` is the `ad9364_ext_refclk` the transceiver runs on.
 
 Two gotchas, both learned on hardware:
@@ -497,7 +498,7 @@ the one-channel shortcut.
 VOX squelch (voice-band) → band-pass/LPF/notch/denoise → AGC → **DeepFilterNet**
 → **presence brightness** → soft clip — on **every** streamed channel, so all
 Icecast/UDP/WAV outputs carry identical enhanced audio. To stay real-time across
-21 channels on the Raspberry Pi 5 (4× Cortex-A76) it uses a **router + per-channel
+18 channels on the Raspberry Pi 5 (4× Cortex-A76) it uses a **router + per-channel
 worker** model: a single router thread reads the socket, detects drops, maintains
 the carrier-mode noise reference, and routes each sample to its channel's worker
 over an **unbounded queue** (never blocking the socket, never dropping a sample);
@@ -552,7 +553,7 @@ keep the displays responsive the page requests a faster spectrometer output rate
 
 | Endpoint | Purpose |
 |---|---|
-| `GET /api/airband` | Returns the persisted (pending) config: `center_hz`, `samp_rate`, `rf_bandwidth`, `gain_db`, `agc`, `channels` (`[{freq_hz, label?}]`), `poll_ms`, plus capability/read-only fields `max_channels` (21), `samp_rate_locked` (`true`), `enabled` (receiver active), and `needs_restart` (persisted ≠ running). |
+| `GET /api/airband` | Returns the persisted (pending) config: `center_hz`, `samp_rate`, `rf_bandwidth`, `gain_db`, `agc`, `channels` (`[{freq_hz, label?}]`), `poll_ms`, plus capability/read-only fields `max_channels` (18, = `N_CHANNELS`), `samp_rate_locked` (`true`), `enabled` (receiver active), and `needs_restart` (persisted ≠ running). |
 | `PATCH /api/airband` | Merges the provided fields, **validates** (≤ `max_channels` channels, each within `center_hz ± samp_rate/2`, `gain_db ∈ [0, 77]`, `poll_ms ≥ 1`; `samp_rate` cannot be changed), and persists the merged config to the SD-card file (`/mnt/sdcard/airband.json`). Returns the updated config. |
 | `POST /api/system/restart` | Restarts the `maia-httpd` service (detached, ~1 s delay) so a freshly saved config is applied. If unavailable, reboot manually. |
 
@@ -648,7 +649,7 @@ Consequences, both addressed by this design:
   thermal/power, watchdog/restart, monitoring). The Icecast source client is built
   (§6.4) and **deployed on the tower Pi** (`rf-pi`): the all-channel `feeds.json`
   feeds the local Icecast under the `deploy/airband-feeds.service` systemd unit
-  (auto-start + auto-restart), validated end-to-end (21/21 mounts, 0 drops; a TLS
+  (auto-start + auto-restart), validated end-to-end (18/18 mounts, 0 drops; a TLS
   feed proven). `feeds.json` now carries the live KSEA/KRNT/S50 plan and fans the
   16 LiveATC channels out to `audio-in.liveatc.net:8010` alongside the local
   Icecast; **passwords are `${ENV_VAR}` references** expanded at load, so the file

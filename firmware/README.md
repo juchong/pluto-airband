@@ -9,7 +9,7 @@ ring depends on. For the actual procedures see:
 ## What's in the image
 
 - **FPGA bitstream**: Maia SDR base (spectrometer + recorder + DDC) **plus** the
-  21-channel airband receiver (`maia_hdl` `ReceiverTop`) and a **cyclic**
+  18-channel airband receiver (`maia_hdl` `ReceiverTop`) and a **cyclic**
   `DmaStreamWrite` that streams 64-bit framed audio records into a 16 MiB DDR
   hardware ring. Timing-closed at 62.5 MHz.
 - **Devicetree**: a `maia_sdr_airband` reserved-memory region

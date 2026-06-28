@@ -66,7 +66,7 @@ on an actual crash.
 ## Updating a deployment
 
 Commit and push from your workstation, then on the host pull and rebuild. Stop the
-service first so the build gets all cores (a running 21-channel reader otherwise
+service first so the build gets all cores (a running 18-channel reader otherwise
 starves the compiler), then restart:
 
 ```bash

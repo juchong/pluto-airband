@@ -405,7 +405,7 @@ ssh root@plutoplus 'reboot'   # init mounts the card; maia-httpd loads the plan
 ```
 
 Verify: `ssh root@plutoplus 'ls -l /dev/mmcblk0* ; grep /mnt/sdcard /proc/mounts'`
-then `airband-reader <ip>:30000` shows the full 21-channel plan (vs the AWOS-only
+then `airband-reader <ip>:30000` shows the full 18-channel plan (vs the AWOS-only
 fallback if the card is absent/unformatted).
 
 ### Persistent SSH host key + key-based auth
@@ -471,7 +471,7 @@ ssh rfpi 'dfu-util -a firmware.dfu -e'                  # named alt (bare -e err
 # 3. Test after boot (~min for sshd/maia-httpd): SD enumerates + mounts, the
 #    stream is full-rate, the plan loads, and the SSH host key is now stable.
 ssh root@plutoplus 'ls -l /dev/mmcblk0* ; grep /mnt/sdcard /proc/mounts ; ps w | grep [m]aia-httpd'
-airband-reader plutoplus:30000          # expect 21 channels (or AWOS-only fallback), ~20000 sps
+airband-reader plutoplus:30000          # expect 18 channels (or AWOS-only fallback), ~20000 sps
 ```
 
 Success = `dfu-util` prints `Done!` with `exit=0` (a second `-D` failing at 0 % is
@@ -852,16 +852,16 @@ netstat -ltn | grep :30000
 busybox devmem 0x7C400000                                   # 0x6169616D ("maia")
 ```
 
-Then from the host, confirm a live, gap-free 21-channel stream:
+Then from the host, confirm a live, gap-free 18-channel stream:
 
 ```bash
 cargo build --release --manifest-path host/Cargo.toml
 host/target/release/airband-reader 192.168.2.1:30000
-# expect: 21 channels, ~20000 sps each, 0 dropped samples
+# expect: 18 channels, ~20000 sps each, 0 dropped samples
 ```
 
 A healthy result is: clean boot (no panic/watchdog), `--airband` in the running
-`maia-httpd`, `:30000` listening, and the reader showing all 21 channels with no
+`maia-httpd`, `:30000` listening, and the reader showing all 18 channels with no
 drops. (Audio is near-silent without a real airband signal on the antenna.)
 
 ### Out-of-context (OOC) module synthesis — real utilization vs Yosys

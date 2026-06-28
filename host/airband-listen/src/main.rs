@@ -80,9 +80,9 @@ const DEFAULT_PORT: u16 = 30000;
 /// Default channel plan (MHz), matching `firmware/airband.json` `channels_hz`
 /// (positional: index 0 is the first streamed channel). 118.050 is NOT here -- it
 /// is only the firmware no-SD fallback indicator, not an operational channel.
-const FREQS_MHZ: [f64; 21] = [
-    119.200, 119.900, 120.100, 120.400, 120.950, 121.500, 121.600, 121.700, 122.275, 122.950,
-    122.975, 123.900, 124.700, 125.600, 125.900, 126.250, 126.500, 126.875, 127.750, 126.950,
+const FREQS_MHZ: [f64; 18] = [
+    119.200, 119.900, 120.100, 120.400, 120.950, 121.500, 121.600, 121.700, 122.275,
+    122.975, 123.900, 124.700, 125.600, 125.900, 126.250, 126.500, 126.875,
     133.650,
 ];
 
