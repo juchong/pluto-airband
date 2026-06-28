@@ -68,6 +68,8 @@ fn entities(cfg: &MqttConfig) -> Vec<Entity> {
     binary("pluto_reachable", "Pluto reachable");
     binary("maia_httpd_up", "maia-httpd up");
     binary("data_flowing", "Data flowing");
+    binary("dma_advancing", "Pluto DMA advancing");
+    binary("fpga_overflow", "Pluto FPGA overflow");
 
     let mut sensor = |key: &str, name: &str, extra: &str| {
         v.push(Entity {

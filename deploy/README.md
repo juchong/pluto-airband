@@ -89,17 +89,21 @@ LiveATC?" without extra daemons:
   - `http://<pi>:9108/metrics` — per-channel and per-feed counters/gauges, plus the
     pipeline-health gauges `airband_pluto_reachable`, `airband_link_up`,
     `airband_data_flowing`, `airband_seconds_since_last_sample`,
-    `airband_system_healthy`, and `airband_liveatc_healthy`.
+    `airband_system_healthy`, `airband_liveatc_healthy`, and the Pluto-side FPGA
+    flags `airband_dma_advancing` / `airband_fpga_overflow` (from `GET /api/health`).
   - `http://<pi>:9108/healthz` — returns **200** only when the Pluto is reachable,
     the stream is up, samples are flowing, and every feed is connected; **503**
     otherwise. Use it for an uptime check.
   - `http://<pi>:9108/status` — the curated JSON snapshot (same data the MQTT
     publisher sends).
 - **The three Pluto questions** are derived purely Pi-side (no Pluto agent):
-  *connected?* = a periodic TCP probe of the Pluto web port (`--pluto-web-port`,
-  default 8000); *application running?* = the `:30000` stream is established;
-  *data flowing?* = a sample arrived in the last few seconds. A dead stream while
-  the web port still answers pinpoints a died airband task vs. a down board.
+  *connected?* = a periodic `GET /api/health` probe of the Pluto web port
+  (`--pluto-web-port`, default 8000); *application running?* = the `:30000` stream
+  is established; *data flowing?* = a sample arrived in the last few seconds. A dead
+  stream while the web port still answers pinpoints a died airband task vs. a down
+  board. That same probe folds the Pluto's FPGA flags `dma_advancing` /
+  `fpga_overflow` into `/status` + MQTT (older firmware without the endpoint keeps
+  the benign defaults: advancing=true, overflow=false).
 - **Low-latency debug listen** (`--monitor-port 8082`): listen to one channel live,
   in the same process as the feeder (no second Pluto connection, no Icecast lag):
 
@@ -131,7 +135,9 @@ broker as "off", so the same unit works with or without a broker.
 The reader publishes a retained JSON state topic (`pluto-airband/state`) and Home
 Assistant **MQTT discovery** configs once per connect, so the entities — including
 the two headline tiles **Capture healthy** (`system_healthy`) and **LiveATC
-healthy** (`liveatc_healthy`) — auto-appear in HA with no manual YAML. A Last Will
+healthy** (`liveatc_healthy`), plus `pluto_reachable`, `maia_httpd_up`,
+`data_flowing`, and the Pluto FPGA flags `dma_advancing` / `fpga_overflow` — 
+auto-appear in HA with no manual YAML. A Last Will
 flips `pluto-airband/availability` to `offline` the instant the feeder dies, so the
 whole dashboard greys out on a crash or Pi outage. Add `--mqtt-per-channel` for the
 (noisier) per-channel open/carrier entities.

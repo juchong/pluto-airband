@@ -598,16 +598,26 @@ fn spawn_pluto_probe(metrics: Arc<Metrics>, addr: &str, web_port: u16) {
         .map(|(h, _)| h.to_string())
         .unwrap_or_else(|| addr.to_string());
     let target = format!("{host}:{web_port}");
+    let host_hdr = host;
     thread::spawn(move || {
         let mut prev: Option<bool> = None;
         loop {
-            let ok = target
-                .to_socket_addrs()
-                .ok()
-                .and_then(|mut a| a.next())
-                .map(|sa| TcpStream::connect_timeout(&sa, Duration::from_secs(2)).is_ok())
-                .unwrap_or(false);
+            // One GET /api/health doubles as the reachability probe (a parsed
+            // response means maia-httpd is serving) and the Pluto-side FPGA health
+            // source. NOT a second :30000 connection (that port is single-client).
+            let body = http_get(&target, &host_hdr, "/api/health");
+            let ok = body.is_some();
             metrics.set_pluto_reachable(ok);
+            if let Some(b) = &body {
+                // ponytail: two known boolean fields, so substring-match instead of
+                // pulling in a JSON parser. Older firmware (no endpoint / 404) leaves
+                // the benign defaults (dma_advancing=true, overflow=false).
+                if b.contains("\"dma_advancing\"") || b.contains("\"overflow\"") {
+                    let dma = b.contains("\"dma_advancing\":true");
+                    let ovf = b.contains("\"overflow\":true");
+                    metrics.set_pluto_health(dma, ovf);
+                }
+            }
             if prev != Some(ok) {
                 eprintln!("pluto: reachable={ok} ({target})");
                 prev = Some(ok);
@@ -615,6 +625,35 @@ fn spawn_pluto_probe(metrics: Arc<Metrics>, addr: &str, web_port: u16) {
             thread::sleep(Duration::from_secs(5));
         }
     });
+}
+
+/// Minimal HTTP/1.0 GET (no dependency): returns the response body on a 2xx, else
+/// None. Bounded read; short timeouts so the probe never blocks the loop.
+fn http_get(target: &str, host: &str, path: &str) -> Option<String> {
+    let sa = target.to_socket_addrs().ok()?.next()?;
+    let mut stream = TcpStream::connect_timeout(&sa, Duration::from_secs(2)).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+    stream.set_write_timeout(Some(Duration::from_secs(2))).ok()?;
+    let req = format!("GET {path} HTTP/1.0\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    stream.write_all(req.as_bytes()).ok()?;
+    let mut buf = Vec::with_capacity(1024);
+    // Cap the read so a misbehaving peer can't grow this unbounded.
+    stream.take(8192).read_to_end(&mut buf).ok()?;
+    let resp = String::from_utf8_lossy(&buf);
+    http_2xx_body(&resp).map(|b| b.to_string())
+}
+
+/// Returns the body of an HTTP response iff the status line is 2xx. Pure (no I/O)
+/// so the status-line/body split is unit-testable.
+fn http_2xx_body(resp: &str) -> Option<&str> {
+    let (head, body) = resp.split_once("\r\n\r\n")?;
+    let status_ok = head
+        .lines()
+        .next()?
+        .split_whitespace()
+        .nth(1)?
+        .starts_with('2');
+    status_ok.then_some(body)
 }
 
 /// Per-channel processing worker. Owns the channel's squelch, full audio chain
@@ -1372,5 +1411,17 @@ mod tests {
         let (_, _, sample, carrier) = unpack(word);
         assert_eq!(carrier, 0x05);
         assert_eq!(sample, -(1 << 23));
+    }
+
+    #[test]
+    fn http_body_parse_and_health_flags() {
+        // 2xx: body returned; the /api/health booleans match by substring.
+        let ok = "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n\
+                  {\"airband_enabled\":true,\"dma_advancing\":true,\"overflow\":false}";
+        let body = http_2xx_body(ok).expect("2xx body");
+        assert!(body.contains("\"dma_advancing\":true"));
+        assert!(!body.contains("\"overflow\":true"));
+        // non-2xx (e.g. older firmware: no /api/health) yields no body.
+        assert!(http_2xx_body("HTTP/1.0 404 Not Found\r\n\r\nnope").is_none());
     }
 }

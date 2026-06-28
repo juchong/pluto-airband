@@ -146,6 +146,11 @@ pub struct Metrics {
     /// The framed-audio stream (:30000) is currently connected (maia-httpd's
     /// airband task is serving). Set by the router on connect, cleared on error.
     pub stream_up: AtomicBool,
+    /// Pluto-side FPGA health from maia-httpd `GET /api/health` (the probe thread
+    /// polls it). `dma_advancing` defaults true so older firmware without the
+    /// endpoint never false-alarms; `fpga_overflow` defaults false.
+    pub dma_advancing: AtomicBool,
+    pub fpga_overflow: AtomicBool,
     start: Instant,
     /// `start.elapsed()` in ms at the last received sample.
     last_sample_ms: AtomicU64,
@@ -159,6 +164,8 @@ impl Metrics {
             carrier_noise: AtomicU32::new(0),
             pluto_reachable: AtomicBool::new(false),
             stream_up: AtomicBool::new(false),
+            dma_advancing: AtomicBool::new(true),
+            fpga_overflow: AtomicBool::new(false),
             start: Instant::now(),
             last_sample_ms: AtomicU64::new(0),
         })
@@ -178,6 +185,11 @@ impl Metrics {
     }
     pub fn set_stream_up(&self, up: bool) {
         self.stream_up.store(up, Ordering::Relaxed);
+    }
+    /// Probe thread: publish the Pluto's `GET /api/health` snapshot.
+    pub fn set_pluto_health(&self, dma_advancing: bool, overflow: bool) {
+        self.dma_advancing.store(dma_advancing, Ordering::Relaxed);
+        self.fpga_overflow.store(overflow, Ordering::Relaxed);
     }
 
     pub fn uptime_secs(&self) -> u64 {
@@ -278,6 +290,8 @@ impl Metrics {
 \"maia_httpd_up\":{stream_up},\
 \"stream_up\":{stream_up},\
 \"data_flowing\":{data},\
+\"dma_advancing\":{dma},\
+\"fpga_overflow\":{ovf},\
 \"system_healthy\":{sys},\
 \"liveatc_healthy\":{live},\
 \"seconds_since_last_sample\":{since:.1},\
@@ -288,6 +302,8 @@ impl Metrics {
 \"feeds\":{feeds},\
 \"channels\":{channels}}}",
             data = self.data_flowing(),
+            dma = self.dma_advancing.load(Ordering::Relaxed),
+            ovf = self.fpga_overflow.load(Ordering::Relaxed),
             sys = self.system_healthy(),
             live = self.liveatc_healthy(),
             since = self.seconds_since_last_sample(),
@@ -322,6 +338,12 @@ impl Metrics {
         s.push_str("# HELP airband_liveatc_healthy All output feeds connected.\n");
         s.push_str("# TYPE airband_liveatc_healthy gauge\n");
         s.push_str(&format!("airband_liveatc_healthy {}\n", b(self.liveatc_healthy())));
+        s.push_str("# HELP airband_dma_advancing Pluto FPGA airband DMA write pointer is advancing.\n");
+        s.push_str("# TYPE airband_dma_advancing gauge\n");
+        s.push_str(&format!("airband_dma_advancing {}\n", b(self.dma_advancing.load(Ordering::Relaxed))));
+        s.push_str("# HELP airband_fpga_overflow Pluto FPGA airband channelizer overflow flag.\n");
+        s.push_str("# TYPE airband_fpga_overflow gauge\n");
+        s.push_str(&format!("airband_fpga_overflow {}\n", b(self.fpga_overflow.load(Ordering::Relaxed))));
 
         // Per-feed health.
         s.push_str("# HELP airband_feed_connected Feed source connection is established.\n");
