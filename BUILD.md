@@ -465,8 +465,11 @@ scp administrator@<server>:~/pluto-build/plutosdr-fw/build/plutoplus.dfu .
 ssh rfpi 'sudo apt-get install -y dfu-util'
 ssh rfpi 'ssh root@plutoplus device_reboot sf'          # over Ethernet; USB re-enumerates as DFU
 ssh rfpi 'until dfu-util -l 2>/dev/null | grep -q alt=; do sleep 1; done; dfu-util -l | grep alt='
-ssh rfpi 'dfu-util -a firmware.dfu -D plutoplus.dfu' ; echo "exit=$?"   # foreground; expect "Done!"
-ssh rfpi 'dfu-util -a firmware.dfu -e'                  # named alt (bare -e errors: >1 alt)
+# the write runs ~100–200 s (budget ≥4 min); log it on the Pi + append exit, then read it
+# (see "Flashing over DFU" step 3 for the wait mechanics — do NOT re-flash to "check"):
+ssh rfpi 'dfu-util -a firmware.dfu -D plutoplus.dfu > /tmp/dfu.log 2>&1; echo "exit=$?" >> /tmp/dfu.log'
+ssh rfpi 'tail -5 /tmp/dfu.log'        # expect: "Download done." → dfuMANIFEST → dfuIDLE → "Done!" → exit=0
+ssh rfpi 'dfu-util -a firmware.dfu -e' # named alt (bare -e errors: >1 alt)
 
 # 3. Test after boot (~min for sshd/maia-httpd): SD enumerates + mounts, the
 #    stream is full-rate, the plan loads, and the SSH host key is now stable.
@@ -547,21 +550,33 @@ dfu-util -l | grep alt=     # expect alt=0 boot.dfu … alt=1 firmware.dfu … a
 (If you can't reach the device to issue `device_reboot sf`, power-cycle holding
 the DFU button.)
 
-**3. Write the image in the foreground, logged to a file — do NOT pipe to `tail`
-or background it.** You must see the `Download done.` / `Done!` line; piping or
-backgrounding swallows it and you can't distinguish success from a hang. Budget
-**≥4 min** for the ~19 MB FIT (the write itself runs ~100–200 s):
+**3. Write the image as ONE logged command, then WAIT for it to finish.** The write
+runs **~100–200 s** (the ~19 MB FIT; `boot.dfu` is only ~2 s) — **budget ≥4 min**.
+Always redirect to a log file **and append the exit code to that same log**, so the
+outcome survives even when the long write gets auto-backgrounded (an agent shell's
+~30 s command timeout) or the SSH session drops — both leave the write running and
+the log filling. Judge success **only** by the log's final lines.
 
 ```bash
 cd firmware/build
 # bitstream change ONLY: flash mtd0 first (~2 s) —
-# dfu-util -a boot.dfu -D boot.dfu > /tmp/dfu-boot.log 2>&1; echo "exit=$?"; tail -4 /tmp/dfu-boot.log
+# dfu-util -a boot.dfu -D boot.dfu > /tmp/dfu-boot.log 2>&1; echo "exit=$?" >> /tmp/dfu-boot.log
 # always (FIT, ~19 MB) — use pluto.dfu on ADALM-Pluto, plutoplus.dfu on Pluto+:
-dfu-util -a firmware.dfu -D plutoplus.dfu > /tmp/dfu.log 2>&1; echo "exit=$?"
-tail -4 /tmp/dfu.log    # MUST end: "Download done." → dfuMANIFEST → dfuIDLE → "Done!"
+dfu-util -a firmware.dfu -D plutoplus.dfu > /tmp/dfu.log 2>&1; echo "exit=$?" >> /tmp/dfu.log
 ```
 
-Success = that `Done!` line **and** `exit=0`. Nothing else counts as confirmation.
+**How to wait (do this; don't re-flash to "check"):** the log captures everything,
+so just block until it shows the terminal sentinel, then read it:
+
+```bash
+until grep -q '^exit=' /tmp/dfu.log 2>/dev/null; do sleep 5; done   # write finished (any outcome)
+tail -5 /tmp/dfu.log   # MUST show: "Download done." → dfuMANIFEST → dfuIDLE → "Done!" → exit=0
+```
+
+Success = the `Done!` line **and** `exit=0` in the log — nothing else counts. A real
+hang is the **only** other case: no new log lines and no `dfuMANIFEST` after ~4 min.
+Do **not** pipe the write straight to `tail` (you lose the `exit=` marker) and do
+**not** re-issue `-D` to see if it worked — that triggers the false failure in step 4.
 
 **4. A second `-D` to the same alt failing at "0 % / 0 bytes / `dfuERROR`" means
 the FIRST write already SUCCEEDED — not that it failed.** After a good download
@@ -805,8 +820,11 @@ scp <server>:~/pluto-build/plutosdr-fw/build/{boot,pluto}.dfu firmware/build/
 # See "Flashing over DFU — the reliable procedure". In short (full bitstream build):
 cd firmware/build
 device_reboot sf                          # over serial/ssh; wait for `dfu-util -l` alts
-dfu-util -a boot.dfu     -D boot.dfu  > /tmp/dfu-boot.log 2>&1; echo "exit=$?"  # mtd0
-dfu-util -a firmware.dfu -D pluto.dfu > /tmp/dfu.log      2>&1; echo "exit=$?"  # mtd3 (~19 MB)
+# each write runs ~100–200 s; append exit to the log and WAIT for it (see step 3):
+dfu-util -a boot.dfu     -D boot.dfu  > /tmp/dfu-boot.log 2>&1; echo "exit=$?" >> /tmp/dfu-boot.log  # mtd0
+until grep -q '^exit=' /tmp/dfu-boot.log; do sleep 5; done; tail -3 /tmp/dfu-boot.log               # confirm Done! + exit=0
+dfu-util -a firmware.dfu -D pluto.dfu > /tmp/dfu.log      2>&1; echo "exit=$?" >> /tmp/dfu.log       # mtd3 (~19 MB)
+until grep -q '^exit=' /tmp/dfu.log; do sleep 5; done; tail -3 /tmp/dfu.log                          # confirm Done! + exit=0
 dfu-util -a firmware.dfu -e               # leave DFU (named alt; plain `-e` errors: >1 alt)
 
 # --- boot.dfu was flashed, so re-apply the wiped u-boot env (over serial) -
@@ -868,6 +886,93 @@ host/target/release/airband-reader 192.168.2.1:30000
 A healthy result is: clean boot (no panic/watchdog), `--airband` in the running
 `maia-httpd`, `:30000` listening, and the reader showing all 18 channels with no
 drops. (Audio is near-silent without a real airband signal on the antenna.)
+
+### Worked example: a channel-plan / `Fs` / PL-clock change end-to-end
+
+This is the loop used to widen the capture to 16 MHz, drop to 18 channels, and
+raise the sync clock to 65.278 MHz. It only ties together sections above —
+[build](#running-a-build-from-an-agent-launch-detached--wait-and-check),
+[provenance](#airband-firmware-build-boot--pluto),
+[flash](#flashing-over-dfu--the-reliable-procedure-do-this),
+[verify](#verify-on-hardware) — plus the parts unique to a parameter change.
+
+**1. Edit the lockstep file-set, then confirm they agree _before_ building.** These
+must move together — a half-updated set builds clean but mismatches at runtime (e.g.
+host reads 18 channels off a 21-channel stream). `N` = channel count; `Fs` =
+`samp_rate`:
+
+| What | File | Symbol |
+|---|---|---|
+| Channelizer lane count (`ceil(N/cpl)`) | `maia-sdr/maia-hdl/maia_hdl/maia_sdr.py` | `_AIRBAND_N_CHANNELS` |
+| PL sync clock (MMCM mult/divs) | `maia-sdr/maia-hdl/projects/pluto/system_bd.tcl` | `maia_sdr_clk` (`CLKFBOUT_MULT_F`) |
+| Firmware daemon: AD9361 `Fs`/LO, channel count, logged audio rate | `maia-sdr/maia-httpd/src/airband.rs` | `N_CHANNELS` |
+| Web UI default plan + max | `maia-sdr/maia-wasm/assets/airband.js` | `DEFAULT_PLAN`, `maxChannels` |
+| Operational plan + gain + `Fs` (SD card) | `firmware/airband.json` | `channels_hz`, `gain_db`, `samp_rate` |
+| Host listener default plan/rate | `host/airband-listen/src/main.rs` | `FREQS_MHZ` |
+| Feeder channel count | `deploy/airband-feeds.service` | `--channels` |
+| LiveATC feed → channel-index map | `feeds.json` | per-channel `index` |
+| Sim mirror (feasibility/throughput, kept in sync) | `hdl/*.py` | `CORE_CHANNELS_MHZ`, `N`, `F_PL` |
+
+Confirm the channel-count constants agree before committing:
+
+```bash
+rg -n --no-ignore '_AIRBAND_N_CHANNELS|N_CHANNELS|maxChannels' maia-sdr host  # all == N (18); maia-sdr/ is gitignored
+python hdl/realtime_budget.py                                      # prints duty table; asserts gap_ok + PASS (the Fs/Fpl gate)
+```
+
+`hdl/realtime_budget.py` is the **GO/NO-GO gate** for an `Fs`/clock change: it
+asserts `floor(Fpl/Fs) >= chans_per_lane+1` (the integer-cadence rule). If that
+fails, the build will route and flash fine but silently drop samples — raise `Fpl`
+(`system_bd.tcl`) or lower `cpl`/`Fs` until it passes. This is the gate the original
+62.5 MHz build skipped (the 18.1 ksps bug below).
+
+**2. Build (commit + push first; HDL change ⇒ both partitions).** Launch detached,
+wait by the phase table. Before flashing, the build files are "confirmed updated"
+**only** by the baked-in identity, not by `git HEAD`: check
+[provenance](#airband-firmware-build-boot--pluto) — embedded `UserID` == fork HEAD —
+**and** `write_bitstream completed successfully` + `WNS >= 0`. All three or don't flash.
+
+**3. Flash both `boot.dfu` + `plutoplus.dfu`** per the
+[reliable DFU procedure](#flashing-over-dfu--the-reliable-procedure-do-this). On a remote
+host (e.g. the Pi reaching the Pluto+), `device_reboot sf` then `dfu-util` need
+`sudo`/root for USB; if hostname won't resolve use the FQDN, and the default login is
+`sshpass -p analog`.
+
+**4. Refresh the SD config — it overrides the baked-in defaults.** A new bitstream
+does **not** change `/mnt/sdcard/airband.json`; a stale card (e.g. old `samp_rate`)
+makes the device boot at the wrong `Fs` even with correct gateware. Push the new
+plan and restart the daemon (it re-reads the SD plan on start):
+
+```bash
+cat firmware/airband.json | ssh root@<pluto> 'cat > /mnt/sdcard/airband.json'
+ssh root@<pluto> /etc/init.d/S60maia-httpd restart
+```
+
+**5. Test the running build against the new parameters** — not just "it streams":
+
+```bash
+# device: AD9361 actually retuned to the new Fs (and LO)
+ssh root@<pluto> 'cat /sys/bus/iio/devices/iio:device*/in_voltage_sampling_frequency'  # = Fs (16e6)
+# host: channel count + per-channel rate (= Fs/lane_decim/audio_decim) + 0 drops
+host/target/release/airband-reader <pluto>:30000   # expect 18 ch, ~20000 sps, 0 drops
+```
+
+The per-channel sps is the tell-tale: `16e6/160/5 = 20000`. Any other value means a
+wrong/stale bitstream or SD `Fs` (see the symptom list under
+[First-boot expectations](#first-boot-expectations-for-unattended-reflash)).
+
+**Worked iteration (symptom → root cause → reflash).** First 16 MHz build streamed
+18 channels, **0 drops** — but at **18113 sps**, not 20000. (The loss is upstream of
+the per-channel sequence counter, so the reader's drop metric stays 0 — the *low
+rate* is the only tell; don't trust "0 drops" alone.) Root cause was *not* the
+host or SD plan: at `Fpl=62.5 MHz`, `floor(62.5/16)=3 < chans_per_lane+1=4`, so the
+lane couldn't absorb a sample on the short input beat: only the `~90.6 %` of beats
+that are 4 cycles wide survive (`4p + 3(1-p) = 3.906 ⇒ p = 0.906`), so the rate
+collapsed to `20000 x 0.906 ≈ 18113`. Fix was upstream, in the gate that should have
+caught it: raise the MMCM to **65.278 MHz** (`floor(4.08)=4`), add the
+`min_gap >= cpl+1` assert to `realtime_budget.py` so it can't recur, rebuild, reflash
+both partitions → **20000 sps, 0 drops**. (Per `ponytail`: fix the cadence gate once,
+not the symptom per consumer.)
 
 ### Out-of-context (OOC) module synthesis — real utilization vs Yosys
 
