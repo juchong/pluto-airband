@@ -632,22 +632,23 @@ pokes): check the live front-end and re-assert it if it drifted off-band.
 ```sh
 # on the device
 P=/sys/bus/iio/devices/iio:device0
-cat $P/out_altvoltage0_RX_LO_frequency   # must be 123438000, not 2399999998
-cat $P/in_voltage_sampling_frequency     # must be 14000000, not 61440000
+cat $P/out_altvoltage0_RX_LO_frequency   # must be 126400000, not 2399999998
+cat $P/in_voltage_sampling_frequency     # must be 16000000, not 61440000
 # re-assert (Fs and bandwidth before LO):
-echo 14000000  > $P/in_voltage_sampling_frequency
-echo 14000000  > $P/in_voltage_rf_bandwidth
-echo 123438000 > $P/out_altvoltage0_RX_LO_frequency
+echo 16000000  > $P/in_voltage_sampling_frequency
+echo 16000000  > $P/in_voltage_rf_bandwidth
+echo 126400000 > $P/out_altvoltage0_RX_LO_frequency
 ```
 
 Or from the host: `curl -s http://<pluto>:8000/api | grep -o '"airband":[a-z]*'`
 should print `"airband":true`, and the `ad9361` block should read
-`rx_lo_frequency 123438000 / sampling_frequency 14000000`.
+`rx_lo_frequency 126400000 / sampling_frequency 16000000`.
 
 ### "Receiver works but no audio" — it's a level problem, not the DSP
 
 **Symptom:** the stream runs (correct rate, 0 drops) and the channel carrying a
-known always-on signal (e.g. an ATIS/ASOS such as 127.750) is the loudest in `airband-reader`
+known active signal (a busy tower/approach channel, or an ATIS/ASOS temporarily
+added to the SD plan) is the loudest in `airband-reader`
 stats, but it's still near-silent when you play/record it.
 
 The DSP chain (channelizer → `|I+jQ|` → DC block → audio CIC) is unity-ish gain
@@ -826,9 +827,11 @@ that path caused stale-gateware flashes and was removed). What to flash:
 > against the new bitstream misreads the framing; a new host against an old
 > bitstream reads carrier `0` and silently falls back to VOX squelch (`--squelch
 > carrier` then has no effect). After the new bitstream is live, verify the narrow
-> cleanup FIR (cleaner inter-transmission noise) and `--squelch carrier` on an
-> always-on ATIS/ASOS in the operational plan (e.g. 127.750 KBFI ATIS; the 16 MHz
-> capture no longer includes 118.050 AWOS, which is the no-SD fallback only).
+> cleanup FIR (cleaner inter-transmission noise) and `--squelch carrier` on a busy
+> channel — or temporarily add an always-on ATIS/ASOS to the SD plan, since the
+> operational 18-channel plan carries only intermittent control channels (the
+> dropped 127.750 KBFI ATIS / 126.950 KSEA ASOS were the continuous broadcasts;
+> 118.050 AWOS is the no-SD fallback only).
 
 ### Verify on hardware
 
