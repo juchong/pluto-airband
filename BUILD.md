@@ -602,8 +602,10 @@ Verify over SSH (`sshpass -p analog ssh root@192.168.2.1`) — or over serial
 (no `watchdog`/`panic`), `maia_sdr_airband@19000000` reserved node present,
 `maia-httpd` running, then on the host run `airband-reader 192.168.2.1:30000`
 and confirm **~20000 sps/channel** (= 16 MHz / 160 / 5) — any other rate (e.g.
-21875 = an old 14 MHz `lane_decim=128` bitstream, or ~10000 = a half-rate bitstream)
-means the wrong/old bitstream is still loaded.
+21875 = an old 14 MHz `lane_decim=128` bitstream; **~18113 = the 62.5 MHz sync-clock
+bitstream**, which only had `floor(62.5/16)=3` PL cycles/sample and dropped ~9.4 %
+on the short beat — needs the 65.278 MHz sync clock; or ~10000 = a half-rate
+bitstream) means the wrong/old bitstream is still loaded.
 
 ### CRITICAL: the AD9361 front-end is locked read-only under `--airband`
 
@@ -902,7 +904,7 @@ run Vivado **directly on the host** (no Docker) against Amaranth-generated Veril
 
   ```bash
   vivado -mode batch -nojournal -source ooc_place.tcl \
-         -tclargs channelizer_core.v channelizer_core 16.0   # 16 ns = 62.5 MHz
+         -tclargs channelizer_core.v channelizer_core 15.32  # 15.32 ns = 65.278 MHz (deployed sync clock)
   # reports -> channelizer_core_routed_util.rpt, channelizer_core_timing.rpt
   ```
 

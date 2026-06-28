@@ -11,7 +11,7 @@ ring depends on. For the actual procedures see:
 - **FPGA bitstream**: Maia SDR base (spectrometer + recorder + DDC) **plus** the
   18-channel airband receiver (`maia_hdl` `ReceiverTop`) and a **cyclic**
   `DmaStreamWrite` that streams 64-bit framed audio records into a 16 MiB DDR
-  hardware ring. Timing-closed at 62.5 MHz.
+  hardware ring. Timing-closed at 65.278 MHz.
 - **Devicetree**: a `maia_sdr_airband` reserved-memory region
   (`0x19000000`, 16 MiB) + a `maia-sdr,rxbuffer` node → `/dev/maia-sdr-airband`.
   (Relocated from the original `0x1f000000`, which collided with the kernel CMA
@@ -29,7 +29,7 @@ Frame layout (little-endian 64-bit word, see `hdl/audio_framer.py`):
 ```
 bits [23:0]  audio sample (signed, 24-bit two's complement)
 bits [31:24] carrier level (8-bit minifloat of the AM carrier; 0 = none/old bitstream)
-bits [39:32] channel index (0..20)
+bits [39:32] channel index (0..17)
 bits [63:40] per-channel sequence counter (wraps at 2**24; gap = dropped samples)
 ```
 

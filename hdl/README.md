@@ -182,7 +182,7 @@ DSP48E1** independent of channel count (maia-hdl's `Cmult3x` would trim this to
 register-based `TdmDdcLane` holds per-channel CIC/NCO state in flip-flops; the file
 also provides **`TdmDdcLaneBRAM`** — same behaviour (bit-exact, same model) but the
 per-channel state lives in `amaranth.lib.memory.Memory` (block/distributed RAM) and
-the datapath is **pipelined READ→MIX→INTEG→COMB** so it closes 62.5 MHz. This is the
+the datapath is **pipelined READ→MIX→INTEG→COMB** so it closes the 65.278 MHz sync clock. This is the
 lane used by the integrated `channelizer_core.py`. The shared front-end decimator and
 per-lane cleanup FIR are built and verified separately in `channelizer_chain.py`.
 
@@ -249,7 +249,9 @@ Verified **bit-exact**: HW == (lane model → per-channel cleanup-FIR model); th
 end-to-end demo tunes each channel to a clean baseband (<0.1 % ripple) and rejects
 neighbours.
 
-**Vivado 2023.2 synth + place + route** (`ooc_place.tcl`, `xc7z010clg225-1`, 62.5 MHz)
+**Vivado 2023.2 synth + place + route** (`ooc_place.tcl`, `xc7z010clg225-1`; this
+out-of-context cross-check was run at the then-current 62.5 MHz — the shipped full
+`plutoplus` build now closes at the 65.278 MHz sync clock, WNS +0.153 ns)
 of one deployment lane (5 ch, dec-64 CIC, complex 119-tap cleanup):
 
 | Resource | Used | % | 
@@ -300,7 +302,9 @@ collector → `TdmAmBackend` → `AudioFramer` → DMA stream. Channels are bala
 across `ceil(N/chans_per_lane)` lanes; the shipping config is `chans_per_lane=3`,
 so 18 → **6 lanes** `[3,3,3,3,3,3]` (21 ch → 7 lanes overflows the XC7Z010 LUTs).
 One lane sweeps all its channels per input
-sample, so `chans_per_lane` is bounded by `Fpl/Fs` (≈3.91 here). Per-channel
+sample and needs `chans_per_lane+1` PL cycles to do so, while the input's *shortest*
+gap is `floor(Fpl/Fs)` cycles — so `chans_per_lane ≤ floor(Fpl/Fs) − 1` (= 3 here:
+`floor(65.278/16) = 4`). Per-channel
 NCO tuning words are written through a flat register interface
 (`freq_wren`/`freq_waddr`=global channel/`freq_wdata`), routed to the owning lane.
 
@@ -316,27 +320,33 @@ place.
 ## `realtime_budget.py`
 
 The `SPEC.md` §4.1 feasibility GATE checked **area**; this checks **throughput**. The shared
-(folded) datapaths must keep up with the sample cadence: at `Fpl=62.5 MHz`,
-`Fs=16 MHz` there are only `~3.91` PL cycles per input sample, so each binding
-stage has a duty cycle that must stay < 1:
+(folded) datapaths must keep up with the sample cadence: at `Fpl=65.278 MHz`,
+`Fs=16 MHz` there are `~4.08` PL cycles per input sample. Two things must hold:
 
-- `duty_lane = chans_per_lane / (Fpl/Fs)` ⟹ **chans_per_lane ≤ 3**.
-- `duty_fir  = chans_per_lane · (Fs/lane_decim) · (ntaps+ovh) / Fpl` ⟹ enough lane
-  decimation for the tap count.
-- `duty_am   = N · (Fs/lane_decim) · 4 / Fpl` (always small).
+- **Integer cadence (no dropped samples).** The input CDC delivers a sample every
+  `floor(Fpl/Fs)` cycles on its *shortest* beat, and a lane needs `chans_per_lane+1`
+  cycles, so we require `floor(Fpl/Fs) ≥ chans_per_lane+1`. At `chans_per_lane=3`
+  that needs `floor(Fpl/Fs) ≥ 4` ⟹ **`Fpl ≥ 4·Fs = 64 MHz`**. The original
+  62.5 MHz gave `floor(3.906) = 3 < 4` and silently dropped the ~9.4 % of samples
+  landing on the short beat (the 18.1 ksps bug); **65.278 MHz** gives
+  `floor(4.08) = 4`. `realtime_budget.py` asserts this gap.
+- **Duty cycle < 1.** Each binding folded stage must finish within the cadence:
+  `duty_lane = chans_per_lane / (Fpl/Fs)`,
+  `duty_fir  = chans_per_lane · (Fs/lane_decim) · (ntaps+ovh) / Fpl`,
+  `duty_am   = N · (Fs/lane_decim) · am_cycles / Fpl`.
 
 **Important:** the OOC config (`dec-64`, `119-tap`) was for *resource* measurement
-and does **not** close real-time timing (`duty_fir ≈ 1.75`). The recommended
+and does **not** close real-time timing (`duty_fir > 1`). The recommended
 deployment config is **`chans_per_lane=3`, `lane_decim=160`, cleanup `ntaps=63`
 → 6 lanes** (18 channels), with `audio_decim=5` giving **20.0 ksps** audio (duties
-lane=0.77 / fir=0.33 / am=0.77, all < 0.9).
+lane≈0.74 / fir≈0.32 / am≈0.63, min gap 4 ≥ 4).
 
 ```bash
 python realtime_budget.py     # prints the duty table + cycle-accurate stress test
 ```
 
 A cycle-accurate stress test drives `ReceiverTop` at the **true** cadence (one
-input every `Fpl/Fs` cycles on average, with the realistic gap=3/gap=4 jitter for a
+input every `Fpl/Fs` cycles on average, with the realistic gap=4/gap=5 jitter for a
 non-integer ratio): a budget-fitting config stays **overflow-free and bit-exact**,
 and an over-budget config (`dec-32`/`119-tap`, `duty_fir>1`)
 **correctly trips** the overflow detector (which now covers the lane→FIR FIFO, the

@@ -54,35 +54,91 @@ This README is the hub. Each topic has a single home:
 
 ## How it works
 
+One wideband AD9361 capture is split into many narrow AM-voice channels
+**entirely inside the Zynq-7010's FPGA**, AM-demodulated to audio on-chip, and
+pushed off the device as a single TCP byte stream that the Rust host fans out to
+recordings, live audio, and Icecast feeds. Every block in that path:
+
 ```
-            Pluto+ (Zynq-7010: FPGA + ARM)                              Host / Raspberry Pi
- ┌──────────────────────────────────────────────────────┐        ┌────────────────────────────┐
- │  AD9361 RF  ──IQ──▶  FPGA (PL)                         │        │  airband-reader (Rust)     │
- │  LO 126.4 MHz        ┌───────────────────────────────┐│  TCP   │  • demux by channel        │
- │  Fs  16 MHz          │ ReceiverTop:                   ││ :30000 │  • drop detection (seq)    │
- │                      │  channelizer (18 ch, TDM DDC)  ││──────▶ │  • 24→16-bit scale         │
- │                      │  → AM demod (|I+jQ|, DC block) ││ framed │  • WAV / raw / live stats  │
- │                      │  → audio decimate → framer     ││ 64-bit └────────────────────────────┘
- │                      │  → cyclic DMA → DDR ring       ││ records
- │                      └───────────────────────────────┘│         each record (LE u64):
- │  maia-httpd (ARM): configures AD9361 + NCOs, starts   │           [23:0]  audio sample (s24)
- │  the DMA, drains the DDR ring, serves it over TCP     │           [31:24] carrier level
- │                                                        │           [39:32] channel index 0..20
- └──────────────────────────────────────────────────────┘           [63:40] per-channel seq
+                       Pluto+  (Zynq-7010 = FPGA "PL" + ARM "PS")
+ ┌─────────────────────────────────────────────────────────────────────────────┐
+ │ antenna ─▶ AD9361 ── 12-bit IQ, 16 Msps ──▶  FPGA channelizer (PL)            │
+ │            LO 126.4 MHz                                                        │
+ │                                                                               │
+ │   per-channel DDC, time-multiplexed — 6 lanes × 3 channels = 18:              │
+ │      NCO mix ─▶ CIC decimate (÷160) ─▶ complex cleanup FIR (63-tap)           │
+ │                                  │  (~100 ksps complex per channel)           │
+ │                                  ▼                                            │
+ │   round-robin collector ─▶ AM back-end (one datapath, folded over channels):  │
+ │      CORDIC |I+jQ| ─▶ DC block ─▶ audio CIC (÷5) ─▶ 20 000 sps mono           │
+ │                                  │                                            │
+ │                                  ▼                                            │
+ │   AudioFramer (8-byte records) ─▶ cyclic DMA ─▶ DDR ring (0x1900_0000)        │
+ │                                                                               │
+ │   maia-httpd (ARM): programs the AD9361 + per-channel NCOs, starts the DMA,   │
+ │   drains the DDR ring, and serves the records over TCP :30000                 │
+ └─────────────────────────────────────────────────────────────────────────────┘
+                                    │  TCP :30000  (stream of 8-byte LE records)
+                                    ▼
+                Host / Raspberry Pi — Rust workspace (host/)
+ ┌─────────────────────────────────────────────────────────────────────────────┐
+ │ airband-reader:  router thread (demux by channel, drop detection via seq #)   │
+ │    └─▶ one worker thread per channel:                                         │
+ │          squelch (VOX | carrier) ─▶ [band-pass · denoise] ─▶ AGC ─▶           │
+ │          DeepFilterNet ─▶ presence ─▶  WAV · Icecast/MP3 · UDP · metrics      │
+ │ airband-listen:  same DSP, live speaker playback + scanner / meters / FFT     │
+ │   shared libs:  airband-dsp (filters · squelch · denoise · AGC) · airband-dfn │
+ └─────────────────────────────────────────────────────────────────────────────┘
+
+   each TCP record (little-endian u64):
+     [23:0]  audio sample (signed 24-bit)    [39:32] channel index 0..17
+     [31:24] carrier level (8-bit minifloat)  [63:40] per-channel sequence #
 ```
 
-- One AD9361 capture (LO **126.4 MHz**, Fs **16 MHz**) covers the 119.2–133.65 MHz
-  band. The FPGA channelizer tunes a numerically-controlled oscillator per channel,
-  filters/decimates to a narrow channel, and AM-demodulates to **20 000 sps** audio
-  (`Fs / 160 / 5`).
-- Audio for all channels is packed into 8-byte records written to a DDR ring by a
-  cyclic DMA, drained by `maia-httpd`, and served as a raw TCP byte stream.
-- The host reader demuxes the records back into per-channel audio and detects any
-  dropped samples via the per-channel sequence counter.
+**On the FPGA (the heart of the project).** A single AD9361 capture (LO
+**126.4 MHz**, Fs **16 MHz**) covers the **119.2–133.65 MHz** airband window. A
+brute-force receiver would need one full DDC per channel — far more DSP/BRAM than
+the small XC7Z010 has. Instead the channelizer is **time-multiplexed**: each of
+**6 lanes** sweeps **3 channels** one-per-clock through a single shared datapath,
+so all **18** channels are produced with one set of arithmetic. Per channel the
+pipeline is `NCO mix → CIC decimate (÷160) → complex cleanup FIR` (the FIR both
+undoes the CIC's passband droop and gives sharp adjacent-channel selectivity). A
+round-robin collector feeds a **shared AM back-end** — a ripple-free **CORDIC
+`|I+jQ|`** envelope detector, a one-pole **DC block**, and an **audio CIC (÷5)** —
+yielding **20 000 sps** (`16 MHz / 160 / 5`) mono audio per channel. The
+`AudioFramer` packs each audio sample into an 8-byte record (sample + carrier
+level + channel index + per-channel sequence number) that a **cyclic DMA** writes
+into a DDR ring buffer. All of this is multiplier-lean (the AM back-end uses **zero
+DSP48s**) so it fits alongside the stock Maia spectrometer.
 
-This is built **on top of** [Maia SDR](https://maia-sdr.org/); the airband DSP,
-DMA, and control live in a fork (`github.com/juchong/maia-sdr`, `pluto-airband`
-branch). The Maia base (spectrometer/recorder/DDC) is preserved.
+**On the ARM (`maia-httpd`).** The Linux side configures the AD9361 front-end and
+programs each channel's NCO tuning word at startup, starts and continuously drains
+the DDR ring, and serves the raw record stream over **TCP `:30000`**. It also keeps
+serving the Maia SDR web UI/waterfall (with the front-end controls **locked**, so a
+browser can't retune the radio off-band).
+
+**On the host (Rust workspace `host/`).** `airband-reader` is a **router +
+per-channel-worker** pipeline: the router reads the socket, demuxes records by
+channel index, and flags drops from the sequence counter — never blocking the
+socket — while one worker per channel runs the full audio chain in parallel:
+**squelch** (voice-VOX or carrier-based) → optional **band-pass / spectral
+denoise** → **AGC** → **DeepFilterNet** neural speech enhancement → **presence**
+brightness, then fans the result out to **WAV** recordings, **Icecast/MP3** feeds,
+**UDP** PCM, and **Prometheus** metrics. `airband-listen` runs the identical DSP for
+live speaker playback with a scanner, per-channel activity meters, and a live FFT.
+The DSP and DFN stages are shared libraries (`airband-dsp`, `airband-dfn`) so both
+binaries enhance audio identically.
+
+**Why this is novel.** A full **multichannel channelizer + AM demodulator running
+inside a $200-class SDR's tiny FPGA**, emitting finished *audio* (not raw IQ) over
+the network, means **one** Pluto+ replaces a rack of single-frequency receivers (or
+a host CPU churning through 16 MHz of IQ per channel) and feeds **18 LiveATC
+streams at once**. The whole DSP is time-multiplexed and DSP48-frugal so it
+coexists with the stock Maia spectrometer on the same chip, and it is built **on
+top of** [Maia SDR](https://maia-sdr.org/) — the airband channelizer, DMA, and
+control live in a fork (`github.com/juchong/maia-sdr`, `pluto-airband` branch)
+while the Maia base (spectrometer/recorder/DDC) is preserved. The deep dive on each
+block is in [`hdl/README.md`](hdl/README.md) and [`SPEC.md`](SPEC.md).
 
 ## Known limitations
 
@@ -468,7 +524,7 @@ any language, implement this contract (the authoritative spec is
 ```
 bits [23:0]  audio sample    — signed, 24-bit, two's complement
 bits [31:24] carrier level   — 8-bit minifloat of the AM carrier (0 = none); for squelch
-bits [39:32] channel index   — 0..20
+bits [39:32] channel index   — 0..17
 bits [63:40] sequence number — per-channel, +1 per sample, wraps at 2**24
 ```
 
@@ -498,7 +554,7 @@ while True:
         if sample & 0x800000:            # sign-extend the 24-bit field
             sample -= 1 << 24
         carrier = (word >> 24) & 0xFF    # AM carrier minifloat (squelch; 0 = none)
-        chan = (word >> 32) & 0xFF       # 0..20
+        chan = (word >> 32) & 0xFF       # 0..17
         seq  = (word >> 40) & 0xFFFFFF   # per-channel sequence
         # `sample` is one 20000 sps mono sample for channel `chan`
 ```

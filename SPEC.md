@@ -134,11 +134,11 @@ the airband channelizer generalizes by time-multiplexing.
    ┌─────────────────┴───────────────────────────────────────────────┐
    │  Pluto+ (Zynq-7010)                                               │
    │                                                                   │
-   │  AD9361  ──12-bit IQ @ 16 Msps──►  PL (FPGA), sync clock 62.5 MHz │
+   │  AD9361  ──12-bit IQ @ 16 Msps──►  PL (FPGA), sync clock 65.3 MHz │
    │  LO 126.4 MHz                      │                               │
    │                ┌───────────────────┴─────────────────────────┐    │
    │                │ ReceiverTop (maia_hdl/airband):              │    │
-   │                │   7 time-multiplexed channelizer lanes       │    │
+   │                │   6 time-multiplexed channelizer lanes       │    │
    │                │     per channel: NCO mix → CIC dec-160       │    │
    │                │                 → 63-tap cleanup FIR         │    │
    │                │   → round-robin collector                    │    │
@@ -165,12 +165,17 @@ the airband channelizer generalizes by time-multiplexing.
 
 ### 4.1 The channelizer fits the Z-7010
 Dozens of independent DDCs do not fit a Z-7010; **time-multiplexing** does. The PL
-runs at 62.5 MHz while each channel's output is far slower, so one physical DDC
-datapath iterates across several channels. The resource/throughput gate (see
+runs at 65.278 MHz while each channel's output is far slower, so one physical DDC
+datapath iterates across several channels. The PL clock is held **≥ `4·Fs`** so the
+shortest input-sample gap (`floor(Fpl/Fs)=4` PL cycles) still covers the
+`chans_per_lane+1 = 4` cycles a lane needs to absorb a sample — i.e. it never drops
+one. (The original 62.5 MHz gave only `floor(3.906)=3` cycles and silently dropped
+the ~9.4% of samples on the short beat → 18.1 ksps instead of 20; see
+`hdl/realtime_budget.py`.) The resource/throughput gate (see
 `hdl/feasibility_25ch.py`, `hdl/realtime_budget.py`) confirmed **GO** against the
-measured Maia base platform, and the integrated lane placed-and-routed with timing
-met at 62.5 MHz. Per-channel state lives in block RAM and the lane datapath is
-pipelined (READ→MIX→INTEG→COMB) to close timing.
+measured Maia base platform, and the integrated design placed-and-routed with timing
+met at the shipped 65.278 MHz (WNS +0.153 ns). Per-channel state lives in block RAM
+and the lane datapath is pipelined (READ→MIX→INTEG→COMB) to close timing.
 
 ### 4.2 Deployed DSP parameters (`maia_hdl/maia_sdr.py`)
 These are the exact constants baked into the shipping bitstream.
@@ -187,7 +192,7 @@ These are the exact constants baked into the shipping bitstream.
 | Audio decimation (`audio_decim`) | **5**, CIC order (`cic_stages`) **4** | audio rate = 100000 / 5 = **20000 sps** (order-4 CIC droop −1.6 dB @3.4 kHz, −5.1 dB @6 kHz) |
 | Audio sample width | **24-bit** signed | scaled to 16-bit on the host |
 | NCO width | 24-bit | per-channel tuning words written via a flat register interface |
-| PL clock | **62.5 MHz** (`sync`) | design is timing-closed at this rate |
+| PL clock | **65.278 MHz** (`sync`; 2×/3× = 130.556/195.833) | raised from 62.5 MHz so `floor(Fpl/Fs)=4 ≥ chans_per_lane+1` (no dropped samples); timing-closed, WNS +0.153 ns |
 
 End-to-end the HDL is verified **bit-exact** against Python reference models at
 each stage (see `hdl/README.md`).
@@ -386,7 +391,7 @@ little-endian record**:
 bits [23:0]  audio sample (signed, 24-bit; host sign-extends to 32 bits)
 bits [31:24] carrier level (8-bit minifloat [exp(5)|mant(3)] of the DC-block
              carrier estimate; 0 = none / pre-carrier bitstream)
-bits [39:32] channel index (0..20)
+bits [39:32] channel index (0..17)
 bits [63:40] per-channel sequence counter (wraps at 2**24; gap = dropped samples)
 ```
 
