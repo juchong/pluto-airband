@@ -471,7 +471,7 @@ ssh rfpi 'dfu-util -a firmware.dfu -e'                  # named alt (bare -e err
 # 3. Test after boot (~min for sshd/maia-httpd): SD enumerates + mounts, the
 #    stream is full-rate, the plan loads, and the SSH host key is now stable.
 ssh root@plutoplus 'ls -l /dev/mmcblk0* ; grep /mnt/sdcard /proc/mounts ; ps w | grep [m]aia-httpd'
-airband-reader plutoplus:30000          # expect 21 channels (or AWOS-only fallback), ~21875 sps
+airband-reader plutoplus:30000          # expect 21 channels (or AWOS-only fallback), ~20000 sps
 ```
 
 Success = `dfu-util` prints `Done!` with `exit=0` (a second `-D` failing at 0 % is
@@ -601,9 +601,9 @@ Verify over SSH (`sshpass -p analog ssh root@192.168.2.1`) — or over serial
 (`firmware/pluto_setup_env.py` logs in the same way): clean `dmesg`
 (no `watchdog`/`panic`), `maia_sdr_airband@19000000` reserved node present,
 `maia-httpd` running, then on the host run `airband-reader 192.168.2.1:30000`
-and confirm **~21875 sps/channel** (= 14 MHz / 128 / 5) — any other rate (e.g.
-15625 = an old `audio_decim=7` bitstream, or ~10937 = a half-rate bitstream) means
-the wrong/old bitstream is still loaded.
+and confirm **~20000 sps/channel** (= 16 MHz / 160 / 5) — any other rate (e.g.
+21875 = an old 14 MHz `lane_decim=128` bitstream, or ~10000 = a half-rate bitstream)
+means the wrong/old bitstream is still loaded.
 
 ### CRITICAL: the AD9361 front-end is locked read-only under `--airband`
 
@@ -613,10 +613,10 @@ is active*. The Maia waterfall (`http://<pluto>:8000`) shows lots of signals, bu
 they're at **2.4 GHz / 61.44 Msps**, not the airband window.
 
 **Cause:** the AD9361 is a **single shared front-end**. The airband task programs
-it to **123.438 MHz / 14 Msps** at startup, but the Maia web UI re-applies its own
+it to **126.4 MHz / 16 Msps** at startup, but the Maia web UI re-applies its own
 settings: on every page load `maia-wasm`'s `preferences.apply()` re-`PATCH`es each
 stored AD9361 field, and the stored *defaults are 2.4 GHz LO / 61.44 Msps*. That
-retunes the radio off-band, so the channelizer NCOs (baked for 14 Msps) all land
+retunes the radio off-band, so the channelizer NCOs (baked for 16 Msps) all land
 on noise.
 
 **Fix (shipped, fork commit `aa9364e`):** when `maia-httpd` runs with `--airband`
@@ -647,7 +647,7 @@ should print `"airband":true`, and the `ad9361` block should read
 ### "Receiver works but no audio" — it's a level problem, not the DSP
 
 **Symptom:** the stream runs (correct rate, 0 drops) and the channel carrying a
-known always-on signal (e.g. AWOS on 118.050) is the loudest in `airband-reader`
+known always-on signal (e.g. an ATIS/ASOS such as 127.750) is the loudest in `airband-reader`
 stats, but it's still near-silent when you play/record it.
 
 The DSP chain (channelizer → `|I+jQ|` → DC block → audio CIC) is unity-ish gain
@@ -656,7 +656,7 @@ gets as large as the demodulated signal, which for weak airband AM is **tens of
 LSB** (i.e. ~ −90 to −100 dBFS at 24-bit). Two things were eating it:
 
 1. **AGC starves weak channels.** `slow_attack`/`fast_attack`/`hybrid` set RF
-   gain from the *wideband* (14 MHz) power and settle to ~48–57 dB, which leaves
+   gain from the *wideband* (16 MHz) power and settle to ~48–57 dB, which leaves
    the weak narrowband carrier tiny. Measured ch0 raw 24-bit peak:
 
    | gain setting | RF gain | ch0 peak |
@@ -826,8 +826,9 @@ that path caused stale-gateware flashes and was removed). What to flash:
 > against the new bitstream misreads the framing; a new host against an old
 > bitstream reads carrier `0` and silently falls back to VOX squelch (`--squelch
 > carrier` then has no effect). After the new bitstream is live, verify the narrow
-> cleanup FIR (cleaner inter-transmission noise) and `--squelch carrier` on
-> 118.050 AWOS.
+> cleanup FIR (cleaner inter-transmission noise) and `--squelch carrier` on an
+> always-on ATIS/ASOS in the operational plan (e.g. 127.750 KBFI ATIS; the 16 MHz
+> capture no longer includes 118.050 AWOS, which is the no-SD fallback only).
 
 ### Verify on hardware
 
@@ -856,7 +857,7 @@ Then from the host, confirm a live, gap-free 21-channel stream:
 ```bash
 cargo build --release --manifest-path host/Cargo.toml
 host/target/release/airband-reader 192.168.2.1:30000
-# expect: 21 channels, ~21875 sps each, 0 dropped samples
+# expect: 21 channels, ~20000 sps each, 0 dropped samples
 ```
 
 A healthy result is: clean boot (no panic/watchdog), `--airband` in the running

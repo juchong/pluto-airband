@@ -54,6 +54,8 @@
 
     { "channel": 18, "server": "icecast.chongflix.tv", "port": 9343, "mountpoint": "/pluto-127p750.mp3", "username": "source", "password": "${AIRBAND_ICECAST_PASSWORD}", "name": "127.750 - KBFI ATIS", "genre": "ATC", "description": "127.750 - KBFI ATIS", "bitrate": 32, "samplerate": 22050, "tls": "disabled" },
 
-    { "channel": 19, "server": "icecast.chongflix.tv", "port": 9343, "mountpoint": "/pluto-126p950.mp3", "username": "source", "password": "${AIRBAND_ICECAST_PASSWORD}", "name": "126.950 - KSEA ASOS at RNT", "genre": "ATC", "description": "126.950 - KSEA ASOS at RNT", "bitrate": 32, "samplerate": 22050, "tls": "disabled" }
+    { "channel": 19, "server": "icecast.chongflix.tv", "port": 9343, "mountpoint": "/pluto-126p950.mp3", "username": "source", "password": "${AIRBAND_ICECAST_PASSWORD}", "name": "126.950 - KSEA ASOS at RNT", "genre": "ATC", "description": "126.950 - KSEA ASOS at RNT", "bitrate": 32, "samplerate": 22050, "tls": "disabled" },
+
+    { "channel": 20, "server": "icecast.chongflix.tv", "port": 9343, "mountpoint": "/pluto-133p650.mp3", "username": "source", "password": "${AIRBAND_ICECAST_PASSWORD}", "name": "133.650 - KSEA Approach", "genre": "ATC", "description": "133.650 - KSEA Approach", "bitrate": 32, "samplerate": 22050, "tls": "disabled" }
   ]
 }

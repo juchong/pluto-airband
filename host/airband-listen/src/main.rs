@@ -67,21 +67,23 @@ use std::{
 
 use airband_dfn::{DfnEnhancer, DfnParams, Presence};
 
-/// Per-channel audio rate: the channelizer is fed IQ at Fs = 14 Msps and
-/// decimates by 640 (128 lane CIC * 5 audio) -> 21875 sps. (Older bitstreams used
-/// audio_decim 7 -> 15625 sps; pass --rate 15625 for those.)
-const DEFAULT_RATE: u32 = 21875;
+/// Per-channel audio rate: the channelizer is fed IQ at Fs = 16 Msps and
+/// decimates by 800 (160 lane CIC * 5 audio) -> 20000 sps. (Older 14 MHz bitstreams
+/// used lane_decim 128 -> 21875 sps; pass --rate 21875 for those.)
+const DEFAULT_RATE: u32 = 20000;
 
 /// Default TCP port of the maia-httpd airband stream, appended when the address
 /// argument omits an explicit `:port` (so `10.0.16.183` works like
 /// `10.0.16.183:30000`).
 const DEFAULT_PORT: u16 = 30000;
 
-/// Default channel plan (MHz), matching `firmware/airband.json`.
+/// Default channel plan (MHz), matching `firmware/airband.json` `channels_hz`
+/// (positional: index 0 is the first streamed channel). 118.050 is NOT here -- it
+/// is only the firmware no-SD fallback indicator, not an operational channel.
 const FREQS_MHZ: [f64; 21] = [
-    118.050, 119.200, 119.900, 120.100, 120.400, 120.950, 121.500, 121.600, 121.700, 122.275,
-    122.950, 122.975, 123.900, 124.700, 125.600, 125.900, 126.250, 126.500, 126.875, 127.100,
-    128.500,
+    119.200, 119.900, 120.100, 120.400, 120.950, 121.500, 121.600, 121.700, 122.275, 122.950,
+    122.975, 123.900, 124.700, 125.600, 125.900, 126.250, 126.500, 126.875, 127.750, 126.950,
+    133.650,
 ];
 
 /// Squelch mode selector for the CLI.
@@ -120,7 +122,7 @@ struct Args {
     /// Channel to start listening on
     #[arg(long, default_value_t = 0)]
     channel: usize,
-    /// Per-channel audio sample rate in Hz (AD9361 Fs / 128 / 7)
+    /// Per-channel audio sample rate in Hz (AD9361 Fs / 160 / 5 = 20000)
     #[arg(long, default_value_t = DEFAULT_RATE)]
     rate: u32,
     /// Playback volume (linear sink gain). Defaults to 1.5 with AGC on (audio is
@@ -482,7 +484,7 @@ struct ChannelDsp {
     agc: Agc,
 }
 
-/// STFT frame size for the spectral denoiser (~16 ms at 15625 sps).
+/// STFT frame size for the spectral denoiser (~13 ms at 20000 sps).
 const DENOISE_FRAME: usize = 256;
 
 impl ChannelDsp {

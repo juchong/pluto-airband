@@ -89,7 +89,7 @@ recovers a clean low-rate audio tone at the expected frequency. Plot at
 `out/am_audio.png` (git-ignored).
 
 `audio_decim`/`cic_stages` are parameters; nothing here hard-codes the rate. The
-shipping receiver uses **`audio_decim=5` → 21 875 sps** (14 MHz / 128 / 5); see
+shipping receiver uses **`audio_decim=5` → 20 000 sps** (16 MHz / 160 / 5); see
 `SPEC.md` §4.2.
 
 ## `synth_estimate.py`
@@ -108,15 +108,15 @@ Measured: a full DDC = **11 DSP48E1** (Cmult3x mixer 1 + 3-stage FIR 4+2+4=10),
 ~661 LUT, ~1239 FF, ~4 BRAM36. The AM back-end is **0 DSP48E1** (multiplier-free),
 ~295 LUT, ~281 FF per channel. The channelizer-chain FIRs are printed both as the
 **unrolled** Yosys upper bound (1 mult/tap) and as the **folded** MAC-engine cost:
-the shared front-end as a single long FIR is ~43 DSP at 14 MHz (→ use a multistage
+the shared front-end as a single long FIR is ~49 DSP at 16 MHz (→ use a multistage
 decimator), while the channel selectivity FIR at ~50 kHz folds to ~0.2 DSP/channel
 (~4 DSP for all 21 on one engine). DSP/BRAM map 1:1 and are trustworthy; LUT/FF are
 Yosys estimates to be re-confirmed with Vivado.
 
 ## `feasibility_25ch.py`
 
-The `SPEC.md` §4.1 resource-fit **GATE** for the final channel set (22 = 21 core +
-1 deferred). Uses the measured per-block costs above plus a time-multiplexing
+The `SPEC.md` §4.1 resource-fit **GATE** for the operational channel set (21,
+including 133.65 MHz). Uses the measured per-block costs above plus a time-multiplexing
 throughput model to size a shared channelizer and compare against the Z-7010
 budget for several capture-window choices (§5). (Filename is historical — the
 planning target was 25.)
@@ -129,9 +129,10 @@ Result: **GO**, now confirmed against the **measured** Maia base platform (built
 from source on the x86 server; LUT 5416/17600, FF 6493/35200, BRAM 29/60, DSP
 18/80, timing met). 22 independent DDCs (242 DSP / ~88 BRAM) do not fit, but a
 time-multiplexed channelizer fits the FREE budget (Z7010 − base) at every capture
-window — even the full ~19 MHz airband (~7 lanes / 21 DSP / 69% of free LUT /
-58% of free BRAM); the resolved 14 MHz core window is ~5 lanes (56% LUT / 45%
-BRAM). Binding resources: BRAM36 then LUT. AM back-end costs zero DSP.
+window — even the full ~19 MHz airband (7 lanes / 35 DSP / 78% of free LUT /
+65% of free BRAM). The resolved 16 MHz window runs **7 lanes** (`chans_per_lane=3`),
+the same area class (~78% LUT / ~65% BRAM in the model). Binding resources: BRAM36
+then LUT. AM back-end costs zero DSP.
 
 ## `capture_window.py`
 
@@ -145,11 +146,13 @@ time-mux lane count. Re-run if the channel list changes.
 python capture_window.py
 ```
 
-Result (21 core channels, 118.05–128.5 MHz): **center 123.438 MHz, Fs ≈ 14 MHz**
-(±7 MHz half-band; extreme channel ±5.39 MHz = 77%; ≥1.6 MHz edge guard; DC spur
-463 kHz from the nearest channel), costing ~5 of the ≤8 lanes the Z-7010 fits. The
-far-out 133.65 MHz is deferred (a nice-to-have that would force Fs≈20 MHz / 8
-lanes / center 125.75 MHz). Plot at `out/capture_window.png` (git-ignored).
+Result (21 channels incl. 133.65, 119.2–133.65 MHz): **center 126.4 MHz, Fs = 16
+MHz** (±8 MHz half-band; extreme channels ±7.25 MHz = 90.6%; ≥0.75 MHz edge guard;
+DC spur 100 kHz from the nearest channel), costing **7** of the ≤8 lanes the Z-7010
+fits. 133.65 lands at ~91% of the half-band: the strict 80%-usable rule would
+request 20 MHz, but 16 MHz is chosen to hold 7 lanes and seat the internal
+sample-clock comb at 128.000 MHz (a guard gap). Plot at `out/capture_window.png`
+(git-ignored).
 
 ## `channelizer_lane.py`
 
@@ -290,9 +293,9 @@ channel + monotonic per-channel sequence preserved through the staging FIFO.
 **`ReceiverTop`** — the complete receiver datapath (`SPEC.md` §4):
 wideband IQ → N `ChannelizerCore` lanes (same stream broadcast) → round-robin
 collector → `TdmAmBackend` → `AudioFramer` → DMA stream. Channels are balanced
-across `ceil(N/chans_per_lane)` lanes; the shipping config is `chans_per_lane=4`,
-so 21 → **6 lanes** `[4,4,4,3,3,3]`. One lane sweeps all its channels per input
-sample, so `chans_per_lane` is bounded by `Fpl/Fs` (≈4.46 here). Per-channel
+across `ceil(N/chans_per_lane)` lanes; the shipping config is `chans_per_lane=3`,
+so 21 → **7 lanes** `[3,3,3,3,3,3,3]`. One lane sweeps all its channels per input
+sample, so `chans_per_lane` is bounded by `Fpl/Fs` (≈3.91 here). Per-channel
 NCO tuning words are written through a flat register interface
 (`freq_wren`/`freq_waddr`=global channel/`freq_wdata`), routed to the owning lane.
 
@@ -309,25 +312,27 @@ place.
 
 The `SPEC.md` §4.1 feasibility GATE checked **area**; this checks **throughput**. The shared
 (folded) datapaths must keep up with the sample cadence: at `Fpl=62.5 MHz`,
-`Fs=14 MHz` there are only `~4.46` PL cycles per input sample, so each binding
+`Fs=16 MHz` there are only `~3.91` PL cycles per input sample, so each binding
 stage has a duty cycle that must stay < 1:
 
-- `duty_lane = chans_per_lane / (Fpl/Fs)` ⟹ **chans_per_lane ≤ 4**.
+- `duty_lane = chans_per_lane / (Fpl/Fs)` ⟹ **chans_per_lane ≤ 3**.
 - `duty_fir  = chans_per_lane · (Fs/lane_decim) · (ntaps+ovh) / Fpl` ⟹ enough lane
   decimation for the tap count.
 - `duty_am   = N · (Fs/lane_decim) · 4 / Fpl` (always small).
 
 **Important:** the OOC config (`dec-64`, `119-tap`) was for *resource* measurement
 and does **not** close real-time timing (`duty_fir ≈ 1.75`). The recommended
-deployment config is **`chans_per_lane=4`, `lane_decim=128`, cleanup `ntaps=63`
-→ 6 lanes**, with `audio_decim=5` giving **21.9 ksps** audio (all duties < 0.9).
+deployment config is **`chans_per_lane=3`, `lane_decim=160`, cleanup `ntaps=63`
+→ 7 lanes**, with `audio_decim=5` giving **20.0 ksps** audio (duties
+lane=0.77 / fir=0.33 / am=0.77, all < 0.9).
 
 ```bash
 python realtime_budget.py     # prints the duty table + cycle-accurate stress test
 ```
 
 A cycle-accurate stress test drives `ReceiverTop` at the **true** cadence (one
-input every `floor(Fpl/Fs)` cycles): a budget-fitting config stays **overflow-free
-and bit-exact**, and an over-budget config (`dec-32`/`119-tap`, `duty_fir>1`)
+input every `Fpl/Fs` cycles on average, with the realistic gap=3/gap=4 jitter for a
+non-integer ratio): a budget-fitting config stays **overflow-free and bit-exact**,
+and an over-budget config (`dec-32`/`119-tap`, `duty_fir>1`)
 **correctly trips** the overflow detector (which now covers the lane→FIR FIFO, the
 collector FIFOs, and the framer FIFO).

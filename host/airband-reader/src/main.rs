@@ -102,8 +102,8 @@ struct Args {
     /// Number of channels to demultiplex
     #[arg(long, default_value_t = 21)]
     channels: usize,
-    /// Audio sample rate in Hz (= AD9361 Fs / 128 / 5); used for WAV headers
-    #[arg(long, default_value_t = 21875)]
+    /// Audio sample rate in Hz (= AD9361 Fs / 160 / 5 = 20000 at the 16 MHz build)
+    #[arg(long, default_value_t = 20000)]
     rate: u32,
     /// Output mode
     #[arg(long, value_enum, default_value_t = Mode::Stats)]
@@ -448,7 +448,7 @@ impl Recorder {
     }
 }
 
-/// STFT frame size for the spectral denoiser (~16 ms at 15625 sps).
+/// STFT frame size for the spectral denoiser (~13 ms at 20000 sps).
 const DENOISE_FRAME: usize = 256;
 
 /// Counting semaphore bounding how many DeepFilterNet **inferences** run at once

@@ -7,6 +7,14 @@ short form lives in [`SPEC.md` §7](SPEC.md) and the remedy table in
 [`firmware/diagnostics/README.md`](firmware/diagnostics/README.md); this document is
 the long-form walkthrough with the plots.
 
+> **Build update (post-investigation):** these captures were taken at the original
+> **Fs = 14 MHz / LO 123.438 MHz**. The receiver has since moved to **Fs = 16 MHz /
+> LO 126.4 MHz** to admit 133.65 MHz. Because the dominant tooth is a *sample-clock
+> harmonic* (it relocates with Fs), it moved from 9 × 14 = 126.000 to **8 × 16 =
+> 128.000 MHz**, which the 16 MHz channel plan deliberately keeps in a guard gap
+> clear of every channel — exactly remedy #8 below. The two *fixed-absolute* teeth
+> (125.004 GbE, 120.000 reference) are Fs-independent and unchanged.
+
 All captures were taken with the **RX input terminated into 50 Ω** (antenna
 disconnected) unless noted, via the Maia recorder (raw wideband IQ), with the new
 self-healing diagnostic tools. Figures are in `firmware/diagnostics/out/`.
@@ -206,16 +214,19 @@ Fix by mechanism (cheapest first). Full detail in
 6. **Tighten the channelizer cleanup FIR** (~±6 → ±3.5 kHz; same tap count) to reject
    near-edge spurs.
 7. **FPGA wideband notch** at the fixed offsets (if the chip FIR is insufficient).
-8. **Change Fs / decimation** so 9·Fs lands in a guard gap — root fix for the
-   sample-clock tooth, largest effort.
+8. **Change Fs / decimation** so n·Fs lands in a guard gap — root fix for the
+   sample-clock tooth, largest effort. **Done:** the 16 MHz build puts the in-band
+   harmonic at 8 × 16 = 128.000 MHz, in a guard gap clear of every channel.
 
 **Hardware (not DSP)**
 9. External low-spur **OCXO** reference (120 MHz), clock-tree / ADC decoupling +
    local shielding (126 MHz), GbE PHY decoupling (125 MHz). A switcher↔bulk-cap
    ferrite is **not** indicated (no dominant tooth rides that rail).
 
-**Frequency planning:** keep channels ≥ ~10 kHz from 126.000 / 125.004 / 120.000
-(the shipped plan already does).
+**Frequency planning:** keep channels ≥ ~10 kHz from the fixed teeth — at the
+shipped 16 MHz build those are **128.000** (sample-clock 8×), 125.004 (GbE) and
+120.000 (reference 3×); the shipped plan already does (nearest channel 127.75 is
+250 kHz from 128.000).
 
 ## Reproduce
 

@@ -28,8 +28,8 @@ program.
 - A **host** to run the receiver tools: any Linux/macOS machine or a Raspberry Pi
   (a Pi 5 comfortably runs all 21 channels with DeepFilterNet). It needs a Rust
   toolchain to build `host/`.
-- A VHF **antenna** for the airband. One capture covers a 14 MHz window (channels
-  within ~116.4–130.4 MHz; see [How it works](#how-it-works)). An airband band-pass
+- A VHF **antenna** for the airband. One capture covers a 16 MHz window (channels
+  within ~118.4–134.4 MHz; see [How it works](#how-it-works)). An airband band-pass
   filter + a low-noise amplifier ahead of the device gives the biggest quality win
   (see [Known limitations](#known-limitations)).
 - A **microSD card** (FAT32) if you want a persistent, custom channel plan on a
@@ -58,8 +58,8 @@ This README is the hub. Each topic has a single home:
             Pluto+ (Zynq-7010: FPGA + ARM)                              Host / Raspberry Pi
  ┌──────────────────────────────────────────────────────┐        ┌────────────────────────────┐
  │  AD9361 RF  ──IQ──▶  FPGA (PL)                         │        │  airband-reader (Rust)     │
- │  LO 123.438 MHz      ┌───────────────────────────────┐│  TCP   │  • demux by channel        │
- │  Fs  14 MHz          │ ReceiverTop:                   ││ :30000 │  • drop detection (seq)    │
+ │  LO 126.4 MHz        ┌───────────────────────────────┐│  TCP   │  • demux by channel        │
+ │  Fs  16 MHz          │ ReceiverTop:                   ││ :30000 │  • drop detection (seq)    │
  │                      │  channelizer (21 ch, TDM DDC)  ││──────▶ │  • 24→16-bit scale         │
  │                      │  → AM demod (|I+jQ|, DC block) ││ framed │  • WAV / raw / live stats  │
  │                      │  → audio decimate → framer     ││ 64-bit └────────────────────────────┘
@@ -71,10 +71,10 @@ This README is the hub. Each topic has a single home:
  └──────────────────────────────────────────────────────┘           [63:40] per-channel seq
 ```
 
-- One AD9361 capture (LO **123.438 MHz**, Fs **14 MHz**) covers the 118.05–128.5 MHz
+- One AD9361 capture (LO **126.4 MHz**, Fs **16 MHz**) covers the 119.2–133.65 MHz
   band. The FPGA channelizer tunes a numerically-controlled oscillator per channel,
-  filters/decimates to a narrow channel, and AM-demodulates to **21 875 sps** audio
-  (`Fs / 128 / 5`).
+  filters/decimates to a narrow channel, and AM-demodulates to **20 000 sps** audio
+  (`Fs / 160 / 5`).
 - Audio for all channels is packed into 8-byte records written to a DDR ring by a
   cyclic DMA, drained by `maia-httpd`, and served as a raw TCP byte stream.
 - The host reader demuxes the records back into per-channel audio and detects any
@@ -95,11 +95,13 @@ audio or plan an install.
   (the 120.000 MHz = 40 MHz-reference 3rd harmonic is one tooth) remains. It is
   independent of the HDL/DSP/demod, so an external enclosure, an antenna band-pass,
   and a notch on the strong local carrier do **not** remove it — but it **is**
-  amplified by RX gain. Fs/LO-shift tests pin each tooth: the **dominant (126.000 MHz)
-  is the 9th harmonic of the 14 MHz ADC sample clock**, plus a **125 MHz GbE clock**
-  (Pluto+) and the **120 MHz reference 3rd harmonic** — all at fixed *absolute*
-  frequencies. Effective levers: **lower RX gain**, **frequency planning** (keep
-  channels off those fixed lines when you build your plan), and an **external
+  amplified by RX gain. Fs/LO-shift tests pin each tooth: the **dominant tooth is
+  the ADC sample-clock harmonic** that lands in-band (9×14 = 126.000 on the original
+  14 MHz build; relocated to 8×16 = **128.000** on the 16 MHz build, where it sits in
+  a guard gap clear of every channel), plus a **125 MHz GbE clock** (Pluto+) and the
+  **120 MHz reference 3rd harmonic** — all at fixed *absolute* frequencies. Effective
+  levers: **lower RX gain**, **frequency planning** (keep channels off those fixed
+  lines when you build your plan), and an **external
   reference** (for the 120 MHz line); input power, enclosure shielding, and a switcher
   bead do not help. Full root-cause analysis and a diagnostic toolkit:
   [`firmware/diagnostics/README.md`](firmware/diagnostics/README.md).
@@ -315,7 +317,7 @@ Per-feed options (defaults in parentheses):
 | `genre` | ICY genre tag (unset). |
 | `description` | ICY description tag (unset). |
 | `bitrate` | MP3 bitrate in kbps (`16`; LiveATC uses 16). |
-| `samplerate` | MP3 output sample rate in Hz (`22050`; the 21875 sps audio is resampled to this). |
+| `samplerate` | MP3 output sample rate in Hz (`22050`; the 20000 sps audio is resampled to this). |
 | `tls` | TLS negotiation (`"disabled"`): `disabled` plain TCP; `transport` implicit TLS (a TLS-only listener); `upgrade` RFC 2817 in-band upgrade; `auto` try TLS then fall back to plain; `auto_no_plain` TLS only, no fallback. |
 | `tls_insecure` | **Testing only** (`false`): accept invalid/self-signed certs and hostname mismatches. This disables protection against man-in-the-middle interception (which can capture your source password) — never set it for a public feed. |
 
@@ -416,7 +418,7 @@ selected channel's squelch state, and cumulative dropped samples.
 neural speech enhancer on the played stream. It is **on by default** (the host
 band-pass/LPF/notch/spectral-denoise instead start off so DFN cleans up alone);
 toggle it with `D`. The DFN3 model is embedded in the binary and fed via streaming
-resampling from the 21875 sps audio to its native 48 kHz. It runs **after** the
+resampling from the 20000 sps audio to its native 48 kHz. It runs **after** the
 per-channel filter + AGC chain (so it sees a healthy, in-range signal) and **only
 while the squelch is open** (the inference is expensive and there is nothing to
 enhance in muted silence), adding ~tens of ms of latency. It complements the
@@ -471,7 +473,7 @@ bits [63:40] sequence number — per-channel, +1 per sample, wraps at 2**24
 ```
 
 - **Demux:** switch on the channel byte and append the sample to that channel's
-  stream. Each channel is mono PCM at **21875 sps** (`Fs/128/5`). Records from
+  stream. Each channel is mono PCM at **20000 sps** (`Fs/160/5`). Records from
   different channels are interleaved; within one channel they are in order.
 - **Drop detection:** a per-channel jump in the sequence number (delta > 1) means
   `delta-1` samples were dropped (FPGA FIFO overflow or a slow client). The server
@@ -498,15 +500,15 @@ while True:
         carrier = (word >> 24) & 0xFF    # AM carrier minifloat (squelch; 0 = none)
         chan = (word >> 32) & 0xFF       # 0..20
         seq  = (word >> 40) & 0xFFFFFF   # per-channel sequence
-        # `sample` is one 21875 sps mono sample for channel `chan`
+        # `sample` is one 20000 sps mono sample for channel `chan`
 ```
 
 ### Web UI (Maia spectrometer) — front-end is read-only
 
 The Pluto still serves the Maia SDR web UI at `http://192.168.2.1:8000`, and its
-waterfall is handy for seeing live activity across the **118–128 MHz** airband
+waterfall is handy for seeing live activity across the **119–134 MHz** airband
 window. Because the airband receiver owns the single AD9361 front-end (its
-channelizer is built for **123.438 MHz / 14 Msps**), those controls — RX freq,
+channelizer is built for **126.4 MHz / 16 Msps**), those controls — RX freq,
 sampling freq, RF bandwidth, gain, AGC — are **locked read-only** while the
 receiver is running. This is deliberate: the web UI used to silently retune the
 radio to its 2.4 GHz / 61.44 Msps defaults on page load, which moved the
@@ -528,21 +530,21 @@ the built-in default (no SD card) is **0 dB**:
 
 ```jsonc
 {
-  "center_hz":   123438000,   // AD9361 RX LO (capture center) — keep within the built window
-  "samp_rate":   14000000,    // MUST stay 14 MHz (the rate the channelizer was built for)
-  "rf_bandwidth":14000000,
+  "center_hz":   126400000,   // AD9361 RX LO (capture center) — keep within the built window
+  "samp_rate":   16000000,    // MUST stay 16 MHz (the rate the channelizer was built for)
+  "rf_bandwidth":16000000,
   "gain_db":     30.0,        // fixed manual gain — ADJUSTABLE; built-in default (no SD card) is 0 dB (see Gain)
   "agc":         "manual",    // "manual" | "slow_attack" | "fast_attack" | "hybrid"
   "poll_ms":     20,
-  "channels_hz": [ 119200000, 119900000, /* … your channels, up to 21 … */ 126950000 ]
+  "channels_hz": [ 119200000, 119900000, /* … your channels, up to 21 … */ 126950000, 133650000 ]
 }
 ```
 
 Rules:
-- **`samp_rate` must remain `14000000`.** The channelizer's filters/decimation are
+- **`samp_rate` must remain `16000000`.** The channelizer's filters/decimation are
   baked into the FPGA bitstream for this rate; changing it requires an HDL rebuild.
 - Up to **21** entries in `channels_hz`, each within `center_hz ± samp_rate/2`
-  (i.e. 116.438–130.438 MHz). Out-of-window channels are rejected at startup. The
+  (i.e. 118.4–134.4 MHz). Out-of-window channels are rejected at startup. The
   FPGA always frames **21 positional channels**, so frame channel *index* = position
   in `channels_hz`; with fewer than 21 entries the trailing positions are stale, and
   the host reader must run `--channels = len(channels_hz)` to ignore them. Your

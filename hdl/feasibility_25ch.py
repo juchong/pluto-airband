@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Z-7010 feasibility model for the airband AM channelizer (§4.2 GATE).
 
-(Filename is historical: the planning target was N=25; the final channel list is
-22 -- 21 "need to have" core channels plus one deferred outlier. We keep N=22 here
-as the conservative upper bound.)
+(Filename is historical: the planning target was N=25. The operational channel list
+is now 21 -- all "need to have", including 133.65 MHz, which the 16 MHz capture
+admits (it was formerly a deferred outlier).)
 
 This is the resource/timing feasibility GATE from the handoff doc: does the
 multichannel AM receiver fit in the Pluto's XC7Z010 programmable logic?
@@ -66,7 +66,7 @@ FIR_CLEANUP_DSP = 2    # one folded MAC engine for the per-lane CIC droop-comp +
 # MultiStageDecimator folds to ~14 DSP (vs ~43 for one long FIR), paid once.
 FRONTEND = {"DSP48E1": 14, "LUT": 1144, "FF": 1175, "BRAM36": 2}
 
-N = 22                 # final channel count (21 core + 1 deferred outlier)
+N = 21                 # operational channel count (incl. 133.65 MHz)
 F_S = 62.5e6           # PL "sync" clock (handoff §4.2)
 AUDIO_HZ = 16_000      # 16 ksps (open decision §8.3; 8 ksps only relaxes this)
 
@@ -144,7 +144,7 @@ def main():
     print(f"\n    {'window':>8} {'lanes':>6} {'DSP48E1':>16} "
           f"{'LUT':>16} {'BRAM36':>14}")
     feasible_windows = []
-    for w_mhz in (4, 8, 14, 19):           # 14 MHz = resolved §8.2 core window
+    for w_mhz in (4, 8, 14, 16, 19):       # 16 MHz = resolved §8.2 capture window
         c = channelizer_cost(w_mhz * 1e6)
         dsp_ok = c["DSP48E1"] <= FREE["DSP48E1"]
         lut_ok = c["LUT"] <= FREE["LUT"]
@@ -165,8 +165,8 @@ def main():
     print(f"Feasible capture windows: "
           f"{', '.join(str(w)+' MHz' for w in feasible_windows)} "
           f"(even the full ~19 MHz airband fits, the tightest case).")
-    print("Resolved (§8.2, see capture_window.py): center 123.438 MHz, Fs ~14 MHz "
-          "-> ~5 lanes for the 21 core channels (133.65 MHz deferred).")
+    print("Resolved (§8.2, see capture_window.py): center 126.4 MHz, Fs ~16 MHz "
+          "-> 7 lanes (chans_per_lane=3) for the 21 channels (incl. 133.65 MHz).")
     print("\nStatus / caveats:")
     print("  * front end + per-channel CIC droop-comp/selectivity FIR + multistage")
     print("    front end + folded one-MAC TDM cleanup FIR are all built and verified")

@@ -33,7 +33,7 @@ off-device.
 
 | Criterion | Status |
 |---|---|
-| Pluto firmware exposing many independently-tuned AM channels | **Done — 21 channels, mono, 24-bit, 21875 sps** |
+| Pluto firmware exposing many independently-tuned AM channels | **Done — 21 channels, mono, 24-bit, 20000 sps** |
 | Demodulated audio reaches a host over the Pluto link, within USB 2.0 | **Done — framed audio over TCP `:30000`, well under USB 2.0** |
 | 24/7 stability at an antenna site | **Partially — gap-free + auto-start on boot; long soak pending** |
 | Pi-side daemon encodes each channel and pushes to liveatc Icecast | **Done — `airband-reader` has a built-in LAME→Icecast source client (16 kbps mono 22050 Hz); soak pending** |
@@ -54,10 +54,10 @@ Shipping wideband IQ to the host does not fit the link, so demod *must* happen o
 the FPGA:
 
 - Pluto host link is **USB 2.0**: ~480 Mbps ≈ 60 MB/s, realistically ~40–50 MB/s.
-- Wideband IQ = `sample_rate × 4 bytes/s`: 14 Msps → 56 MB/s, 61.44 Msps →
+- Wideband IQ = `sample_rate × 4 bytes/s`: 16 Msps → 64 MB/s, 61.44 Msps →
   ~246 MB/s. Neither fits comfortably with overhead.
-- **Demodulated audio**: 21875 sps mono, packed 8 bytes/sample = 175 KB/s/channel;
-  21 channels ≈ 3.7 MB/s raw, trivial over USB. **This is the chosen path.**
+- **Demodulated audio**: 20000 sps mono, packed 8 bytes/sample = 160 KB/s/channel;
+  21 channels ≈ 3.4 MB/s raw, trivial over USB. **This is the chosen path.**
 
 Because the FPGA produces audio (not IQ), RTLSDR-Airband — whose pipeline is
 strictly IQ-in → channelize → demodulate → audio-out — has no role downstream. We
@@ -134,12 +134,12 @@ the airband channelizer generalizes by time-multiplexing.
    ┌─────────────────┴───────────────────────────────────────────────┐
    │  Pluto+ (Zynq-7010)                                               │
    │                                                                   │
-   │  AD9361  ──12-bit IQ @ 14 Msps──►  PL (FPGA), sync clock 62.5 MHz │
-   │  LO 123.438 MHz                    │                               │
+   │  AD9361  ──12-bit IQ @ 16 Msps──►  PL (FPGA), sync clock 62.5 MHz │
+   │  LO 126.4 MHz                      │                               │
    │                ┌───────────────────┴─────────────────────────┐    │
    │                │ ReceiverTop (maia_hdl/airband):              │    │
-   │                │   6 time-multiplexed channelizer lanes       │    │
-   │                │     per channel: NCO mix → CIC dec-128       │    │
+   │                │   7 time-multiplexed channelizer lanes       │    │
+   │                │     per channel: NCO mix → CIC dec-160       │    │
    │                │                 → 63-tap cleanup FIR         │    │
    │                │   → round-robin collector                    │    │
    │                │   → TdmAmBackend: CORDIC |I+jQ| → DC block   │    │
@@ -178,13 +178,13 @@ These are the exact constants baked into the shipping bitstream.
 | Parameter | Value | Notes |
 |---|---|---|
 | Channels (`n_channels`) | **21** | indices 0..20 |
-| Channels per lane (`chans_per_lane`) | **4** | → `ceil(21/4)` = **6 lanes** (`[4,4,4,3,3,3]`) |
-| Input | **12-bit IQ @ 14 Msps** | AD9361 delivers the working rate directly (no separate front-end decimator) |
-| Lane decimation (`decimation`) | **128** | channel rate = 14 MHz / 128 = 109375 sps |
-| Cleanup FIR | **63-tap complex, folded** | `design_cic_compensation(128, 3, 63, 0.15, 0.24)`, `out_shift=17`; inverts CIC droop and doubles as the channel-select filter, set to the full AM voice bandwidth (~±8 kHz at the 109375 sps channel rate: flat through ~6 kHz, −1.6 dB @8 kHz, −102 dB at the 25 kHz adjacent channel) |
+| Channels per lane (`chans_per_lane`) | **3** | → `ceil(21/3)` = **7 lanes** (`[3,3,3,3,3,3,3]`) |
+| Input | **12-bit IQ @ 16 Msps** | AD9361 delivers the working rate directly (no separate front-end decimator) |
+| Lane decimation (`decimation`) | **160** | channel rate = 16 MHz / 160 = 100000 sps |
+| Cleanup FIR | **63-tap complex, folded** | `design_cic_compensation(160, 3, 63, 0.164, 0.2625)`, `out_shift=17`; inverts CIC droop and doubles as the channel-select filter, set to the full AM voice bandwidth (~±8 kHz at the 100000 sps channel rate: flat through ~6 kHz, −1.1 dB @8 kHz, ~−95 dB at the 25 kHz adjacent channel) |
 | AM magnitude | **CORDIC vectoring**, 12 iterations | ripple-free `|I+jQ|`; no angle-dependent gain modulation (multiplier-free) |
 | DC block | one-pole high-pass, `dcblock_k=10` | strips the carrier-DC term left by the detector |
-| Audio decimation (`audio_decim`) | **5**, CIC order (`cic_stages`) **4** | audio rate = 109375 / 5 = **21875 sps** (order-4 CIC droop −1.3 dB @3.4 kHz, −4.2 dB @6 kHz) |
+| Audio decimation (`audio_decim`) | **5**, CIC order (`cic_stages`) **4** | audio rate = 100000 / 5 = **20000 sps** (order-4 CIC droop −1.6 dB @3.4 kHz, −5.1 dB @6 kHz) |
 | Audio sample width | **24-bit** signed | scaled to 16-bit on the host |
 | NCO width | 24-bit | per-channel tuning words written via a flat register interface |
 | PL clock | **62.5 MHz** (`sync`) | design is timing-closed at this rate |
@@ -193,13 +193,13 @@ End-to-end the HDL is verified **bit-exact** against Python reference models at
 each stage (see `hdl/README.md`).
 
 ### 4.3 Per-channel signal flow and sample rates
-A single 12-bit IQ stream at **14 Msps** (zero-IF, LO 123.438 MHz) is broadcast to
-all 6 lanes. Each channel's path:
+A single 12-bit IQ stream at **16 Msps** (zero-IF, LO 126.4 MHz) is broadcast to
+all 7 lanes. Each channel's path:
 
 ```
-14 Msps IQ ─► NCO complex mix ─► CIC ÷128 ─► 63-tap complex cleanup FIR ─►
-   (tune f-LO to DC)            109.375 ksps   (un-droop + selectivity)
-─► CORDIC |I+jQ| ─► one-pole DC block ─► CIC ÷5 (order 4) ─► 21.875 ksps audio
+16 Msps IQ ─► NCO complex mix ─► CIC ÷160 ─► 63-tap complex cleanup FIR ─►
+   (tune f-LO to DC)            100.000 ksps   (un-droop + selectivity)
+─► CORDIC |I+jQ| ─► one-pole DC block ─► CIC ÷5 (order 4) ─► 20.000 ksps audio
    (M=12, ×5/8 gain fix)  (strip carrier DC)                  (24-bit, signed)
 ```
 
@@ -207,7 +207,7 @@ all 6 lanes. Each channel's path:
   word is `round(((f − LO) / Fs) · 2^24)`, computed by `maia-httpd` and written per
   channel (see §6). `(f − LO)/Fs` must lie in `[−0.5, 0.5)` or the channel is
   rejected at startup.
-- **CIC ÷128 + cleanup FIR:** a multiplier-free CIC drops each channel to 109.375
+- **CIC ÷160 + cleanup FIR:** a multiplier-free CIC drops each channel to 100.000
   ksps; the 63-tap complex FIR (`design_cic_compensation`) flattens the CIC
   passband droop and supplies the sharp adjacent-channel selectivity the CIC's
   gentle roll-off cannot. Both are **folded** (one engine time-shared across a
@@ -219,7 +219,7 @@ all 6 lanes. Each channel's path:
   off-tuned carrier into ~−30 dBc demod spurs.
 - **DC block + audio CIC:** a one-pole leaky-integrator high-pass removes the
   carrier-amplitude DC term the detector leaves, then an order-4 CIC decimates ÷5
-  to **21875 sps** mono audio (`14e6 / 128 / 5`).
+  to **20000 sps** mono audio (`16e6 / 160 / 5`).
 
 The AM back-end is itself folded over all 21 channels (one datapath, per-channel
 DC/CIC state in BRAM); the magnitude is shared combinational logic.
@@ -235,20 +235,21 @@ is missing/unformatted/unmounted, `maia-httpd` falls back to a **deliberately
 minimal built-in default — a single channel (118.050 AWOS) at 0 dB gain** — so a
 faint, single AWOS channel is the obvious cue that the SD plan did not load. That
 fallback is the only place 118.050 AWOS appears: it is deliberately **excluded**
-from the operational plan (a continuous AWOS carrier we don't track), so the live
-plan is **20 channels**. The FPGA still frames **21 positional channels**
-(`N_CHANNELS`); the frame channel index = position in `channels_hz`, so with 20
-entries the trailing position is stale and the host reader runs `--channels 20`.
+from the operational plan (a continuous AWOS carrier we don't track). With 133.65
+MHz added (the 16 MHz capture), the live plan now fills all **21 channels**
+(`N_CHANNELS`); the frame channel index = position in `channels_hz`, so the host
+reader runs `--channels 21`.
 The SD config is the source of truth (persistence model in §8.1); the operational
 values below are what `firmware/airband.json` ships:
 
-- **LO / capture center:** 123.438 MHz.
-- **Sample rate:** 14 MHz — **fixed**; the channelizer's decimation/filters are
+- **LO / capture center:** 126.4 MHz.
+- **Sample rate:** 16 MHz — **fixed**; the channelizer's decimation/filters are
   baked into the bitstream for this rate. Changing it requires an HDL rebuild.
-- **Capture window:** center ± 7 MHz = 116.438–130.438 MHz. The 21 channels span
-  118.05–128.5 MHz; every channel sits inside the central ~80% of the band, clear
-  of the filter skirts. (Channel selection and the LO choice — placing the zero-IF
-  DC/LO-leakage spur in a guard gap — are derived in `hdl/capture_window.py`.)
+- **Capture window:** center ± 8 MHz = 118.4–134.4 MHz. The 21 channels span
+  119.2–133.65 MHz; every channel sits inside the central ~91% of the band (the
+  119.2 and 133.65 extremes at ~90.6%), clear of the filter skirts. (Channel
+  selection and the LO choice — placing the zero-IF DC/LO-leakage spur in a guard
+  gap — are derived in `hdl/capture_window.py`.)
 - **Gain:** one shared RX gain serves all 21 channels (no per-channel *RF* AGC;
   per-channel audio AGC is done on the host, §6.4); fixed **manual gain**, set by
   `gain_db` in the SD-card `airband.json` (the AD9361 AGC modes settle on wideband
@@ -286,7 +287,7 @@ independent synthesizers, so the TX is quieted without touching RX:
 - `out_altvoltage1_TX_LO_powerdown = 1` — power down the TX LO synth.
 - `out_voltage0_hardwaregain = -89.75` — TX attenuation floor (range `[-89.75 … 0]`).
 
-RX is unaffected (waterfall, per-channel meters, and the 123.438 MHz RX LO all
+RX is unaffected (waterfall, per-channel meters, and the 126.4 MHz RX LO all
 unchanged). An A/B on the raw `/waterfall` feed (median of 60 frames, 4096 bins)
 shows the in-band noise floor is identical with TX on vs off (~72.5 dB) — 2.45 GHz
 is far outside the 118–138 MHz window, so the TX never raised our *own* floor; the
@@ -308,7 +309,7 @@ carrier shows drift); a bare ADALM-Pluto's uncalibrated XO does. Correct it once
 unit via the u-boot env var **`ad936x_ext_refclk_override`**: the `adi_loadvals`
 boot script does
 `fdt set /clocks/clock@0 clock-frequency <value>`, so the AD9361 driver computes its
-PLL/decimation from the *true* reference and the nominal 123.438 MHz LO / 14 MHz Fs
+PLL/decimation from the *true* reference and the nominal 126.4 MHz LO / 16 MHz Fs
 are hit exactly (all 21 channels corrected together; the channelizer NCO math is
 unchanged). `/clocks/clock@0` is the `ad9364_ext_refclk` the transceiver runs on.
 
@@ -358,8 +359,8 @@ writing your own client — see `README.md` → "Audio output interface".)
 ### 6.1 Configuration (one-time, at start)
 On boot with `--airband`, `maia-httpd` reads `/mnt/sdcard/airband.json` from the
 SD card (or the built-in AWOS-only 0 dB fallback if no card is mounted) and:
-1. Sets the AD9361 **sampling frequency** (14 MHz), **RX RF bandwidth** (= Fs),
-   and **RX LO** (123.438 MHz).
+1. Sets the AD9361 **sampling frequency** (16 MHz), **RX RF bandwidth** (= Fs),
+   and **RX LO** (126.4 MHz).
 2. Sets the gain: `agc: "manual"` → manual gain mode + `gain_db` (12 dB default,
    tuned for an external LNA — clears ADC quantization, §5); otherwise the named AGC mode.
 3. Computes each channel's 24-bit NCO word `round(((f − LO)/Fs)·2^24)` and writes
@@ -521,7 +522,7 @@ noise reference** (the demod audio is ~0 until modulation rides up, so audio dBF
 not a useful weak-signal indicator). A **DeepFilterNet** neural enhancer (`D` key) runs
 on the played stream **by default** — the host band-pass/LPF/notch/spectral-denoise
 instead start off so DFN cleans up alone. The DFN3 model is embedded and run at its
-native 48 kHz via streaming resampling from 21875 sps, **after** the filter+AGC chain
+native 48 kHz via streaming resampling from 20000 sps, **after** the filter+AGC chain
 and **only while the squelch is open** (NN inference is expensive); it adds ~tens of
 ms of latency and complements the spectral denoiser. DFN is tuned for weak airband
 speech via `--dfn-min-snr` (−20 dB mute floor, keeps faint speech), `--dfn-atten-lim`
@@ -571,7 +572,7 @@ generated spur comb in the ADC samples** — *not* a DSP/HDL problem and *not* R
 arriving through the antenna. The decisive test (Pluto+, **50 Ω termination on the
 RX input, antenna disconnected**): the comb is **still present** — a dense,
 band-wide comb of discrete teeth (up to ~40 dB over the floor) across the whole
-14 MHz capture. It is therefore generated on the board (power/clock/oscillator
+16 MHz capture. It is therefore generated on the board (power/clock/oscillator
 harmonics coupling into the front end). The **120.000 MHz** tooth is the 40 MHz
 reference's 3rd harmonic, but it is just one line of the comb; a tooth inside a
 25 kHz channel cannot be removed by the per-channel NCO/CIC/FIR/AM chain.
@@ -582,10 +583,13 @@ hardware with no effect). The comb **is** amplified by the RX gain (a terminated
 input gain sweep: strongest tooth −28 dBFS @71 dB → −86 dBFS @15 dB; comb-to-floor
 ~36 dB @71 → ~17 dB @30), A 2026-06-24 test series (power, reference, Fs and LO
 shifts; see `firmware/diagnostics/README.md`) pins each wideband tooth: the
-**dominant (126.000 MHz) is the 9th harmonic of the 14 MHz ADC sample clock** (fixed
-absolute under LO shift; moves to other n·Fs under Fs shift), plus a **125 MHz
-Gigabit-Ethernet PHY clock** (Pluto+) and the **120 MHz reference 3rd harmonic** —
-all at fixed *absolute* frequencies, none on the switcher rail. Input power
+**dominant tooth is the ADC sample-clock harmonic** that lands in-band — measured at
+**126.000 MHz = 9 × 14 MHz** on the original 14 MHz build (fixed absolute under LO
+shift; moves to other n·Fs under Fs shift), and so **relocated to 128.000 MHz =
+8 × 16 MHz** on the deployed 16 MHz build, where it deliberately sits in a guard gap
+clear of every channel — plus a **125 MHz Gigabit-Ethernet PHY clock** (Pluto+) and
+the **120 MHz reference 3rd harmonic**, both fixed *absolute* (Fs-independent), none
+on the switcher rail. Input power
 (USB/battery/benchtop identical), enclosure shielding, an antenna band-pass, and a
 switcher↔bulk-cap bead do **not** help; the effective levers are a clean **external
 LNA + modest internal gain** (~12 dB default — the internal gain stage is the dominant

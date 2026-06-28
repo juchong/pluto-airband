@@ -2,8 +2,8 @@
 //! (`airband-listen`, `airband-reader`).
 //!
 //! DeepFilterNet (`deep_filter`'s `DfTract`) is a 48 kHz, hop-based neural noise
-//! suppressor. Our audio is 21875 sps, so this wraps the model with streaming
-//! linear resamplers (21875 -> 48000 in, 48000 -> 21875 out) and a small priming
+//! suppressor. Our audio is 20000 sps, so this wraps the model with streaming
+//! linear resamplers (20000 -> 48000 in, 48000 -> 20000 out) and a small priming
 //! buffer. The signal is already low-passed to <=2.5 kHz upstream, far below both
 //! Nyquists, so linear interpolation introduces no audible error.
 //!
@@ -297,8 +297,8 @@ mod tests {
         // resample/hop pipeline primes without inference errors. (Output values
         // are not asserted: DFN correctly suppresses synthetic non-speech toward
         // zero; real enhancement is validated on live RF.)
-        let mut e = DfnEnhancer::new(21875.0, DfnParams::default()).expect("DFN model should load");
-        for i in 0..21875 {
+        let mut e = DfnEnhancer::new(20000.0, DfnParams::default()).expect("DFN model should load");
+        for i in 0..20000 {
             let x = (i as f32 * 0.02).sin() * 0.1;
             let _ = e.process_sample(x);
         }
@@ -308,15 +308,15 @@ mod tests {
 
     #[test]
     fn resampler_matches_target_rate() {
-        // 21875 -> 48000 should emit ~ (48000/21875) outputs per input.
-        let mut r = LinResampler::new(21875.0, 48000.0);
+        // 20000 -> 48000 should emit ~ (48000/20000) outputs per input.
+        let mut r = LinResampler::new(20000.0, 48000.0);
         let mut out = Vec::new();
-        let n = 21875;
+        let n = 20000;
         for i in 0..n {
             let x = (i as f32 * 0.01).sin();
             r.push(x, &mut out);
         }
-        let expected = n as f64 * 48000.0 / 21875.0;
+        let expected = n as f64 * 48000.0 / 20000.0;
         let err = (out.len() as f64 - expected).abs();
         assert!(err < 4.0, "got {} expected ~{:.0}", out.len(), expected);
     }

@@ -26,28 +26,37 @@ import pathlib
 
 OUT_DIR = pathlib.Path(__file__).parent / "out"
 
-# Target channels (MHz) -- FINAL list (2026-06-13). 21 "need to have" core
-# channels plus one deferred far-out outlier (133.65, see below).
+# Target channels (MHz) -- the LIVE operational plan (firmware/airband.json) plus
+# 133.65, now admitted by widening the capture to 16 MHz. 21 channels total.
+# (118.050 S50 AWOS is the firmware no-SD fallback only and is NOT operational.)
 CORE_CHANNELS_MHZ = sorted([
-    118.050, 119.2, 119.9, 120.1, 120.4, 120.95, 121.5, 121.6, 121.7,
-    122.275, 122.95, 122.975, 123.9, 124.7, 125.6, 125.9, 126.25, 126.5,
-    126.875, 127.1, 128.5,
+    119.2, 119.9, 120.1, 120.4, 120.95, 121.5, 121.6, 121.7, 122.275, 122.95,
+    122.975, 123.9, 124.7, 125.6, 125.9, 126.25, 126.5, 126.875, 127.75, 126.95,
+    133.65,
 ])
-# Far outlier — "nice to have", not "need to have". Excluded from the core window;
-# supporting it is a separate, later decision (§8.2 note).
-OUTLIER_MHZ = [133.65]
+# 133.65 used to be a deferred outlier; it is now included (see DEPLOY_* below).
+OUTLIER_MHZ = []
 
-N_CORE = len(CORE_CHANNELS_MHZ)   # 21 need-to-have channels (final list)
+N_CORE = len(CORE_CHANNELS_MHZ)   # 21 operational channels (incl. 133.65)
 F_PL = 62.5e6                 # PL "sync" clock (handoff §4.2)
 
 # A channel must stay within this fraction of the half-band (|offset| < frac*W/2)
 # to avoid the anti-alias / decimation-filter roll-off near the capture edges.
+# 0.80 is the comfortable design target; the deployment relaxes to ~0.91 for the
+# single 133.65 outlier (see DEPLOY_* and the recommendation below).
 USABLE_FRACTION = 0.80
 # AM voice channel bandwidth (Hz) — the per-channel low-pass; the DC spur must be
 # at least this far from any channel after per-channel tuning.
 CHANNEL_BW_HZ = 25e3
 # AD936x complex sample-rate candidates (MHz) we'd actually request.
 FS_CANDIDATES_MHZ = [12.0, 12.288, 14.0, 15.36, 16.0, 20.0]
+
+# Deployed capture window (see plan "Widen capture to 16 MHz"). 16 MHz admits
+# 133.65 at ~91% of the half-band (mild AD9361 edge droop, AGC-compensated), keeps
+# the channelizer at 7 lanes (cpl=3), and lands the internal sample-clock spur comb
+# at the 8th harmonic = 128.000 MHz, clear of every channel.
+DEPLOY_CENTER_MHZ = 126.4
+DEPLOY_FS_MHZ = 16.0
 
 
 def gaps(channels_mhz):
@@ -129,28 +138,51 @@ def main():
         print(f"  {lo:.3f} .. {hi:.3f} MHz   (gap {w*1e3:.0f} kHz, "
               f"mid {0.5*(lo+hi):.4f} MHz)")
 
-    center, fs, lanes = _report("CORE list (recommended)", CORE_CHANNELS_MHZ)
-    _report("CORE + outlier 133.65 (nice-to-have, for comparison)",
-            CORE_CHANNELS_MHZ + OUTLIER_MHZ)
+    # The strict 80%-usable rule (for reference) on the full 21-channel list:
+    center, fs, lanes = _report(
+        f"Strict {USABLE_FRACTION:.0%}-usable auto-pick (reference)",
+        CORE_CHANNELS_MHZ)
+
+    # The DEPLOYED decision: a fixed 16 MHz at center 126.4, relaxing the usable
+    # fraction for the single 133.65 outlier.
+    ch = sorted(CORE_CHANNELS_MHZ)
+    half = DEPLOY_FS_MHZ / 2.0
+    max_off = max(abs(f - DEPLOY_CENTER_MHZ) for f in ch)
+    dc_clear_khz = min(abs(f - DEPLOY_CENTER_MHZ) for f in ch) * 1e3
+    dep_lanes = lanes_for(DEPLOY_FS_MHZ, len(ch))
+    print(f"\n=== DEPLOYED window (16 MHz, center 126.4) ===")
+    print(f"  channels            : {len(ch)}  ({ch[0]:.3f} .. {ch[-1]:.3f} MHz)")
+    print(f"  center (LO)         : {DEPLOY_CENTER_MHZ:.3f} MHz")
+    print(f"  Fs                  : {DEPLOY_FS_MHZ:.3f} MHz  (half-band +/-{half:.3f} MHz)")
+    print(f"  extreme channel off : +/-{max_off:.3f} MHz "
+          f"({100*max_off/half:.1f}% of half-band)")
+    print(f"  edge guard          : {half-max_off:.3f} MHz to each band edge")
+    print(f"  DC-to-nearest chan  : {dc_clear_khz:.0f} kHz "
+          f"(> {CHANNEL_BW_HZ/1e3:.0f} kHz channel BW: "
+          f"{'OK' if dc_clear_khz > CHANNEL_BW_HZ/1e3 else 'TOO CLOSE'})")
+    print(f"  time-mux lanes      : {dep_lanes}  (cpl=3 -> 7 lanes; <= the 8 the "
+          f"Z-7010 fits)")
 
     print("\n" + "=" * 70)
-    print("RECOMMENDATION (§8.2):")
-    print(f"  center (LO) = {center:.3f} MHz, Fs ~= {fs:.3f} MHz capture.")
-    print(f"  All {len(CORE_CHANNELS_MHZ)} core channels fall in the central "
-          f"{100*USABLE_FRACTION:.0f}% of the band with healthy edge guard; the DC "
-          f"spur sits in a channel gap. Costs {lanes} time-mux lanes (<= the 8 the "
-          f"Z-7010 fits).")
-    print("  The 133.65 MHz channel is excluded (it would push Fs to ~20 MHz and")
-    print("  shift the center up, spending lanes/edge-margin on one nice-to-have);")
-    print("  it can be added later as a separate decision without disturbing the core.")
+    print("RECOMMENDATION (deployed):")
+    print(f"  center (LO) = {DEPLOY_CENTER_MHZ:.3f} MHz, Fs = {DEPLOY_FS_MHZ:.3f} MHz.")
+    print(f"  All {len(ch)} channels (incl. 133.65) fit; both extremes sit at "
+          f"~{100*max_off/half:.0f}% of the half-band. The strict 80%-usable rule "
+          f"would request {fs:.0f} MHz, but 16 MHz keeps the channelizer at 7 lanes,")
+    print("  lands the sample-clock spur comb at 128.000 MHz (clear of channels), and")
+    print("  gives a round 20 kHz audio rate; 133.65 sees mild edge droop (AGC-comp).")
 
-    _save_plot(center, fs)
+    _save_plot(DEPLOY_CENTER_MHZ, DEPLOY_FS_MHZ)
 
 
 def _save_plot(center, fs):
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("\n(matplotlib not installed; skipping capture_window.png)")
+        return
 
     OUT_DIR.mkdir(exist_ok=True)
     half = fs / 2.0

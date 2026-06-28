@@ -37,7 +37,7 @@ from receiver_top import ReceiverTop
 from audio_framer import AudioFramer
 
 F_PL = 62.5e6          # PL sync clock (handoff §4.2)
-F_S = 14.0e6           # resolved capture rate (§8.2)
+F_S = 16.0e6           # resolved capture rate (§8.2: 16 MHz to admit 133.65 MHz)
 N = 21                 # core channels
 
 
@@ -69,7 +69,7 @@ def _print_table():
           f"{'duty_lane':>10} {'duty_fir':>9} {'duty_am':>8}  fit")
     best = None
     for cpl in (3, 4):
-        for lane_decim in (64, 128, 175, 256):
+        for lane_decim in (64, 128, 160, 175, 256):
             for ntaps in (63, 119):
                 d = duties(F_S, F_PL, N, cpl, lane_decim, ntaps)
                 fit = (d["duty_lane"] < 0.95 and d["duty_fir"] < 0.9
@@ -78,20 +78,21 @@ def _print_table():
                       f"{d['ch_rate']/1e3:>7.1f}k {d['duty_lane']:>10.2f} "
                       f"{d['duty_fir']:>9.2f} {d['duty_am']:>8.3f}  "
                       f"{'OK' if fit else 'no'}")
-                if fit and best is None and cpl == 4:
+                if fit and best is None and cpl == 3:
                     best = (cpl, lane_decim, ntaps)
     return best
 
 
-def _audio_decim_for(Fs, lane_decim, target_audio=16e3):
+def _audio_decim_for(Fs, lane_decim, target_audio=20e3):
     ch_rate = Fs / lane_decim
     return max(2, round(ch_rate / target_audio))
 
 
 def _stress(cpl=3, lane_decim=64, ntaps=63, audio_decim=4, n_channels=6,
             n_in=2600, seed=7):
-    """Drive ReceiverTop at the true cadence (gap = floor(Fpl/Fs)) and report
-    whether any stage overflows and whether the framed audio is bit-exact.
+    """Drive ReceiverTop at the true cadence (one input every Fpl/Fs sync cycles
+    on average, with the realistic gap=3/gap=4 jitter for a non-integer ratio) and
+    report whether any stage overflows and whether the framed audio is bit-exact.
 
     ``audio_decim`` is kept small here (independent of the 16 ksps deployment
     value) so a few audio samples appear within a short sim; the real-time
@@ -102,7 +103,13 @@ def _stress(cpl=3, lane_decim=64, ntaps=63, audio_decim=4, n_channels=6,
                       decimation=lane_decim, coeffs=coeffs, out_shift=out_shift,
                       audio_decim=audio_decim, cic_stages=3, dcblock_k=10,
                       in_width=12, nco_width=24, stages=3, audio_sample_w=24)
-    gap = int(F_PL // F_S)            # true inter-sample spacing in PL cycles
+    # True inter-sample spacing is Fpl/Fs sync cycles. For a non-integer ratio
+    # (e.g. 62.5/16 = 3.906) the CDC delivers a sample every 3 or 4 cycles so the
+    # AVERAGE is 3.906; a fixed integer floor (3) would feed ~30% too fast and
+    # falsely over-stress the lanes. Drive the realistic fractional cadence with a
+    # phase accumulator below; `gap` here is just the nominal average for display.
+    cyc_per_in = F_PL / F_S
+    gap = cyc_per_in
     rng = np.random.default_rng(seed)
     lim = 2 ** 11 - 1
     samples = rng.integers(-lim, lim, size=(n_in, 2)).astype(np.int64)
@@ -128,13 +135,17 @@ def _stress(cpl=3, lane_decim=64, ntaps=63, audio_decim=4, n_channels=6,
                 words.append(ctx.get(dut.stream_data))
             await ctx.tick()
 
+        acc = 0.0
         for (re, im) in samples:
             ctx.set(dut.re_in, int(re))
             ctx.set(dut.im_in, int(im))
             ctx.set(dut.in_valid, 1)
             await step()
             ctx.set(dut.in_valid, 0)
-            for _ in range(gap - 1):
+            acc += cyc_per_in - 1.0       # cycles owed before the next sample
+            idle = int(acc)
+            acc -= idle
+            for _ in range(idle):
                 await step()
         for _ in range(4000):
             await step()
@@ -171,35 +182,41 @@ def _stress(cpl=3, lane_decim=64, ntaps=63, audio_decim=4, n_channels=6,
 
 def main():
     best = _print_table()
-    print(f"\nRecommended deployment config (4 ch/lane fits with margin): "
+    print(f"\nRecommended deployment config (3 ch/lane fits at Fs=16 MHz): "
           f"chans_per_lane={best[0]}, lane_decim={best[1]}, cleanup ntaps={best[2]} "
           f"-> {math.ceil(N/best[0])} lanes; "
           f"audio_decim={_audio_decim_for(F_S, best[1])} gives "
           f"{F_S/best[1]/_audio_decim_for(F_S, best[1])/1e3:.1f} ksps audio.")
 
     print("\nStress test: drive ReceiverTop at the true cadence "
-          f"(one input every floor(Fpl/Fs)={int(F_PL//F_S)} cycles)...")
+          f"(one input every ~{F_PL/F_S:.2f} cycles on average, Fpl/Fs)...")
 
-    # (1) a budget-fitting config: must stay overflow-free AND bit-exact
+    # The stress configs use the DEPLOYMENT decimation (lane_decim=160), not a
+    # speed-shrunk one: at Fs=16 the fractional cadence has occasional gap=3 bursts
+    # (~1 in 10 samples), and a near-saturated FIR (e.g. lane_decim=64 -> duty_fir
+    # 0.83) cannot absorb them. The shipped lane_decim=160 (duty_fir 0.33) has ample
+    # margin and stays bit-exact.
+
+    # (1) a budget-fitting config (extra lane margin): overflow-free AND bit-exact.
     dut, gap, ad, no_ovf, bit_ok, nwords = _stress(
-        cpl=3, lane_decim=64, ntaps=63, audio_decim=4)
-    print(f"  [fits]   {dut.n_channels} ch / {dut.n_lanes} lanes, cpl=3, decim=64, "
-          f"63-tap, gap={gap} -> {nwords} records, overflow-free={no_ovf}, "
+        cpl=2, lane_decim=160, ntaps=63, audio_decim=5, n_channels=4, n_in=4000)
+    print(f"  [fits]   {dut.n_channels} ch / {dut.n_lanes} lanes, cpl=2, decim=160, "
+          f"63-tap, gap~{gap:.2f} -> {nwords} records, overflow-free={no_ovf}, "
           f"bit-exact+complete={bit_ok}")
     assert no_ovf, "FIFO overflow at real-time cadence: parameters do not fit"
     assert bit_ok, "framed audio not bit-exact/complete under real-time cadence"
 
-    # (1b) the DEPLOYMENT lane size (chans_per_lane=4) at the true cadence. This
-    #      is the config that ships; the pipelined lane must accept EVERY input
-    #      (no half-rate drop) and stay bit-exact. With the old ~busy gate this
-    #      case dropped every other sample (and would now fail bit-exact+complete).
+    # (1b) the DEPLOYMENT geometry (chans_per_lane=3, lane_decim=160) at the true
+    #      fractional cadence. This is the config that ships at Fs=16 MHz; the
+    #      pipelined lanes must accept EVERY input (no half-rate drop) and stay
+    #      bit-exact across the gap=3/gap=4 jitter.
     dut, gap, ad, no_ovf, bit_ok, nwords = _stress(
-        cpl=4, lane_decim=64, ntaps=63, audio_decim=4, n_channels=8)
-    print(f"  [deploy] {dut.n_channels} ch / {dut.n_lanes} lanes, cpl=4, decim=64, "
-          f"63-tap, gap={gap} -> {nwords} records, overflow-free={no_ovf}, "
+        cpl=3, lane_decim=160, ntaps=63, audio_decim=5, n_channels=8, n_in=4000)
+    print(f"  [deploy] {dut.n_channels} ch / {dut.n_lanes} lanes, cpl=3, decim=160, "
+          f"63-tap, gap~{gap:.2f} -> {nwords} records, overflow-free={no_ovf}, "
           f"bit-exact+complete={bit_ok}")
-    assert no_ovf, "FIFO overflow at real-time cadence (cpl=4): parameters do not fit"
-    assert bit_ok, "cpl=4 lane dropped inputs at the true cadence (half-rate bug)"
+    assert no_ovf, "FIFO overflow at real-time cadence (cpl=3): parameters do not fit"
+    assert bit_ok, "cpl=3 lane dropped inputs at the true cadence (half-rate bug)"
 
     # (2) negative control: an over-budget config (FIR too slow, duty>1) MUST
     #     trip the overflow detector -- proves the detector actually fires.
