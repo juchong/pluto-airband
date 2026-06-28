@@ -23,12 +23,14 @@ EnvironmentFile=/etc/airband-feeds.env
 # the airband-reader default; passed explicitly so the unit is self-documenting.
 # --squelch carrier: gate on the FPGA AM-carrier byte (cross-channel noise
 # reference) instead of voice-band VOX, so keyed transmissions open reliably.
-# --squelch-snr 8: dB above the cross-channel carrier-noise median. Measured idle
-# carrier ceiling on this 16 MHz / 18-ch build is ~6 dB.c (most channels <=1 dB.c),
-# so 8 sits just above the conducted-comb floor to catch weak transmissions. Raise
-# it a couple dB if the idle comb starts false-opening a channel (133.650/ch17 runs
-# the hottest idle baseline, ~6 dB.c).
-ExecStart=/home/pi/pluto-airband/host/target/release/airband-reader plutoplus.chongflix.tv:30000 --feeds /home/pi/pluto-airband/feeds.json --channels 18 --rate 20000 --squelch carrier --squelch-snr 8
+# --squelch-snr 13: dB above the cross-channel carrier-noise median. Measured on the
+# 16 MHz / 18-ch build: snr 8 false-opens heavily on the conducted comb (~139 opens
+# in 3 min, all peaks ~-120 dBFS = no audio; worst on ch17/133.650, whose carrier
+# baseline reaches ~8 dB.c when hot), while snr 12 was clean in a quiet-comb window.
+# 13 keeps margin over the comb's hot transients yet sits 2 dB below the prior 15 so
+# weak transmissions still open. Lower toward 11 for more sensitivity (watch for a
+# channel false-opening: tx climbing while peak stays ~-120); raise toward 15 if so.
+ExecStart=/home/pi/pluto-airband/host/target/release/airband-reader plutoplus.chongflix.tv:30000 --feeds /home/pi/pluto-airband/feeds.json --channels 18 --rate 20000 --squelch carrier --squelch-snr 13
 # airband-reader reconnects to the Pluto and to Icecast on its own, so this only
 # fires on a real crash. Wait between restarts so a wedged Pluto isn't hammered.
 Restart=always
