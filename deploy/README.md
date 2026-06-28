@@ -100,15 +100,15 @@ LiveATC?" without extra daemons:
   default 8000); *application running?* = the `:30000` stream is established;
   *data flowing?* = a sample arrived in the last few seconds. A dead stream while
   the web port still answers pinpoints a died airband task vs. a down board.
-- **Low-latency debug listen** (`--monitor-port 8081`): listen to one channel live,
+- **Low-latency debug listen** (`--monitor-port 8082`): listen to one channel live,
   in the same process as the feeder (no second Pluto connection, no Icecast lag):
 
   ```bash
   # pre  = raw demod (continuous, matches the waterfall); lowest latency
   ffplay -fflags nobuffer -flags low_delay -probesize 32 -analyzeduration 0 \
-    http://<pi>:8081/listen/3.wav?tap=pre
+    http://<pi>:8082/listen/3.wav?tap=pre
   # post = the enhanced, squelch-gated audio byte-identical to what LiveATC gets
-  ffplay -nodisp http://<pi>:8081/listen/3.wav?tap=post
+  ffplay -nodisp http://<pi>:8082/listen/3.wav?tap=post
   ```
 
   Change the channel by changing the URL — no restart. End-to-end latency is just

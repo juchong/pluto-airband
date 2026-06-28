@@ -44,12 +44,12 @@ EnvironmentFile=/etc/airband-feeds.env
 # channel false-opening: tx climbing while peak stays ~-120); raise toward 15 if so.
 # --metrics-port 9108: serves Prometheus /metrics, a /healthz liveness probe, and
 #   a /status JSON snapshot (Pluto reachability, link/data-flow, per-feed health).
-# --monitor-port 8081: low-latency raw-PCM debug-listen on
+# --monitor-port 8082: low-latency raw-PCM debug-listen on (8081 is taken by a
 #   GET /listen/<ch>.wav?tap=pre|post (no Icecast/MP3); coexists with the feeds.
 # --mqtt-* -> Home Assistant: broker/user/pass come from the EnvironmentFile. An
 #   empty ${AIRBAND_MQTT_BROKER} (var unset) disables MQTT in-reader, so this line
 #   is safe whether or not the broker is configured — no separate "MQTT off" variant.
-ExecStart=/home/pi/pluto-airband/host/target/release/airband-reader plutoplus.chongflix.tv:30000 --feeds /home/pi/pluto-airband/feeds.json --channels 18 --rate 20000 --squelch carrier --squelch-snr 13 --metrics-port 9108 --monitor-port 8081 --mqtt-broker ${AIRBAND_MQTT_BROKER} --mqtt-user ${AIRBAND_MQTT_USER} --mqtt-pass ${AIRBAND_MQTT_PASS}
+ExecStart=/home/pi/pluto-airband/host/target/release/airband-reader plutoplus.chongflix.tv:30000 --feeds /home/pi/pluto-airband/feeds.json --channels 18 --rate 20000 --squelch carrier --squelch-snr 13 --metrics-port 9108 --monitor-port 8082 --mqtt-broker ${AIRBAND_MQTT_BROKER} --mqtt-user ${AIRBAND_MQTT_USER} --mqtt-pass ${AIRBAND_MQTT_PASS}
 # airband-reader reconnects to the Pluto and to Icecast on its own, so this only
 # fires on a real crash. Wait between restarts so a wedged Pluto isn't hammered.
 Restart=always
