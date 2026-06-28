@@ -16,8 +16,10 @@ own host, channel count, and squelch preference.
 
 ## Prerequisites
 
-- A built `airband-reader` on the host (`cargo build --release -p airband-reader`;
-  `airband-listen` needs ALSA and is not built headless).
+- A built `airband-reader` on the host (`cargo build --release --manifest-path
+  host/Cargo.toml -p airband-reader` — the Cargo workspace is `host/`; there is no
+  root manifest, so a bare `cargo build` from the checkout root fails with "could
+  not find Cargo.toml". `airband-listen` needs ALSA and is not built headless).
 - A reachable Pluto+ streaming on `:30000` (see the main [`README.md`](../README.md)).
 - A `feeds.json` describing which channel feeds which Icecast mount (schema in the
   main README → *Stream to Icecast / LiveATC*). Keep passwords out of it — write
@@ -34,8 +36,14 @@ your host differs.
 git clone https://github.com/juchong/pluto-airband.git /home/pi/pluto-airband
 cd /home/pi/pluto-airband
 
-# Build only the streamer.
-cargo build --release -p airband-reader
+# Build only the streamer. The Cargo workspace is host/ (no root manifest). A clean
+# build pulls deep_filter + deps — tens of minutes on a Pi — so run it detached and
+# logged, then poll the log, rather than holding the session (a dropped SSH or a
+# command-timeout would otherwise strand it). cargo is NOT on a non-interactive SSH
+# PATH, so source its env first.
+nohup sh -c '. "$HOME/.cargo/env"; cargo build --release --manifest-path host/Cargo.toml -p airband-reader; echo "BUILD_EXIT=$?"' > /tmp/reader_build.log 2>&1 &
+until grep -q '^BUILD_EXIT=' /tmp/reader_build.log; do sleep 10; done   # wait for completion
+tail -3 /tmp/reader_build.log    # expect: "Finished `release`" then BUILD_EXIT=0
 
 # Supply the secrets that feeds.json references as ${AIRBAND_*}. The committed
 # feeds.json carries no passwords, so it is safe to commit and pull; the real
@@ -72,8 +80,17 @@ starves the compiler), then restart:
 ```bash
 cd /home/pi/pluto-airband
 git pull --ff-only
-sudo systemctl stop airband-feeds
-cargo build --release -p airband-reader
+# If the unit FILE changed (e.g. --channels/--rate), reinstall it first — git pull
+# only updates the repo copy, not the installed one under /etc/systemd/system:
+#   sudo cp deploy/airband-feeds.service /etc/systemd/system/ && sudo systemctl daemon-reload
+sudo systemctl stop airband-feeds      # free all cores for the build (no-op if already stopped)
+
+# Rebuild detached + logged, then poll the log (survives SSH drops / command-timeouts).
+# Workspace is host/ (no root manifest); cargo isn't on a non-interactive SSH PATH:
+nohup sh -c '. "$HOME/.cargo/env"; cargo build --release --manifest-path host/Cargo.toml -p airband-reader; echo "BUILD_EXIT=$?"' > /tmp/reader_build.log 2>&1 &
+until grep -q '^BUILD_EXIT=' /tmp/reader_build.log; do sleep 10; done
+tail -3 /tmp/reader_build.log          # expect: "Finished `release`" then BUILD_EXIT=0
+
 sudo systemctl start airband-feeds
 journalctl -u airband-feeds -n 30 --no-pager   # confirm "ready" + all mounts connect
 ```
