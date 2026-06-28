@@ -662,9 +662,42 @@ Consequences, both addressed by this design:
   (`/etc/airband-feeds.env`). The Pi runs a plain **git checkout built on-device**
   (never `rsync`); update with `git pull` + `cargo build --release -p
   airband-reader` + service restart (see README → *Run the feeder as a service*).
-  What remains is unattended hardening (per-feed supervision/alerting)
-  and field validation against a live LiveATC mount. NB: the Pluto serves a
-  **single client** on `:30000` — run exactly one reader per device.
+  NB: the Pluto serves a **single client** on `:30000` — run exactly one reader
+  per device.
+- **Reliability, observability & recovery (implemented; soak pending).** The
+  pipeline now defends "reliable audio reaches LiveATC" on its own:
+  - *Pi (airband-reader):* extended Prometheus `/metrics` plus `/healthz`
+    (200 only when the Pluto is reachable, the stream is up, samples flow, and
+    every feed is connected) and `/status` JSON. Three derived gauges answer the
+    operator's questions — `pluto_reachable` (periodic TCP probe of the Pluto web
+    port), `maia_httpd_up`/`airband_link_up` (the `:30000` stream is established),
+    `data_flowing` (recent sample) — rolling up into `system_healthy` and
+    `liveatc_healthy`. Curated metrics + those two headline tiles publish over
+    **MQTT** with Home Assistant auto-discovery and a Last-Will availability topic.
+    A **low-latency raw-PCM debug monitor** (`--monitor-port`,
+    `GET /listen/<ch>.wav?tap=pre|post`) streams one selectable channel in-process
+    (no Icecast/MP3, ~100–200 ms). The systemd unit is `Type=notify` with
+    `WatchdogSec` + `sd_notify`, `MemoryMax`/`OOMPolicy`, and an `OnFailure=` alert
+    hook (webhook/ntfy).
+  - *Pluto (maia-httpd):* the airband `reader_loop` has a **DMA-stall watchdog**
+    (fails if the FPGA write pointer freezes) and escalates sustained overflow; a
+    failed airband task now **restarts in-process with backoff** (app.rs) instead
+    of pending forever, keeping the web UI up; an optional `GET /api/health`
+    exposes internal DMA progress/overflow. The init script captures maia-httpd
+    logs to a bounded on-device ring (`patch_maia_logging.py`) and a **permanent
+    restart-safe supervisor** (`patch_maia_supervisor.py`, intentional-stop flag)
+    replaces the old bounded boot respawn.
+  What remains is the **fault-injection soak** (kill/stall/network/OOM) on
+  hardware to confirm each component auto-recovers with the failure visible in
+  logs/metrics and an alert fired, plus field validation against a live LiveATC
+  mount.
+- **Pluto memory headroom (built; flash + validate pending).** The unused IQ-
+  recorder DDR reserve is shrunk from ~384 MiB to 16 MiB
+  (`maia-hdl/config.py` + `apply_airband_devicetree.py`, kept in lockstep),
+  returning ~368 MiB to Linux (~96 MiB → ~464 MiB usable) to remove the OOM race
+  at its source while keeping a small functional recorder, the airband ring, and
+  the spectrometer. Requires a coordinated bitstream + DT rebuild flashed as a set
+  (BUILD.md); free-RAM + 0-drop soak validation is hardware work.
 - **Squelch/AGC:** implemented on the host (`airband-dsp`, §6.4). A coarse
   power-squelch could still move into the FPGA later to cut link bandwidth, but the
   host chain already gates audio and normalizes level.

@@ -1,0 +1,13 @@
+# One-shot alert fired by airband-feeds.service's OnFailure= when the feeder
+# crashes or trips its watchdog. Instantiated as airband-alert@airband-feeds.service
+# (the %i is the failed unit name). Sends a one-line notification to the webhook /
+# ntfy URL in $AIRBAND_ALERT_URL (set it in /etc/airband-feeds.env); if that is
+# unset it just logs to journald, so the hook is harmless when no alerting is set up.
+[Unit]
+Description=Alert that %i failed
+
+[Service]
+Type=oneshot
+# Reuse the feeder's secrets file (optional: '-' means don't fail if absent).
+EnvironmentFile=-/etc/airband-feeds.env
+ExecStart=/home/pi/pluto-airband/deploy/airband-alert.sh %i

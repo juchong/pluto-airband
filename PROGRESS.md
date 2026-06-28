@@ -1355,3 +1355,62 @@ Config/deploy only — no firmware or host-binary rebuild.
   24/7 soak and per-feed supervision.
 - **Optional:** add the deferred 133.65 MHz outlier (needs Fs≈20 MHz / 8 lanes /
   recentered LO — a separate window decision, `SPEC.md` §5).
+
+### Reliability, observability & recovery (implemented; hardware soak pending)
+
+End-to-end hardening so "reliable audio reaches LiveATC" is an invariant the
+system defends on its own (full design in `SPEC.md` §9).
+
+- **Pi `airband-reader`:**
+  - Metrics endpoint now also serves **`/healthz`** (200 only when the Pluto is
+    reachable, the stream is up, samples flow, and every feed is connected) and
+    **`/status`** (curated JSON), alongside extended Prometheus gauges:
+    `pluto_reachable`, `airband_link_up`, `data_flowing`,
+    `seconds_since_last_sample`, `system_healthy`, `liveatc_healthy`, and per-feed
+    `connected`/`reconnects`/`bytes`.
+  - **Pluto health derived Pi-side** (no Pluto agent): a periodic TCP probe of
+    the Pluto web port (`--pluto-web-port`) answers "connected?", the `:30000`
+    link state answers "app running?", recent samples answer "data flowing?".
+  - **MQTT → Home Assistant** (`--mqtt-*`): one retained JSON state topic + HA
+    discovery (auto entities, incl. the `system_healthy`/`liveatc_healthy` tiles)
+    + LWT availability. New dep: `rumqttc`.
+  - **Low-latency debug monitor** (`--monitor-port`): `GET /listen/<ch>.wav?tap=
+    pre|post` streams one channel as raw-PCM WAV in-process (no Icecast/MP3,
+    ~100–200 ms). `pre` = raw demod (continuous), `post` = enhanced gated audio.
+  - **systemd hardening** (`deploy/airband-feeds.service`): `Type=notify` +
+    `WatchdogSec` + `sd_notify` (a hung-but-alive reader is restarted),
+    `MemoryMax`/`OOMPolicy`, and `OnFailure=airband-alert@.service`
+    (webhook/ntfy via `$AIRBAND_ALERT_URL`). Docs in `deploy/README.md`.
+- **Pluto `maia-httpd`:**
+  - `airband::reader_loop` gained a **DMA-stall watchdog** (errors if the FPGA
+    write pointer freezes for >5 s) and **overflow escalation** (>15 s sustained
+    → error). On error the airband task now **restarts in-process with capped
+    backoff** (`app.rs`) instead of pending forever, so the data path self-heals
+    without killing the web UI/spectrometer.
+  - Optional **`GET /api/health`** exposes internal DMA progress/overflow.
+  - Init script captures maia-httpd stdout/stderr to a bounded on-device log ring
+    (`firmware/patch_maia_logging.py`, `RUST_LOG=info`), and a **permanent
+    restart-safe supervisor** (`firmware/patch_maia_supervisor.py`, intentional-
+    stop flag so it never fights `S60maia-httpd restart`) replaces the old bounded
+    ~90 s boot respawn (`patch_maia_respawn.py`, now superseded).
+- **Pluto memory headroom (built; flash + validate pending):** the unused IQ-
+  recorder DDR reserve is shrunk ~384 MiB → 16 MiB (`maia-hdl/config.py` +
+  `firmware/apply_airband_devicetree.py`, kept in lockstep), returning ~368 MiB to
+  Linux (~96 → ~464 MiB usable) while keeping a small functional recorder + the
+  airband ring + spectrometer. Recorder size is read from sysfs, so maia-httpd's
+  mmap stays consistent with no code change. Needs a coordinated bitstream + DT
+  rebuild flashed as a set (BUILD.md).
+- **Fault-injection soak procedure (to run on hardware):** with the feeder under
+  systemd and metrics/MQTT up, induce each fault and confirm auto-recovery +
+  visibility + alert:
+  1. `ssh root@<pluto> killall maia-httpd` → supervisor relaunches it; Pi shows
+     `airband_link_up` drop then recover; `/healthz` 503→200.
+  2. Pull the Pluto Ethernet/USB link → `pluto_reachable` 0, reader reconnect loop,
+     MQTT availability still online (Pi alive); restore → recovers.
+  3. `systemctl stop icecast` (or block LiveATC) → affected feed `connected` 0,
+     `liveatc_healthy` 0, reconnects climb; restore → recovers.
+  4. `systemctl kill -s SIGKILL airband-feeds` → `Restart=always` + `OnFailure`
+     alert fires; MQTT LWT flips availability `offline` then `online` on restart.
+  5. Stress memory toward `MemoryMax` → cgroup OOM-kills + restart (no host-wide
+     OOM). Each step should be visible in `journalctl -u airband-feeds`,
+     `/metrics`, and the HA dashboard.

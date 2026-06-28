@@ -184,19 +184,29 @@ if [ -f "$S60" ]; then
     python3 "$AIRBAND_REPO/firmware/patch_tx_quiet.py" "$S60"
 fi
 
-# 3d. Self-heal maia-httpd on a tight-memory boot. The kernel reserves ~416 MB of
-#     the 512 MB for the maia-sdr DMA regions, leaving userspace ~96 MB; maia-httpd's
-#     startup footprint sits near that edge, so a transient spike on the FIRST boot
-#     after a flash can let the OOM killer take it -- and `start-stop-daemon -b` never
-#     respawns, leaving web :8000 / audio :30000 dead until a manual restart. This
-#     injects a BOUNDED (~90 s) boot-time retry that relaunches it if it died, then
-#     exits (so it never fights the web-UI / lte_calibrate `S60maia-httpd restart`).
-#     Idempotent (airband-respawn marker). Software-only init-script change.
+# 3d. Capture maia-httpd's logs to a bounded on-device ring. maia-httpd logs via
+#     `tracing` to stdout, but `start-stop-daemon -b` on a journald-less ramfs Pluto
+#     discards that -- so a crash leaves nothing to inspect. This redirects the launch
+#     line's stdout/stderr into a size-capped file (SD card, else /tmp) and sets a
+#     sane RUST_LOG. MUST run before the supervisor patch (so the supervisor's verbatim
+#     relaunch inherits the redirect). Idempotent (airband-logcap marker).
 if [ -f "$S60" ]; then
-    python3 "$AIRBAND_REPO/firmware/patch_maia_respawn.py" "$S60"
+    python3 "$AIRBAND_REPO/firmware/patch_maia_logging.py" "$S60"
 fi
 
-# 3e. Persist the SSH host key + authorized_keys across power cycles. The rootfs
+# 3e. Permanent, restart-safe maia-httpd supervisor. The kernel reserves ~416 MB of
+#     the 512 MB for the maia-sdr DMA regions, leaving userspace ~96 MB, so an OOM (or
+#     a panic / the new DMA-stall exit) can take maia-httpd down at any time -- and
+#     `start-stop-daemon -b` never respawns, leaving web :8000 / audio :30000 dead.
+#     This installs a permanent supervisor that relaunches it whenever it dies, guarded
+#     by an intentional-stop flag so it never fights the web-UI / lte_calibrate
+#     `S60maia-httpd restart`. Replaces the old bounded ~90 s respawn (patch strips it).
+#     Idempotent (airband-supervisor marker). Software-only init-script change.
+if [ -f "$S60" ]; then
+    python3 "$AIRBAND_REPO/firmware/patch_maia_supervisor.py" "$S60"
+fi
+
+# 3f. Persist the SSH host key + authorized_keys across power cycles. The rootfs
 #     is ramfs, so dropbear's `-R` regenerates a NEW host key every boot (the
 #     fingerprint churns) and /root/.ssh is wiped. Patch the dropbear init to
 #     restore/generate them on the jffs2 NVM (/mnt/jffs2, mtd2; survives power

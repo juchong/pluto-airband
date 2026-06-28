@@ -7,7 +7,9 @@ tower site — under **systemd**, so it auto-starts on boot and restarts on cras
 | File | What |
 |---|---|
 | [`airband-feeds.service`](airband-feeds.service) | systemd unit that runs `airband-reader --feeds …`. **Edit it** for your host: the device address, checkout path, user, `--channels`, and squelch flags. |
-| [`airband-feeds.env.example`](airband-feeds.env.example) | template for the root-only env file that supplies the Icecast/LiveATC source passwords referenced as `${…}` in `feeds.json`. |
+| [`airband-feeds.env.example`](airband-feeds.env.example) | template for the root-only env file that supplies the Icecast/LiveATC source passwords referenced as `${…}` in `feeds.json` (plus optional MQTT/alert settings). |
+| [`airband-alert@.service`](airband-alert@.service) | one-shot unit the feeder's `OnFailure=` triggers on crash/watchdog timeout; runs `airband-alert.sh`. |
+| [`airband-alert.sh`](airband-alert.sh) | notification hook: POSTs a one-line message to `$AIRBAND_ALERT_URL` (webhook/ntfy), or logs only if that is unset. |
 
 The shipped `airband-feeds.service` is a **working example**, not a fixed
 recipe — its `User=`, `WorkingDirectory=`, `ExecStart=` device address, and
@@ -57,7 +59,8 @@ Install and start the service (edit `airband-feeds.service` first if your paths,
 user, device address, or channel count differ):
 
 ```bash
-sudo cp deploy/airband-feeds.service /etc/systemd/system/
+# Install the feeder unit and the OnFailure alert template together.
+sudo cp deploy/airband-feeds.service deploy/airband-alert@.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now airband-feeds.service
 systemctl status airband-feeds            # state
@@ -69,7 +72,77 @@ sudo systemctl stop airband-feeds         # graceful stop (SIGINT closes feeds)
 The unit sets `Restart=always` with `StartLimitIntervalSec=0` (never give up) and
 `KillSignal=SIGINT` so `stop` triggers the reader's graceful shutdown. Because the
 reader reconnects to both the Pluto and Icecast on its own, a restart only fires
-on an actual crash.
+on an actual crash or a watchdog timeout.
+
+It also runs as `Type=notify` with `WatchdogSec=30`: the reader signals readiness
+once its DeepFilterNet models are loaded and pings the watchdog from its live read
+loop, so a process that is *alive but no longer moving data* (a hang) is restarted,
+not just one that exits. `MemoryMax=1500M`/`OOMPolicy=kill` cap a runaway leak (well
+above normal RSS), and `OnFailure=` fires the alert hook below.
+
+## Monitoring, health & debugging
+
+The reader exposes everything needed to answer "is reliable audio reaching
+LiveATC?" without extra daemons:
+
+- **Prometheus + health probes** (`--metrics-port 9108`, in the example `ExecStart`):
+  - `http://<pi>:9108/metrics` — per-channel and per-feed counters/gauges, plus the
+    pipeline-health gauges `airband_pluto_reachable`, `airband_link_up`,
+    `airband_data_flowing`, `airband_seconds_since_last_sample`,
+    `airband_system_healthy`, and `airband_liveatc_healthy`.
+  - `http://<pi>:9108/healthz` — returns **200** only when the Pluto is reachable,
+    the stream is up, samples are flowing, and every feed is connected; **503**
+    otherwise. Use it for an uptime check.
+  - `http://<pi>:9108/status` — the curated JSON snapshot (same data the MQTT
+    publisher sends).
+- **The three Pluto questions** are derived purely Pi-side (no Pluto agent):
+  *connected?* = a periodic TCP probe of the Pluto web port (`--pluto-web-port`,
+  default 8000); *application running?* = the `:30000` stream is established;
+  *data flowing?* = a sample arrived in the last few seconds. A dead stream while
+  the web port still answers pinpoints a died airband task vs. a down board.
+- **Low-latency debug listen** (`--monitor-port 8081`): listen to one channel live,
+  in the same process as the feeder (no second Pluto connection, no Icecast lag):
+
+  ```bash
+  # pre  = raw demod (continuous, matches the waterfall); lowest latency
+  ffplay -fflags nobuffer -flags low_delay -probesize 32 -analyzeduration 0 \
+    http://<pi>:8081/listen/3.wav?tap=pre
+  # post = the enhanced, squelch-gated audio byte-identical to what LiveATC gets
+  ffplay -nodisp http://<pi>:8081/listen/3.wav?tap=post
+  ```
+
+  Change the channel by changing the URL — no restart. End-to-end latency is just
+  the client's buffer (~100–200 ms), versus 30–60 s through Icecast.
+
+### MQTT → Home Assistant
+
+`ExecStart` already passes `--mqtt-broker/--mqtt-user/--mqtt-pass` from the
+`AIRBAND_MQTT_*` vars in `/etc/airband-feeds.env`; just fill them in:
+
+```
+AIRBAND_MQTT_BROKER=10.0.16.9
+AIRBAND_MQTT_USER=plutoplus
+AIRBAND_MQTT_PASS=…
+```
+
+Leave `AIRBAND_MQTT_BROKER` empty to disable MQTT — the reader treats an empty
+broker as "off", so the same unit works with or without a broker.
+
+The reader publishes a retained JSON state topic (`pluto-airband/state`) and Home
+Assistant **MQTT discovery** configs once per connect, so the entities — including
+the two headline tiles **Capture healthy** (`system_healthy`) and **LiveATC
+healthy** (`liveatc_healthy`) — auto-appear in HA with no manual YAML. A Last Will
+flips `pluto-airband/availability` to `offline` the instant the feeder dies, so the
+whole dashboard greys out on a crash or Pi outage. Add `--mqtt-per-channel` for the
+(noisier) per-channel open/carrier entities.
+
+### Failure alerting
+
+`airband-feeds.service` declares `OnFailure=airband-alert@%n.service`. Install the
+template (done above) and set `AIRBAND_ALERT_URL` in `/etc/airband-feeds.env` to a
+webhook or ntfy topic; the hook POSTs a one-line message on any crash or watchdog
+timeout. Left unset, it logs to the alert unit's journal only. Test it with
+`systemctl start airband-alert@test.service`.
 
 ## Updating a deployment
 
@@ -80,9 +153,9 @@ starves the compiler), then restart:
 ```bash
 cd /home/pi/pluto-airband
 git pull --ff-only
-# If the unit FILE changed (e.g. --channels/--rate), reinstall it first — git pull
-# only updates the repo copy, not the installed one under /etc/systemd/system:
-#   sudo cp deploy/airband-feeds.service /etc/systemd/system/ && sudo systemctl daemon-reload
+# If a unit FILE changed (e.g. --channels/--rate, or the alert template), reinstall
+# it first — git pull only updates the repo copy, not the one under /etc/systemd/system:
+#   sudo cp deploy/airband-feeds.service deploy/airband-alert@.service /etc/systemd/system/ && sudo systemctl daemon-reload
 sudo systemctl stop airband-feeds      # free all cores for the build (no-op if already stopped)
 
 # Rebuild detached + logged, then poll the log (survives SSH drops / command-timeouts).

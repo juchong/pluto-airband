@@ -8,11 +8,13 @@
 //!
 //! Defaults (16 kbps mono, 22050 Hz) match LiveATC's feed requirements.
 
+use crate::metrics::FeedMetric;
 use mp3lame_encoder::{Bitrate, Builder, MonoPcm, Mode, Quality};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender};
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -324,8 +326,9 @@ fn connect(cfg: &IcecastConfig) -> std::io::Result<Conn> {
 const ENCODE_CHUNK: usize = 4096;
 
 /// Runs the encode/stream loop against a single connection until it errors.
-fn stream_once(cfg: &IcecastConfig, rx: &Receiver<i16>) -> std::io::Result<()> {
+fn stream_once(cfg: &IcecastConfig, rx: &Receiver<i16>, metric: &FeedMetric) -> std::io::Result<()> {
     let mut sock = connect(cfg)?;
+    metric.set_connected(true);
     eprintln!(
         "icecast: connected to {}:{}{} (ch {}, {} kbps, {} Hz)",
         cfg.host, cfg.port, cfg.mount, cfg.channel, cfg.bitrate, cfg.out_rate
@@ -363,6 +366,7 @@ fn stream_once(cfg: &IcecastConfig, rx: &Receiver<i16>) -> std::io::Result<()> {
             pcm.clear();
             if !mp3.is_empty() {
                 sock.write_all(&mp3)?;
+                metric.add_bytes(mp3.len() as u64);
             }
         }
     }
@@ -372,17 +376,26 @@ fn stream_once(cfg: &IcecastConfig, rx: &Receiver<i16>) -> std::io::Result<()> {
 ///
 /// The processing loop pushes one `i16` per channel sample with `try_send`;
 /// when the worker is disconnected or behind, samples are dropped rather than
-/// blocking the demux loop.
-pub fn spawn(cfg: IcecastConfig) -> SyncSender<i16> {
+/// blocking the demux loop. `metric` is updated with the feed's connection
+/// state, reconnect count, and bytes shipped (see [`FeedMetric`]).
+pub fn spawn(cfg: IcecastConfig, metric: Arc<FeedMetric>) -> SyncSender<i16> {
     // ~1 s of audio of slack before back-pressure drops samples.
     let (tx, rx) = mpsc::sync_channel::<i16>(cfg.in_rate as usize);
-    thread::spawn(move || loop {
-        if let Err(e) = stream_once(&cfg, &rx) {
-            eprintln!("icecast: stream error ({e}); reconnecting in 2s");
+    thread::spawn(move || {
+        let mut first = true;
+        loop {
+            if !first {
+                metric.note_reconnect();
+            }
+            first = false;
+            if let Err(e) = stream_once(&cfg, &rx, &metric) {
+                eprintln!("icecast: feed {} stream error ({e}); reconnecting in 2s", cfg.mount);
+            }
+            metric.set_connected(false);
+            // Drain stale samples queued during the outage so we resume near-live.
+            while rx.try_recv().is_ok() {}
+            thread::sleep(Duration::from_secs(2));
         }
-        // Drain stale samples queued during the outage so we resume near-live.
-        while rx.try_recv().is_ok() {}
-        thread::sleep(Duration::from_secs(2));
     });
     tx
 }

@@ -35,6 +35,8 @@
 mod feeds;
 mod icecast;
 mod metrics;
+mod monitor;
+mod mqtt;
 
 use airband_dfn::{DfnEnhancer, DfnParams, InferencePermit, Presence};
 use airband_dsp::{
@@ -52,20 +54,24 @@ const CARRIER_UPDATE_FRAMES: u64 = 8192;
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use icecast::{IcecastConfig, TlsMode};
-use metrics::Metrics;
+use metrics::{FeedMetric, Metrics};
 use std::{
     fs::{self, File},
     io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write},
-    net::{TcpStream, UdpSocket},
+    net::{TcpStream, ToSocketAddrs, UdpSocket},
     path::PathBuf,
     sync::{
         atomic::{AtomicU32, Ordering},
-        mpsc::{self, Receiver, Sender, SyncSender},
+        mpsc::{self, Receiver, Sender, SyncSender, TrySendError},
         Arc, Barrier, Condvar, Mutex,
     },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+
+/// Makeup gain applied to the raw demod sample on the `tap=pre` monitor so the
+/// (typically quiet) airband audio is audible. Debug path only; never shipped.
+const MONITOR_PRE_GAIN: f64 = 8.0;
 
 const FRAME_BYTES: usize = 8;
 const AUDIO_FIELD: u32 = 24;
@@ -170,9 +176,42 @@ struct Args {
     /// Statistics print interval in seconds
     #[arg(long, default_value_t = 5)]
     stats_interval: u64,
-    /// Serve Prometheus metrics on this TCP port (0 = disabled).
+    /// Serve Prometheus /metrics, /healthz, and /status on this TCP port (0 = disabled).
     #[arg(long, default_value_t = 0)]
     metrics_port: u16,
+    /// Pluto web port to probe for reachability ("is the Pluto connected?"). The
+    /// host is taken from the stream address; this is the maia-httpd web port.
+    #[arg(long, default_value_t = 8000)]
+    pluto_web_port: u16,
+    /// Low-latency debug-listen port (0 = disabled). Serves raw-PCM WAV at
+    /// GET /listen/<ch>.wav?tap=pre|post (no Icecast/MP3). Coexists with feeds.
+    #[arg(long, default_value_t = 0)]
+    monitor_port: u16,
+    /// MQTT broker host for Home Assistant publishing (unset = MQTT disabled).
+    #[arg(long)]
+    mqtt_broker: Option<String>,
+    /// MQTT broker port.
+    #[arg(long, default_value_t = 1883)]
+    mqtt_port: u16,
+    /// MQTT username (optional; use ${ENV} via the systemd EnvironmentFile).
+    #[arg(long)]
+    mqtt_user: Option<String>,
+    /// MQTT password (optional; use ${ENV} via the systemd EnvironmentFile).
+    #[arg(long)]
+    mqtt_pass: Option<String>,
+    /// MQTT base topic prefix and Home Assistant node id.
+    #[arg(long, default_value = "pluto-airband")]
+    mqtt_prefix: String,
+    /// Home Assistant MQTT discovery prefix.
+    #[arg(long, default_value = "homeassistant")]
+    mqtt_discovery_prefix: String,
+    /// Seconds between MQTT state publishes.
+    #[arg(long, default_value_t = 5)]
+    mqtt_interval: u64,
+    /// Also publish per-channel open/carrier entities over MQTT (noisy: many
+    /// channels x several entities). Off by default.
+    #[arg(long)]
+    mqtt_per_channel: bool,
     /// Stream this channel's processed PCM over UDP (needs --udp-dest).
     #[arg(long)]
     udp_channel: Option<usize>,
@@ -497,13 +536,85 @@ impl InferencePermit for Semaphore {
     }
 }
 
-/// A message from the router thread to a per-channel worker.
+/// Debug-monitor tap point for the [`monitor`] HTTP endpoint.
+#[derive(Copy, Clone, Debug)]
+pub enum Tap {
+    /// Raw demod audio (pre-DSP, pre-squelch): continuous, lowest latency, hears
+    /// exactly what the receiver hears regardless of squelch/filters.
+    Pre,
+    /// Fully-enhanced post-DFN/presence audio: squelch-gated, byte-identical to
+    /// what the feeds ship.
+    Post,
+}
+
+/// A message from the router thread (or the monitor server) to a per-channel
+/// worker.
 enum Msg {
     /// One demultiplexed audio record: (sample, FPGA carrier byte).
     Sample(i32, u8),
     /// Stream reset (reconnect/shutdown): finalize any open recording and clear
     /// streaming DSP state so the next transmission starts clean.
     Reset,
+    /// Register a runtime debug-monitor sink (added by [`monitor`] on a new
+    /// listen request; pruned automatically when the client disconnects).
+    AddMonitor { tap: Tap, tx: SyncSender<i16> },
+}
+
+/// Fans one PCM sample out to a set of runtime monitor sinks, dropping the
+/// sample under back-pressure (slow client) and pruning a sink only when its
+/// receiver has hung up (client disconnected).
+fn fanout_monitors(sinks: &mut Vec<SyncSender<i16>>, s: i16) {
+    sinks.retain(|tx| !matches!(tx.try_send(s), Err(TrySendError::Disconnected(_))));
+}
+
+/// Sends a state line to systemd's notify socket if running under `Type=notify`
+/// (no-op otherwise). Used for readiness and the `WATCHDOG=1` keep-alive.
+#[cfg(unix)]
+fn sd_notify(state: &str) {
+    use std::os::unix::net::UnixDatagram;
+    let Ok(path) = std::env::var("NOTIFY_SOCKET") else {
+        return;
+    };
+    let Ok(sock) = UnixDatagram::unbound() else {
+        return;
+    };
+    // Abstract-namespace sockets ('@'-prefixed) aren't addressable via the std
+    // path API; services use a filesystem path socket, which is all we need.
+    if !path.starts_with('@') {
+        let _ = sock.send_to(state.as_bytes(), &path);
+    }
+}
+
+#[cfg(not(unix))]
+fn sd_notify(_state: &str) {}
+
+/// Spawns the Pluto reachability probe: a periodic lightweight TCP connect to
+/// the maia-httpd web port (the host is taken from the stream address). Sets the
+/// `pluto_reachable` gauge and logs transitions. This deliberately does NOT open
+/// a second `:30000` connection (that port is single-client).
+fn spawn_pluto_probe(metrics: Arc<Metrics>, addr: &str, web_port: u16) {
+    let host = addr
+        .rsplit_once(':')
+        .map(|(h, _)| h.to_string())
+        .unwrap_or_else(|| addr.to_string());
+    let target = format!("{host}:{web_port}");
+    thread::spawn(move || {
+        let mut prev: Option<bool> = None;
+        loop {
+            let ok = target
+                .to_socket_addrs()
+                .ok()
+                .and_then(|mut a| a.next())
+                .map(|sa| TcpStream::connect_timeout(&sa, Duration::from_secs(2)).is_ok())
+                .unwrap_or(false);
+            metrics.set_pluto_reachable(ok);
+            if prev != Some(ok) {
+                eprintln!("pluto: reachable={ok} ({target})");
+                prev = Some(ok);
+            }
+            thread::sleep(Duration::from_secs(5));
+        }
+    });
 }
 
 /// Per-channel processing worker. Owns the channel's squelch, full audio chain
@@ -536,6 +647,11 @@ struct Worker {
     udp: Option<UdpOut>,
     /// Icecast feeds for this channel (fan-out: one sender per destination).
     icecast: Vec<SyncSender<i16>>,
+    /// Runtime debug-monitor sinks: `pre` taps the raw demod (continuous),
+    /// `post` taps the enhanced gated audio. Added via [`Msg::AddMonitor`] and
+    /// pruned when their client disconnects.
+    pre_monitors: Vec<SyncSender<i16>>,
+    post_monitors: Vec<SyncSender<i16>>,
     since_checkpoint: u64,
 }
 
@@ -573,13 +689,23 @@ impl Worker {
             recorder,
             udp,
             icecast,
+            pre_monitors: Vec::new(),
+            post_monitors: Vec::new(),
             since_checkpoint: 0,
         }
     }
 
-    /// True when some consumer needs the processed audio for this sample.
+    /// True when a statically-configured consumer needs the processed audio
+    /// (gates DFN model load at startup). Runtime monitors are handled
+    /// separately in [`Self::on_sample`].
     fn needs_audio(&self) -> bool {
         self.recorder.is_some() || self.udp.is_some() || !self.icecast.is_empty()
+    }
+
+    /// True when the fully-enhanced (post-DFN) sample must be computed this
+    /// sample: any static sink or an attached `post` monitor.
+    fn needs_post(&self) -> bool {
+        self.needs_audio() || !self.post_monitors.is_empty()
     }
 
     /// Runs one sample through the gated audio chain (filters -> denoise -> AGC),
@@ -742,7 +868,19 @@ impl Worker {
             self.squelch.is_open(),
         );
 
-        if !self.needs_audio() {
+        // Continuous raw-demod tap (pre-DSP, pre-squelch) for the debug monitor:
+        // cheap fixed-gain scale, always streamed so it matches the waterfall
+        // regardless of squelch. Computed only when a `pre` client is attached.
+        if !self.pre_monitors.is_empty() {
+            let pre = ((sample as f64 / SAMPLE_SCALE as f64) * 32767.0 * MONITOR_PRE_GAIN)
+                .round()
+                .clamp(i16::MIN as f64, i16::MAX as f64) as i16;
+            fanout_monitors(&mut self.pre_monitors, pre);
+        }
+
+        // Skip the (expensive) enhancement chain entirely when nothing needs the
+        // post-DFN audio this sample.
+        if !self.needs_post() {
             return Ok(());
         }
 
@@ -768,6 +906,8 @@ impl Worker {
             // path itself never drops or bypasses.
             let _ = tx.try_send(pcm);
         }
+        // Post-DFN debug-monitor tap (byte-identical to what feeds ship).
+        fanout_monitors(&mut self.post_monitors, pcm);
         self.record(pcm, gated, just_opened, just_closed, cfg)
     }
 
@@ -819,6 +959,10 @@ impl Worker {
                     }
                 }
                 Msg::Reset => self.reset(&cfg),
+                Msg::AddMonitor { tap, tx } => match tap {
+                    Tap::Pre => self.pre_monitors.push(tx),
+                    Tap::Post => self.post_monitors.push(tx),
+                },
             }
         }
         if let Some(r) = self.recorder.as_mut() {
@@ -911,6 +1055,7 @@ fn run_session(
     let stream = TcpStream::connect(addr).with_context(|| format!("connecting to {addr}"))?;
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     eprintln!("connected to {addr}");
+    metrics.set_stream_up(true);
     let mut reader = BufReader::with_capacity(1 << 16, stream);
     let mut frame = [0u8; FRAME_BYTES];
 
@@ -922,6 +1067,7 @@ fn run_session(
     let mut last_carrier = vec![0f32; n];
     let mut last_seq = vec![Option::<u32>::None; n];
     let mut since_carrier_update: u64 = 0;
+    let mut since_active: u64 = 0;
 
     loop {
         reader.read_exact(&mut frame)?;
@@ -940,6 +1086,13 @@ fn run_session(
         }
         last_seq[ci] = Some(seq);
         metrics.channels[ci].note_sample(sample.unsigned_abs() as f32);
+        // Refresh the "data flowing" timestamp periodically (cheap; the stream
+        // carries ~360k samples/s so a coarse update is ample resolution).
+        since_active += 1;
+        if since_active >= 256 {
+            metrics.note_active();
+            since_active = 0;
+        }
 
         // Always track the per-channel FPGA carrier and periodically recompute the
         // cross-channel noise reference, so the stats meter can show carrier-over-
@@ -965,6 +1118,9 @@ fn run_session(
 
         if stats.due() {
             stats.emit(metrics);
+            // Pet the systemd watchdog from the live read loop, so a hung-but-
+            // alive reader (no data progressing) is restarted (no-op off-systemd).
+            sd_notify("WATCHDOG=1");
         }
     }
 }
@@ -1060,7 +1216,18 @@ fn main() -> Result<()> {
             channel: ch,
         });
     }
-    for icfg in feed_cfgs {
+    // One health cell per feed (same order as the configs), shared with both the
+    // metrics bus and each feed's streaming thread.
+    let feed_metrics: Vec<Arc<FeedMetric>> = feed_cfgs
+        .iter()
+        .map(|c| FeedMetric::new(c.channel, c.mount.clone()))
+        .collect();
+
+    // Shared cross-thread state: stats/metrics bus (incl. per-feed health), DFN
+    // concurrency semaphore, and the carrier-mode noise threshold.
+    let metrics = Metrics::new(n, feed_metrics.clone());
+
+    for (icfg, fm) in feed_cfgs.into_iter().zip(feed_metrics) {
         let ch = icfg.channel;
         anyhow::ensure!(ch < n, "icecast feed channel {ch} out of range");
         let scheme = if icfg.tls == TlsMode::Disabled { "icecast" } else { "icecast+tls" };
@@ -1068,14 +1235,38 @@ fn main() -> Result<()> {
             "icecast: feed ch{ch} -> {scheme}://{}:{}{}",
             icfg.host, icfg.port, icfg.mount
         );
-        icecast_sinks[ch].push(icecast::spawn(icfg));
+        icecast_sinks[ch].push(icecast::spawn(icfg, fm));
     }
 
-    // Shared cross-thread state: stats/metrics bus, DFN concurrency semaphore,
-    // and the carrier-mode noise threshold.
-    let metrics = Metrics::new(n);
     if args.metrics_port > 0 {
         metrics::serve(Arc::clone(&metrics), args.metrics_port);
+    }
+
+    // "Is the Pluto connected?" — periodic lightweight TCP probe of the maia-httpd
+    // web port (NOT a second :30000 connection; that port is single-client). The
+    // stream-up gauge answers "is the application serving?" and the data-flow
+    // gauge answers "is data flowing?".
+    spawn_pluto_probe(Arc::clone(&metrics), &args.addr, args.pluto_web_port);
+
+    // MQTT -> Home Assistant (optional). Reuses the metrics snapshot. An empty
+    // broker (e.g. an unset `${AIRBAND_MQTT_BROKER}` expanded by systemd) means
+    // "disabled", so the env-var ExecStart pattern is safe when MQTT is unused.
+    if let Some(broker) = args.mqtt_broker.clone().filter(|b| !b.is_empty()) {
+        eprintln!("mqtt: publishing to {broker}:{} (prefix {})", args.mqtt_port, args.mqtt_prefix);
+        mqtt::spawn(
+            Arc::clone(&metrics),
+            mqtt::MqttConfig {
+                broker,
+                port: args.mqtt_port,
+                user: args.mqtt_user.clone().filter(|s| !s.is_empty()),
+                pass: args.mqtt_pass.clone().filter(|s| !s.is_empty()),
+                prefix: args.mqtt_prefix.clone(),
+                discovery_prefix: args.mqtt_discovery_prefix.clone(),
+                interval: Duration::from_secs(args.mqtt_interval.max(1)),
+                per_channel: args.mqtt_per_channel,
+                n_channels: n,
+            },
+        );
     }
     let sem = Arc::new(Semaphore::new(cfg.dfn_max_active));
     let carrier_thr = Arc::new(AtomicU32::new(0));
@@ -1115,16 +1306,29 @@ fn main() -> Result<()> {
     barrier.wait();
     eprintln!("ready");
 
+    // Low-latency debug monitor: registers runtime sinks into the workers via
+    // their existing senders (clone so the router keeps its own borrow).
+    if args.monitor_port > 0 {
+        monitor::serve(args.monitor_port, senders.clone(), cfg.rate);
+    }
+
+    // Signal readiness for systemd Type=notify (no-op otherwise).
+    sd_notify("READY=1");
+
     let mut stats = StatsPrinter::new(args.stats_interval, n, cfg.mode);
     loop {
         if let Err(e) =
             run_session(&args.addr, n, &cfg, &senders, &metrics, &carrier_thr, &mut stats)
         {
+            metrics.set_stream_up(false);
             eprintln!("stream error ({e:#}); reconnecting in 1s");
             // Reconnect: tell workers to finalize recordings and clear state.
             for s in &senders {
                 let _ = s.send(Msg::Reset);
             }
+            // Keep the watchdog satisfied across a Pluto/network outage so a
+            // reconnecting (but healthy) reader is not killed by WatchdogSec.
+            sd_notify("WATCHDOG=1");
             thread::sleep(Duration::from_secs(1));
         }
     }

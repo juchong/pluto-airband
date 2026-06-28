@@ -312,9 +312,32 @@ $BIN 192.168.2.1:30000 --feeds feeds.json
 # UDP s16le PCM of one channel to another host
 $BIN 192.168.2.1:30000 --udp-channel 0 --udp-dest 10.0.0.5:7355
 
-# Prometheus metrics (per-channel samples/drops/transmissions/level/floor/carrier-dBc/open)
-$BIN 192.168.2.1:30000 --metrics-port 9100   # scrape http://host:9100/metrics
+# Prometheus metrics + health/status (per-channel samples/drops/transmissions/level/
+# floor/carrier-dBc/open, plus pipeline-health gauges and per-feed connect/bytes).
+$BIN 192.168.2.1:30000 --metrics-port 9100   # /metrics /healthz /status on :9100
+
+# Low-latency debug listen on one channel (raw PCM/WAV; no Icecast, ~100-200 ms lag).
+# Channel is per-request; tap=pre is raw demod (continuous), tap=post is the gated
+# enhanced audio LiveATC gets. Coexists with --feeds (no second Pluto connection).
+$BIN 192.168.2.1:30000 --feeds feeds.json --monitor-port 8081
+ffplay -fflags nobuffer -flags low_delay -probesize 32 -analyzeduration 0 \
+  http://host:8081/listen/3.wav?tap=pre
+
+# Publish curated health/metrics to MQTT for a Home Assistant dashboard (auto-
+# discovered entities + availability via Last Will). See deploy/README.md.
+$BIN 192.168.2.1:30000 --feeds feeds.json --mqtt-broker homeassistant.local
 ```
+
+**Health at a glance.** `/healthz` returns 200 only when the Pluto is reachable,
+the `:30000` stream is up, samples are flowing, and every feed is connected (503
+otherwise). The same signals answer the three questions directly — *is the Pluto
+connected?* (a periodic TCP probe of the Pluto web port), *is the application
+running?* (the stream is established), *is data flowing?* (a recent sample) — and
+roll up into two headline booleans, `system_healthy` (capture side) and
+`liveatc_healthy` (every output feed connected), exported to both Prometheus and
+MQTT. Running under systemd, the reader uses `Type=notify`/`WatchdogSec` so a hung
+reader is restarted; see [`deploy/README.md`](deploy/README.md) for the full
+monitoring/alerting setup.
 
 ### Icecast feeds (stream every channel; one or more servers)
 

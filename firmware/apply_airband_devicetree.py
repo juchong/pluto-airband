@@ -1,23 +1,22 @@
 #!/usr/bin/env python3
 """Idempotently add the airband reserved-memory region to the Pluto devicetree.
 
-The airband framed-audio DMA writes a continuous ring to a 16 MiB DDR region
-that is *carved from the top of the maia-sdr recording region*
-(phys 0x19000000 .. 0x1a000000), matching
-``MaiaSDRConfig.airband_address_range``. This placement is deliberate: the
-kernel's default CMA region lives at the very top of usable DDR
-(0x1f000000 .. 0x20000000 on the 512 MiB Pluto), and reserving that range as
-``no-map`` collides with CMA and hangs the kernel before USB comes up. By
-carving the ring from the already-reserved recording region instead, usable RAM
-and CMA placement stay byte-for-byte identical to stock maia-sdr.
+The airband framed-audio DMA writes a continuous ring to a 16 MiB DDR region at
+phys 0x19000000 .. 0x1a000000, matching ``MaiaSDRConfig.airband_address_range``.
+This placement is deliberate: the kernel's default CMA region lives at the very
+top of usable DDR (0x1f000000 .. 0x20000000 on the 512 MiB Pluto), and reserving
+that range as ``no-map`` collides with CMA and hangs the kernel before USB comes
+up, so the ring sits well below CMA at 0x19000000.
 
 The maia-sdr kernel module exposes the region to userspace as an ``rxbuffer``
 character device (``/dev/maia-sdr-airband``) when a matching reserved-memory
 node + platform node exist in the devicetree.
 
 This script:
-  1. shrinks the existing ``maia_sdr_recording`` reg so it ends at the airband
-     base (0x19000000) instead of 0x1a000000, and
+  1. shrinks the existing ``maia_sdr_recording`` reg to 16 MiB (0x01000000 ..
+     0x02000000), reclaiming ~368 MiB back to Linux (the airband build never
+     uses the IQ recorder) -- this MUST match the bitstream's
+     ``MaiaSDRConfig.recorder_address_range`` and ship as a set (BUILD.md), and
   2. inserts the airband reserved-memory node + the ``maia-sdr-airband``
      rxbuffer platform node into ``zynq-pluto-sdr-maiasdr.dtsi`` (the shared
      maia-sdr overlay #included by every Pluto rev's .dts).
@@ -36,12 +35,16 @@ import sys
 import pathlib
 
 # Must match MaiaSDRConfig.airband_address_range (start, end) and
-# MaiaSDRConfig.recorder_address_range (which ends at AIRBAND_BASE).
+# MaiaSDRConfig.recorder_address_range.
 AIRBAND_BASE = 0x1900_0000
 AIRBAND_SIZE = 0x0100_0000          # 16 MiB
-# The recording region is shrunk so that it ends exactly at AIRBAND_BASE.
+# The recording region is SHRUNK to 16 MiB (was ~384 MiB) to reclaim the bulk of
+# DDR for Linux and fix the maia-httpd OOM race (the airband build never uses the
+# IQ recorder). This MUST match MaiaSDRConfig.recorder_address_range
+# (0x0100_0000..0x0200_0000) and ship as a set with the bitstream (BUILD.md). The
+# reclaimed 0x0200_0000..0x19000000 is left unreserved -> returned to userspace.
 RECORDING_BASE = 0x0100_0000
-RECORDING_SIZE = AIRBAND_BASE - RECORDING_BASE   # 0x18000000 (384 MiB)
+RECORDING_SIZE = 0x0100_0000        # 16 MiB (ends at 0x0200_0000)
 # Ring buffer slot size for the rxbuffer device (region / buffer-size = slots).
 AIRBAND_BUFFER_SIZE = 0x1_0000      # 64 KiB -> 256 slots
 

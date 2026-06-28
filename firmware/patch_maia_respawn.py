@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """Idempotently make maia-httpd survive a tight-memory boot race.
 
+SUPERSEDED: the firmware build now installs a *permanent* restart-safe supervisor
+via ``patch_maia_supervisor.py`` (which also strips this script's bounded block on
+migration). This bounded respawn is retained only for reference / historical
+provenance; it is no longer wired into ``build_firmware_full.sh``.
+
 Why this exists
 ---------------
 On the Pluto the kernel sees 512 MB but reserves ~416 MB for the maia-sdr DMA
