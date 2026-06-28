@@ -36,9 +36,16 @@ from ddc_tune_decimate import SYNC_PERIOD
 from receiver_top import ReceiverTop
 from audio_framer import AudioFramer
 
-F_PL = 62.5e6          # PL sync clock (handoff §4.2)
+F_PL = 65.278e6        # PL sync clock = 1175/18 MHz (MMCM mult 11.75, system_bd.tcl)
 F_S = 16.0e6           # resolved capture rate (§8.2: 16 MHz to admit 133.65 MHz)
 N = 18                 # core channels (18 ch / 6 lanes; 21 ch -> 7 lanes overflows LUTs)
+
+# The lane consumes one input sample every max_size+1 sync cycles (the +1 is the
+# per-sample handoff). The input CDC delivers a sample every floor(Fpl/Fs) cycles
+# at minimum (the SHORT gap of the fractional cadence), so a sample is dropped
+# unless floor(Fpl/Fs) >= max_size+1. At Fpl=62.5/Fs=16 the ratio is 3.906 ->
+# min gap 3 < 4, dropping the ~9.4% of samples that land on the gap-3 beat
+# (measured 18.1 ksps vs 20). 65.278 MHz gives floor(4.08)=4 -> 0 drops.
 
 
 def duties(Fs, Fpl, n, cpl, lane_decim, ntaps, am_cycles=23, fir_ovh=6):
@@ -59,6 +66,11 @@ def duties(Fs, Fpl, n, cpl, lane_decim, ntaps, am_cycles=23, fir_ovh=6):
         "duty_lane": max_size / cyc_in,
         "duty_fir": max_size * ch_rate * (ntaps + fir_ovh) / Fpl,
         "duty_am": n * ch_rate * am_cycles / Fpl,
+        # Integer-cadence guard: the SHORT inter-sample gap is floor(cyc_in); the
+        # lane needs max_size+1 cycles, so any short gap below that drops a sample
+        # even when duty_lane < 1 (the 62.5 MHz / 16 MHz drop bug).
+        "min_gap": math.floor(cyc_in),
+        "gap_ok": math.floor(cyc_in) >= max_size + 1,
     }
 
 
@@ -66,17 +78,18 @@ def _print_table():
     print(f"Fpl={F_PL/1e6:.1f} MHz  Fs={F_S/1e6:.1f} MHz  "
           f"cycles/input={F_PL/F_S:.2f}  -> chans_per_lane <= {int(F_PL//F_S)}\n")
     print(f"{'cpl':>3} {'decim':>6} {'ntaps':>6} {'lanes':>6} {'ch_rate':>9} "
-          f"{'duty_lane':>10} {'duty_fir':>9} {'duty_am':>8}  fit")
+          f"{'duty_lane':>10} {'duty_fir':>9} {'duty_am':>8} {'min_gap':>8}  fit")
     best = None
     for cpl in (3, 4):
         for lane_decim in (64, 128, 160, 175, 256):
             for ntaps in (63, 119):
                 d = duties(F_S, F_PL, N, cpl, lane_decim, ntaps)
                 fit = (d["duty_lane"] < 0.95 and d["duty_fir"] < 0.9
-                       and d["duty_am"] < 0.9)
+                       and d["duty_am"] < 0.9 and d["gap_ok"])
                 print(f"{cpl:>3} {lane_decim:>6} {ntaps:>6} {d['n_lanes']:>6} "
                       f"{d['ch_rate']/1e3:>7.1f}k {d['duty_lane']:>10.2f} "
-                      f"{d['duty_fir']:>9.2f} {d['duty_am']:>8.3f}  "
+                      f"{d['duty_fir']:>9.2f} {d['duty_am']:>8.3f} "
+                      f"{d['min_gap']:>5}>={d['max_size']+1}  "
                       f"{'OK' if fit else 'no'}")
                 if fit and best is None and cpl == 3:
                     best = (cpl, lane_decim, ntaps)
@@ -182,6 +195,15 @@ def _stress(cpl=3, lane_decim=64, ntaps=63, audio_decim=4, n_channels=6,
 
 def main():
     best = _print_table()
+
+    # Guard the integer-cadence requirement at the deployment geometry (cpl=3):
+    # floor(Fpl/Fs) must be >= max_size+1 or the channelizer drops the short-gap
+    # samples (the 62.5 MHz bug). This is the check that should have caught it.
+    dep = duties(F_S, F_PL, N, 3, 160, 63)
+    assert dep["gap_ok"], (
+        f"Fpl={F_PL/1e6:.3f} MHz too slow: min inter-sample gap "
+        f"{dep['min_gap']} < {dep['max_size']+1} cycles -> samples dropped; "
+        f"need Fpl >= {(dep['max_size']+1)*F_S/1e6:.1f} MHz at Fs={F_S/1e6:.0f} MHz")
     print(f"\nRecommended deployment config (3 ch/lane fits at Fs=16 MHz): "
           f"chans_per_lane={best[0]}, lane_decim={best[1]}, cleanup ntaps={best[2]} "
           f"-> {math.ceil(N/best[0])} lanes; "
