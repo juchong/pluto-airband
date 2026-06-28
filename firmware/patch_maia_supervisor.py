@@ -25,8 +25,9 @@ What it does
    and starts a permanent background loop that relaunches maia-httpd (using the
    launch line captured verbatim, including any log redirection) unless the flag
    is set.
-3. ``stop)``: before the ``start-stop-daemon -K ... /root/maia-httpd`` kill, sets
-   the flag so the supervisor does not fight the deliberate stop/restart.
+3. ``stop)``: before the ``start-stop-daemon -K ... maia-httpd`` kill (the real
+   init script kills by pidfile, ``-p /var/run/maia-httpd.pid``), sets the flag so
+   the supervisor does not fight the deliberate stop/restart.
 
 It is whitespace tolerant and a no-op if already applied (``airband-supervisor``
 marker). Run it AFTER ``patch_maia_logging.py`` so the relaunch inherits the log
@@ -50,9 +51,13 @@ SUP_PID = "/tmp/maia-httpd.supervisor.pid"
 LAUNCH_LINE_RE = re.compile(
     r"^(?P<indent>[ \t]*)(?P<cmd>start-stop-daemon\s+-S\b.*?/root/maia-httpd.*)$"
 )
-# The deliberate-stop kill line in the stop) case.
+# The deliberate-stop kill line in the stop) case. The real init script kills by
+# pidfile (`-K -q -p /var/run/maia-httpd.pid`), not by exe path, so match any
+# `-K` line referencing maia-httpd (covers `-p .../maia-httpd.pid` and
+# `-x /root/maia-httpd`). The bounded-respawn block's `-K -t -x /root/maia-httpd`
+# test-kill is stripped by _strip_respawn() before this runs, so it can't match.
 STOP_LINE_RE = re.compile(
-    r"^(?P<indent>[ \t]*)start-stop-daemon\s+-K\b.*?/root/maia-httpd.*$"
+    r"^(?P<indent>[ \t]*)start-stop-daemon\s+-K\b.*?maia-httpd.*$"
 )
 
 
@@ -76,10 +81,12 @@ def _supervisor_block(indent: str, launch: str) -> str:
         f"{indent}# audio :30000 self-heal indefinitely -- not just during the boot window.\n"
         f"{indent}# An intentional-stop flag (set by stop)/restart) makes it stand down so it\n"
         f"{indent}# never fights a deliberate `S60maia-httpd restart`.\n"
-        f"{indent}rm -f {FLAG}\n"
+        f"{indent}# Kill any stale supervisor BEFORE clearing the flag, then record the\n"
+        f"{indent}# new subshell's real PID via $! (a subshell's own $$ is the parent's\n"
+        f"{indent}# PID in POSIX/busybox sh, so $$ inside ( ) can't identify itself).\n"
         f'{indent}[ -f {SUP_PID} ] && kill "$(cat {SUP_PID})" 2>/dev/null\n'
+        f"{indent}rm -f {FLAG}\n"
         f"{indent}(\n"
-        f"{indent}  echo $$ > {SUP_PID}\n"
         f"{indent}  while true; do\n"
         f"{indent}    sleep 10\n"
         f"{indent}    [ -f {FLAG} ] && continue\n"
@@ -87,6 +94,7 @@ def _supervisor_block(indent: str, launch: str) -> str:
         f"{indent}    {launch}\n"
         f"{indent}  done\n"
         f"{indent}) &\n"
+        f"{indent}echo $! > {SUP_PID}\n"
     )
 
 
@@ -130,7 +138,7 @@ def patch(path: pathlib.Path) -> bool:
             f"launch line; cannot install the supervisor (has the init script changed?)")
     if not stop_done:
         raise SystemExit(
-            f"{path}: could not find the 'start-stop-daemon -K ... /root/maia-httpd' "
+            f"{path}: could not find the 'start-stop-daemon -K ... maia-httpd' "
             f"stop line; refusing to install a supervisor that would fight a deliberate "
             f"restart (has the init script changed?)")
 
