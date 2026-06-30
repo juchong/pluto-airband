@@ -454,22 +454,22 @@ carrier-loss fast-close (`low_signal_abort`) is **disabled by default** (without
 carrier on the link it would fire on every speech gap).
 
 **Carrier power (`--squelch carrier`).** With a bitstream that ships the
-per-channel carrier byte (§6.2), the squelch gates on carrier level instead. A
-per-channel adaptive-SNR floor is *not* usable here: it can't tell a continuous
-AWOS carrier from a high steady noise floor, so it learns the carrier away and
-closes. Instead the host derives a **shared, fixed threshold from a cross-channel
-noise estimate** — all channels of one receiver see the same wideband noise, so
-the **median** (50th percentile) of the live per-channel carrier levels is the
-noise reference and a station is a large outlier above it (the median matches
-`airband-listen`: at useful gain the conducted comb elevates several channels,
-which would inflate a high percentile and push the threshold above real traffic).
-The threshold is `median × 10^(--squelch-snr/20)`, recomputed every 8192 frames
-(`airband-dsp::carrier_noise_threshold`) and applied to every channel via
-`Squelch::set_threshold`. Because it tracks the *other* channels' noise rather
-than a channel's own level, it holds a continuous carrier open (no hang, no
-chatter) while empty channels stay shut. The frame's carrier byte is decoded with
-`airband-dsp::decode_carrier`; channels start shut until the first cross-channel
-update. In carrier mode the audio-energy VOX is retained internally only to drive
+per-channel carrier byte (§6.2), the squelch gates on carrier level instead. Each
+channel keeps its **own adaptive carrier-noise floor** (`airband-dsp::CarrierFloor`):
+an EWMA of that channel's carrier sampled **only while its squelch is shut**, so
+the floor follows the conducted comb's per-channel, diurnal drift up and down but
+never learns a transmission into itself. The open threshold is
+`floor × 10^(--squelch-snr/20)` — a fixed dB margin above *each channel's own*
+noise, so one `--squelch-snr` fits a quiet channel and a comb-hot one alike (the
+old single shared threshold could not separate a quiet channel's weak keyings from
+a comb-hot channel's noise, since both sat the same distance from one absolute
+line). Each floor is **seeded once** from a robust cross-channel noise reference —
+the **median** (50th percentile) of the live per-channel carrier levels, recomputed
+every 8192 frames (`airband-dsp::carrier_noise_threshold`); that median is also the
+`dB·c` meter's reference. A continuous carrier (e.g. ATIS) opens on the seed and
+then freezes its floor while open, so it is **not** learned away. The carrier byte
+is decoded with `airband-dsp::decode_carrier`; channels start shut until their
+floor is seeded. In carrier mode the audio-energy VOX is retained internally only to drive
 the speech-present flag that gates AGC gain and denoise noise-learning (the
 carrier alone can't distinguish speech from inter-word silence within an open
 transmission).

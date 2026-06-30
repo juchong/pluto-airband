@@ -147,11 +147,9 @@ impl Squelch {
             SquelchMode::Off => (false, None, 1.0),
             SquelchMode::AutoSnr { snr_db } => (true, None, 10f32.powf(snr_db / 20.0)),
             SquelchMode::ManualDbfs(dbfs) => (true, Some(dbfs_to_level(dbfs)), 1.0),
-            // Carrier mode is driven by a *fixed* threshold derived from a
-            // cross-channel noise estimate and pushed in via `set_threshold`. It
-            // starts effectively closed (huge threshold) until the first update,
-            // because an adaptive per-channel floor can't hold a continuous
-            // carrier (e.g. AWOS) open.
+            // Carrier mode's threshold is pushed in via `set_threshold` from a
+            // per-channel adaptive floor ([`CarrierFloor`]), so it starts
+            // effectively closed (huge threshold) until that floor is seeded.
             SquelchMode::Carrier { .. } => (true, Some(f32::MAX), 1.0),
         };
         let ms_to_samples = |ms: f32| ((ms / 1000.0) * cfg.rate as f32).round().max(1.0) as u32;
@@ -354,6 +352,77 @@ pub fn carrier_noise_threshold(carriers: &[f32], percentile: f32, snr_ratio: f32
     (noise.max(NOISE_EPSILON)) * snr_ratio
 }
 
+/// Per-channel adaptive carrier-noise floor for carrier-power squelch.
+///
+/// The cross-channel reference ([`carrier_noise_threshold`]) gives every channel
+/// one shared *absolute* threshold, which cannot separate a quiet channel's weak
+/// keyings from a comb-hot channel's noise transients — and per-channel baselines
+/// drift through the day, so no static value holds. This instead tracks each
+/// channel's *own* carrier baseline with an EWMA sampled **only while that
+/// channel's squelch is shut** (idle), so the floor follows the conducted comb up
+/// and down but never learns a transmission into itself. The open threshold is
+/// then `floor × snr_ratio` — a fixed dB margin above each channel's own noise.
+///
+/// Seeded once from the cross-channel reference so it starts at a sane level (and
+/// reads as always-shut until then). Because the floor freezes whenever the
+/// squelch is open, a continuously-keyed station (e.g. ATIS) opens on the seed
+/// and is never learned away — the failure mode that made carrier mode use a
+/// shared reference in the first place.
+pub struct CarrierFloor {
+    floor: f32,
+    seeded: bool,
+    /// Per-sample EWMA weight, from the idle time constant and audio rate.
+    alpha: f32,
+}
+
+impl CarrierFloor {
+    /// Idle time constant (seconds) over which the floor tracks baseline drift.
+    const TAU_S: f32 = 5.0;
+    /// Hard lower bound (raw carrier units) so a dead channel cannot collapse the
+    /// threshold to zero (mirrors [`MIN_NOISE_FLOOR`]'s role for the audio floor).
+    const MIN: f32 = 1.0;
+
+    /// Builds a floor whose EWMA settles over ~`TAU_S` of idle audio at `rate` Hz.
+    pub fn new(rate: u32) -> CarrierFloor {
+        let tau_samples = (Self::TAU_S * rate as f32).max(1.0);
+        CarrierFloor {
+            floor: 0.0,
+            seeded: false,
+            alpha: 1.0 - (-1.0 / tau_samples).exp(),
+        }
+    }
+
+    /// Seeds the floor once from the cross-channel noise reference (raw carrier
+    /// units). No-op once seeded or while `noise <= 0` (router not yet warmed up).
+    pub fn seed(&mut self, noise: f32) {
+        if !self.seeded && noise > 0.0 {
+            self.floor = noise;
+            self.seeded = true;
+        }
+    }
+
+    /// Advances the floor by one sample. `carrier` is the channel's current AM
+    /// carrier level (raw units); `closed` must be true **only** while the squelch
+    /// is fully shut, so a held transmission never pulls the floor up under itself.
+    #[inline]
+    pub fn update(&mut self, carrier: f32, closed: bool) {
+        if self.seeded && closed {
+            self.floor += self.alpha * (carrier - self.floor);
+        }
+    }
+
+    /// Open/close threshold in raw carrier units (`floor × snr_ratio`), clamped to
+    /// [`MIN`](Self::MIN). Returns `f32::MAX` (always shut) until seeded.
+    #[inline]
+    pub fn threshold(&self, snr_ratio: f32) -> f32 {
+        if self.seeded {
+            self.floor.max(Self::MIN) * snr_ratio
+        } else {
+            f32::MAX
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -523,5 +592,66 @@ mod tests {
         }
         assert!(!shut.is_open(), "empty channel must stay shut");
         assert!(open.is_open(), "continuous station carrier must stay open");
+    }
+
+    #[test]
+    fn carrier_floor_unseeded_is_shut() {
+        let f = CarrierFloor::new(20000);
+        assert_eq!(
+            f.threshold(2.0),
+            f32::MAX,
+            "an unseeded floor must read as always-shut"
+        );
+    }
+
+    #[test]
+    fn carrier_floor_tracks_idle_up_and_down() {
+        let mut f = CarrierFloor::new(20000);
+        f.seed(100.0);
+        // a rising idle baseline pulls the floor up toward it...
+        for _ in 0..400_000 {
+            f.update(500.0, true);
+        }
+        let up = f.threshold(1.0);
+        assert!(up > 400.0, "floor should climb toward 500, got {up}");
+        // ...and a falling one pulls it back down (the min-only audio floor can't).
+        for _ in 0..400_000 {
+            f.update(50.0, true);
+        }
+        let down = f.threshold(1.0);
+        assert!(down < 100.0, "floor should fall toward 50, got {down}");
+    }
+
+    #[test]
+    fn carrier_floor_frozen_while_open() {
+        let mut f = CarrierFloor::new(20000);
+        f.seed(100.0);
+        let before = f.threshold(1.0);
+        // a held transmission (closed = false) must not move the floor.
+        for _ in 0..400_000 {
+            f.update(1.0e6, false);
+        }
+        assert_eq!(f.threshold(1.0), before, "floor must not move while open");
+    }
+
+    #[test]
+    fn per_channel_floors_yield_different_thresholds() {
+        // The whole point: a comb-hot channel and a quiet channel, fed the same
+        // global SNR ratio, must end up with very different thresholds.
+        let ratio = 10f32.powf(10.0 / 20.0);
+        let mut quiet = CarrierFloor::new(20000);
+        let mut comb = CarrierFloor::new(20000);
+        quiet.seed(100.0);
+        comb.seed(100.0);
+        for _ in 0..400_000 {
+            quiet.update(80.0, true);
+            comb.update(800.0, true);
+        }
+        assert!(
+            comb.threshold(ratio) > quiet.threshold(ratio) * 5.0,
+            "comb-hot channel must demand a far higher threshold ({} vs {})",
+            comb.threshold(ratio),
+            quiet.threshold(ratio)
+        );
     }
 }

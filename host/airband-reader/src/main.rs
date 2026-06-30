@@ -40,8 +40,8 @@ mod mqtt;
 
 use airband_dfn::{DfnEnhancer, DfnParams, InferencePermit, Presence};
 use airband_dsp::{
-    carrier_noise_threshold, decode_carrier, level_to_dbfs, Agc, Denoise, LowPass, Notch, Squelch,
-    SquelchConfig, SquelchMode, VoiceFilter, SAMPLE_SCALE,
+    carrier_noise_threshold, decode_carrier, level_to_dbfs, Agc, CarrierFloor, Denoise, LowPass,
+    Notch, Squelch, SquelchConfig, SquelchMode, SquelchState, VoiceFilter, SAMPLE_SCALE,
 };
 
 /// Carrier-squelch: population percentile used as the cross-channel noise
@@ -126,7 +126,9 @@ struct Args {
     /// Squelch mode: off, auto (noise-floor tracking), or manual (fixed dBFS).
     #[arg(long, value_enum, default_value_t = SquelchArg::Auto)]
     squelch: SquelchArg,
-    /// Automatic-squelch open threshold, in dB of SNR above the noise floor.
+    /// Squelch open threshold in dB above the noise floor. In `carrier` mode this
+    /// is the margin above each channel's *own* adaptive carrier-noise floor, so a
+    /// single value fits quiet and comb-hot channels alike (no per-channel tuning).
     #[arg(long, default_value_t = 9.0)]
     squelch_snr: f32,
     /// Manual-squelch threshold in dBFS (used when --squelch manual).
@@ -664,6 +666,12 @@ fn http_2xx_body(resp: &str) -> Option<&str> {
 struct Worker {
     index: usize,
     squelch: Squelch,
+    /// Per-channel adaptive carrier-noise floor (carrier mode only). Tracks this
+    /// channel's own idle baseline so the squelch threshold is a fixed dB margin
+    /// above *its* noise, not a single absolute line shared by all channels.
+    carrier_floor: CarrierFloor,
+    /// Linear SNR ratio (`10^(snr_db/20)`) applied to [`Self::carrier_floor`].
+    carrier_snr_ratio: f32,
     /// Audio-energy VOX used only in carrier-squelch mode to drive the `above`
     /// (speech-present) flag for AGC/denoise; the main squelch then keys on the
     /// carrier, whose units don't match the audio sample magnitude.
@@ -706,6 +714,11 @@ impl Worker {
             squelch: Squelch::new(
                 SquelchConfig::new(cfg.squelch_mode, cfg.rate).with_hang_ms(cfg.squelch_hang_ms),
             ),
+            carrier_floor: CarrierFloor::new(cfg.rate),
+            carrier_snr_ratio: match cfg.squelch_mode {
+                SquelchMode::Carrier { snr_db } => 10f32.powf(snr_db / 20.0),
+                _ => 1.0,
+            },
             audio_gate: match cfg.squelch_mode {
                 SquelchMode::Carrier { snr_db } => Some(Squelch::new(SquelchConfig::new(
                     SquelchMode::AutoSnr { snr_db },
@@ -879,12 +892,19 @@ impl Worker {
             SquelchMode::Carrier { .. } => decode_carrier(carrier),
             _ => sq_mag,
         };
-        // In carrier mode, apply the latest cross-channel threshold (>0 once the
-        // router has computed it; before that the squelch keeps its default).
-        if let Some(thr) = carrier_thr {
-            if thr > 0.0 {
-                self.squelch.set_threshold(thr);
+        // Carrier mode: gate a fixed dB margin above this channel's *own* adaptive
+        // noise floor (not one absolute line shared by all channels). `carrier_thr`
+        // carries the cross-channel noise reference, used only to seed the floor
+        // (>0 once the router warms up); the floor then tracks this channel's idle
+        // baseline itself, updating only while the squelch is shut.
+        if matches!(cfg.squelch_mode, SquelchMode::Carrier { .. }) {
+            if let Some(noise) = carrier_thr {
+                self.carrier_floor.seed(noise);
             }
+            self.carrier_floor
+                .update(sq_level, self.squelch.state() == SquelchState::Closed);
+            self.squelch
+                .set_threshold(self.carrier_floor.threshold(self.carrier_snr_ratio));
         }
         self.squelch.process(sq_level);
         let gated = !matches!(cfg.squelch_mode, SquelchMode::Off);
@@ -1099,10 +1119,6 @@ fn run_session(
     let mut frame = [0u8; FRAME_BYTES];
 
     let carrier_mode = matches!(cfg.squelch_mode, SquelchMode::Carrier { .. });
-    let carrier_snr_ratio = match cfg.squelch_mode {
-        SquelchMode::Carrier { snr_db } => 10f32.powf(snr_db / 20.0),
-        _ => 1.0,
-    };
     let mut last_carrier = vec![0f32; n];
     let mut last_seq = vec![Option::<u32>::None; n];
     let mut since_carrier_update: u64 = 0;
@@ -1147,7 +1163,10 @@ fn run_session(
                 cm.set_carrier(c);
             }
             if carrier_mode {
-                carrier_thr.store((noise * carrier_snr_ratio).to_bits(), Ordering::Relaxed);
+                // Publish the raw cross-channel noise: workers use it only to seed
+                // their per-channel adaptive floors (the SNR margin is applied
+                // per-channel in the worker, not here).
+                carrier_thr.store(noise.to_bits(), Ordering::Relaxed);
             }
             since_carrier_update = 0;
         }

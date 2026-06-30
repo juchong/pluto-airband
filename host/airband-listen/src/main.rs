@@ -37,7 +37,7 @@
 //!   q                   quit
 
 use airband_dsp::{
-    carrier_noise_threshold, decode_carrier, Agc, Denoise, LowPass, Notch, Squelch,
+    carrier_noise_threshold, decode_carrier, Agc, CarrierFloor, Denoise, LowPass, Notch, Squelch,
     SquelchConfig, SquelchMode, SquelchState, VoiceFilter, SAMPLE_SCALE,
 };
 use anyhow::{Context, Result};
@@ -130,7 +130,7 @@ struct Args {
     #[arg(long)]
     gain: Option<f32>,
     /// Squelch mode: auto (audio-energy VOX, default), off, manual (fixed dBFS),
-    /// or carrier (cross-channel carrier power). Auto/VOX keys on the demodulated
+    /// or carrier (per-channel adaptive carrier-noise floor). Auto/VOX keys on the demodulated
     /// *modulation* (the audio) via a per-channel adaptive noise floor, so it is
     /// immune to the per-channel carrier-level offsets the conducted comb causes
     /// (the comb is a steady carrier bump with no in-band voice modulation).
@@ -556,6 +556,8 @@ fn reader_loop(shared: Arc<Shared>, addr: String, n: usize, cfg: DspCfg, mix: bo
     };
     let mut last_carrier = vec![0f32; n];
     let mut since_carrier_update: u64 = 0;
+    // Latest cross-channel noise reference; seeds each channel's adaptive floor.
+    let mut last_noise = 0f32;
 
     let mut last_seq = vec![u32::MAX; n];
     let mut squelches: Vec<Squelch> = (0..n)
@@ -565,6 +567,9 @@ fn reader_loop(shared: Arc<Shared>, addr: String, n: usize, cfg: DspCfg, mix: bo
             )
         })
         .collect();
+    // Per-channel adaptive carrier-noise floor (carrier mode): each channel gates
+    // a fixed dB margin above its *own* drifting baseline, not one shared line.
+    let mut carrier_floors: Vec<CarrierFloor> = (0..n).map(|_| CarrierFloor::new(cfg.rate)).collect();
     // In carrier-squelch mode the main squelch keys on the carrier; this
     // audio-energy VOX drives the `above` (speech-present) flag for AGC/denoise.
     let mut audio_gates: Vec<Option<Squelch>> = (0..n)
@@ -631,12 +636,9 @@ fn reader_loop(shared: Arc<Shared>, addr: String, n: usize, cfg: DspCfg, mix: bo
                     if since_carrier_update >= CARRIER_UPDATE_FRAMES {
                         let noise = carrier_noise_threshold(&last_carrier, CARRIER_NOISE_PCT, 1.0);
                         shared.carrier_noise.store(noise.to_bits(), Ordering::Relaxed);
-                        if carrier_mode {
-                            let thr = noise * carrier_snr_ratio;
-                            for sq in squelches.iter_mut() {
-                                sq.set_threshold(thr);
-                            }
-                        }
+                        // Raw noise only seeds the per-channel floors; the SNR
+                        // margin is applied per-channel just before each process().
+                        last_noise = noise;
                         since_carrier_update = 0;
                     }
                     shared.records.fetch_add(1, Ordering::Relaxed);
@@ -663,6 +665,15 @@ fn reader_loop(shared: Arc<Shared>, addr: String, n: usize, cfg: DspCfg, mix: bo
                     };
                     // Squelch runs on every channel so the meter shows activity.
                     let sq = &mut squelches[chan];
+                    // Carrier mode: gate a fixed dB margin above this channel's own
+                    // adaptive floor (seeded from the cross-channel reference; the
+                    // floor then tracks this channel's idle baseline itself).
+                    if carrier_mode {
+                        let f = &mut carrier_floors[chan];
+                        f.seed(last_noise);
+                        f.update(sq_level, sq.state() == SquelchState::Closed);
+                        sq.set_threshold(f.threshold(carrier_snr_ratio));
+                    }
                     let st = sq.process(sq_level);
                     shared.sq_open[chan].store(sq.is_open(), Ordering::Relaxed);
 

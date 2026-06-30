@@ -15,7 +15,7 @@ pub use agc::Agc;
 pub use denoise::Denoise;
 pub use filter::{HighShelf, LowPass, Notch, VoiceFilter};
 pub use squelch::{
-    carrier_noise_threshold, Squelch, SquelchConfig, SquelchMode, SquelchState,
+    carrier_noise_threshold, CarrierFloor, Squelch, SquelchConfig, SquelchMode, SquelchState,
 };
 
 #[cfg(test)]

@@ -33,16 +33,14 @@ EnvironmentFile=/etc/airband-feeds.env
 # equal len(channels_hz) in the Pluto's /mnt/sdcard/airband.json.
 # --rate 20000: per-channel audio rate at the 16 MHz build (Fs / 160 / 5). Matches
 # the airband-reader default; passed explicitly so the unit is self-documenting.
-# --squelch carrier: gate on the FPGA AM-carrier byte (cross-channel noise
-# reference) instead of voice-band VOX, so keyed transmissions open reliably.
-# --squelch-snr 10: dB above the cross-channel carrier-noise median. Calibrated
-# against live 119.2 traffic: real keyings run ~12 dB.c (weaker, aircraft) up to
-# ~19 dB.c (tower); 13 dropped the ~12 dB.c keyings (you'd hear only the strong
-# side), so 10 catches both classes while the conducted comb stayed clean on all
-# 18 ch during observation. (snr 8 false-opens the comb hard: ~139 opens/3 min,
-# peaks ~-120 dBFS = no audio, worst on ch17/133.650.) Lower toward 9 for still-
-# weaker aircraft (watch ch17's comb); raise toward 13 if a channel false-opens
-# (tx climbing while peak stays ~-120 dBFS).
+# --squelch carrier: gate on the FPGA AM-carrier byte, not voice-band VOX, so
+# keyed transmissions open reliably even through speech pauses.
+# --squelch-snr 10: dB above each channel's OWN adaptive carrier-noise floor.
+# Every channel tracks its own idle baseline (EWMA sampled only while shut), so a
+# single margin fits both a quiet channel and a comb-hot one (e.g. ch17/133.650)
+# with no per-channel tuning, and it follows the conducted comb's diurnal drift
+# on its own. Raise if a channel false-opens (tx climbing while peak stays ~-120
+# dBFS = no audio); lower to catch weaker keyings.
 # --metrics-port 9108: serves Prometheus /metrics, a /healthz liveness probe, and
 #   a /status JSON snapshot (Pluto reachability, link/data-flow, per-feed health).
 # --monitor-port 8082: low-latency raw-PCM debug-listen on (8081 is taken by a
