@@ -35,13 +35,14 @@ EnvironmentFile=/etc/airband-feeds.env
 # the airband-reader default; passed explicitly so the unit is self-documenting.
 # --squelch carrier: gate on the FPGA AM-carrier byte (cross-channel noise
 # reference) instead of voice-band VOX, so keyed transmissions open reliably.
-# --squelch-snr 13: dB above the cross-channel carrier-noise median. Measured on the
-# 16 MHz / 18-ch build: snr 8 false-opens heavily on the conducted comb (~139 opens
-# in 3 min, all peaks ~-120 dBFS = no audio; worst on ch17/133.650, whose carrier
-# baseline reaches ~8 dB.c when hot), while snr 12 was clean in a quiet-comb window.
-# 13 keeps margin over the comb's hot transients yet sits 2 dB below the prior 15 so
-# weak transmissions still open. Lower toward 11 for more sensitivity (watch for a
-# channel false-opening: tx climbing while peak stays ~-120); raise toward 15 if so.
+# --squelch-snr 10: dB above the cross-channel carrier-noise median. Calibrated
+# against live 119.2 traffic: real keyings run ~12 dB.c (weaker, aircraft) up to
+# ~19 dB.c (tower); 13 dropped the ~12 dB.c keyings (you'd hear only the strong
+# side), so 10 catches both classes while the conducted comb stayed clean on all
+# 18 ch during observation. (snr 8 false-opens the comb hard: ~139 opens/3 min,
+# peaks ~-120 dBFS = no audio, worst on ch17/133.650.) Lower toward 9 for still-
+# weaker aircraft (watch ch17's comb); raise toward 13 if a channel false-opens
+# (tx climbing while peak stays ~-120 dBFS).
 # --metrics-port 9108: serves Prometheus /metrics, a /healthz liveness probe, and
 #   a /status JSON snapshot (Pluto reachability, link/data-flow, per-feed health).
 # --monitor-port 8082: low-latency raw-PCM debug-listen on (8081 is taken by a
@@ -49,7 +50,7 @@ EnvironmentFile=/etc/airband-feeds.env
 # --mqtt-* -> Home Assistant: broker/user/pass come from the EnvironmentFile. An
 #   empty ${AIRBAND_MQTT_BROKER} (var unset) disables MQTT in-reader, so this line
 #   is safe whether or not the broker is configured — no separate "MQTT off" variant.
-ExecStart=/home/pi/pluto-airband/host/target/release/airband-reader plutoplus.chongflix.tv:30000 --feeds /home/pi/pluto-airband/feeds.json --channels 18 --rate 20000 --squelch carrier --squelch-snr 13 --metrics-port 9108 --monitor-port 8082 --mqtt-broker ${AIRBAND_MQTT_BROKER} --mqtt-user ${AIRBAND_MQTT_USER} --mqtt-pass ${AIRBAND_MQTT_PASS}
+ExecStart=/home/pi/pluto-airband/host/target/release/airband-reader plutoplus.chongflix.tv:30000 --feeds /home/pi/pluto-airband/feeds.json --channels 18 --rate 20000 --squelch carrier --squelch-snr 10 --metrics-port 9108 --monitor-port 8082 --mqtt-broker ${AIRBAND_MQTT_BROKER} --mqtt-user ${AIRBAND_MQTT_USER} --mqtt-pass ${AIRBAND_MQTT_PASS}
 # airband-reader reconnects to the Pluto and to Icecast on its own, so this only
 # fires on a real crash. Wait between restarts so a wedged Pluto isn't hammered.
 Restart=always
