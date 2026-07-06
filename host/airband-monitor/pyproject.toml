@@ -1,0 +1,19 @@
+[project]
+name = "airband-monitor"
+version = "0.1.0"
+description = "Interactive Python listener for Pluto airband: streams pre-/post-filtered channel audio from the Pi monitor endpoint, channel plan auto-read from the Pluto."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "sounddevice>=0.4.6",
+]
+
+[project.scripts]
+airband-monitor = "airband_monitor.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/airband_monitor"]

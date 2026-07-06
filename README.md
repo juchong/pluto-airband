@@ -322,6 +322,8 @@ $BIN 192.168.2.1:30000 --metrics-port 9100   # /metrics /healthz /status on :910
 $BIN 192.168.2.1:30000 --feeds feeds.json --monitor-port 8081
 ffplay -fflags nobuffer -flags low_delay -probesize 32 -analyzeduration 0 \
   http://host:8081/listen/3.wav?tap=pre
+# or an interactive TUI over this endpoint (channel plan auto-read from the Pluto):
+#   cd host/airband-monitor && uv run airband-monitor host:8081   (see its README)
 
 # Publish curated health/metrics to MQTT for a Home Assistant dashboard (auto-
 # discovered entities + availability via Last Will). See deploy/README.md.
@@ -724,6 +726,7 @@ the request/response schema.
 | `host/airband-dfn/` | shared DeepFilterNet enhancer + presence brightness (used by both binaries) |
 | `host/airband-reader/` | host reader: router + per-channel workers, demux, drop detection, DFN/presence DSP, split recording, Icecast/UDP/metrics |
 | `host/airband-listen/` | interactive listener: live DSP playback, scanner/mix modes, per-channel meters |
+| `host/airband-monitor/` | uv-managed Python listener: streams a channel's pre/post-filtered audio from the reader's `--monitor-port`, channel plan auto-read from the Pluto (`host/airband-monitor/README.md`) |
 | `feeds.json` | example all-channel Icecast feeds file (adapt to your own mounts) |
 | `deploy/` | systemd feeder unit + secrets template + runbook (`deploy/README.md`) |
 | `maia-sdr/` | the Maia SDR fork (gitignored here; the airband HDL + `maia-httpd` integration) |
