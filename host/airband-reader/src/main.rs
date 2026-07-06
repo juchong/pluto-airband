@@ -69,10 +69,6 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-/// Makeup gain applied to the raw demod sample on the `tap=pre` monitor so the
-/// (typically quiet) airband audio is audible. Debug path only; never shipped.
-const MONITOR_PRE_GAIN: f64 = 8.0;
-
 const FRAME_BYTES: usize = 8;
 const AUDIO_FIELD: u32 = 24;
 const CARRIER_FIELD: u32 = 8;
@@ -686,6 +682,10 @@ struct Worker {
     notch: Option<Notch>,
     denoise: Denoise,
     agc: Agc,
+    /// Dedicated AGC for the `tap=pre` debug monitor: normalizes the raw demod so
+    /// it is audible, run continuously (never squelch-gated) and independent of
+    /// the post-chain `agc` above.
+    pre_agc: Agc,
     /// DeepFilterNet enhancer (built eagerly at startup when enabled).
     dfn: Option<DfnEnhancer>,
     /// Post-DFN brightness high-shelf (None when `--presence-db 0`).
@@ -734,6 +734,7 @@ impl Worker {
                 .map(|f| Notch::new(f, cfg.rate as f64, cfg.notch_q)),
             denoise: Denoise::new(DENOISE_FRAME, cfg.denoise_floor_db),
             agc: Agc::new(),
+            pre_agc: Agc::new(),
             dfn: None,
             presence: (cfg.presence_db != 0.0).then(|| {
                 Presence::new(cfg.rate as f64, cfg.presence_hz, cfg.presence_q, cfg.presence_db)
@@ -927,11 +928,19 @@ impl Worker {
             self.squelch.is_open(),
         );
 
-        // Continuous raw-demod tap (pre-DSP, pre-squelch) for the debug monitor:
-        // cheap fixed-gain scale, always streamed so it matches the waterfall
-        // regardless of squelch. Computed only when a `pre` client is attached.
+        // Raw-demod tap (pre-DSP, pre-squelch) for the debug monitor: continuous
+        // and un-enhanced, but level-normalized by a dedicated AGC so the tiny,
+        // wildly-varying airband demod is actually audible (a fixed gain can't fit
+        // a weak aircraft and a strong tower at once). `open = true` keeps it
+        // continuous (never gated to silence, unlike `post`); training is gated on
+        // the voice-present `above` flag so gain locks to speech and the noise
+        // floor between transmissions stays quiet instead of being pumped up.
+        // Computed only when a `pre` client is attached.
         if !self.pre_monitors.is_empty() {
-            let pre = ((sample as f64 / SAMPLE_SCALE as f64) * 32767.0 * MONITOR_PRE_GAIN)
+            let y = self
+                .pre_agc
+                .process((sample as f64 / SAMPLE_SCALE as f64) as f32, true, false, above);
+            let pre = (y as f64 * 32767.0)
                 .round()
                 .clamp(i16::MIN as f64, i16::MAX as f64) as i16;
             fanout_monitors(&mut self.pre_monitors, pre);
