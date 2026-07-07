@@ -149,7 +149,14 @@ struct Args {
     /// field-tune `--squelch-voice-flatness` before enabling on a feed.
     #[arg(long)]
     squelch_voice_gate: bool,
-    /// Max spectral flatness (0-1) still treated as voice for `--squelch-voice-gate`
+    /// Enable the voice gate on only these channel indices (comma-separated, e.g.
+    /// `9` or `9,12`), leaving the rest ungated. Use for a channel with a large
+    /// receive-power swing where a band-wide noise burst false-opens it, without
+    /// risking a global veto of weak/noisy stations elsewhere. Unions with
+    /// `--squelch-voice-gate` (that flag gates *all* channels).
+    #[arg(long, value_delimiter = ',')]
+    squelch_voice_gate_channels: Vec<usize>,
+    /// Max spectral flatness (0-1) still treated as voice for the voice gate
     /// (broadband noise ~1, voiced audio well below; lower = stricter).
     #[arg(long, default_value_t = 0.5)]
     squelch_voice_flatness: f32,
@@ -323,6 +330,7 @@ struct Config {
     squelch_hang_ms: f32,
     squelch_hysteresis_db: f32,
     voice_gate: bool,
+    voice_gate_channels: Vec<usize>,
     voice_flatness: f32,
     split: bool,
     min_samples: u64,
@@ -758,8 +766,9 @@ impl Worker {
                 _ => None,
             },
             sq_filter: VoiceFilter::new(cfg.rate as f64, 300.0, 3400.0),
-            voice: (cfg.voice_gate && !matches!(cfg.squelch_mode, SquelchMode::Off))
-                .then(|| SpectralFlatness::new(cfg.rate as f64, VOICE_FRAME, cfg.voice_flatness)),
+            voice: ((cfg.voice_gate || cfg.voice_gate_channels.contains(&index))
+                && !matches!(cfg.squelch_mode, SquelchMode::Off))
+            .then(|| SpectralFlatness::new(cfg.rate as f64, VOICE_FRAME, cfg.voice_flatness)),
             vf: VoiceFilter::new(cfg.rate as f64, cfg.low, cfg.high),
             lpf: (cfg.lpf_hz > 0.0).then(|| LowPass::new(cfg.rate as f64, cfg.lpf_hz)),
             notch: cfg
@@ -1264,6 +1273,7 @@ fn main() -> Result<()> {
         squelch_hang_ms: args.squelch_hang_ms,
         squelch_hysteresis_db: args.squelch_hysteresis_db,
         voice_gate: args.squelch_voice_gate,
+        voice_gate_channels: args.squelch_voice_gate_channels.clone(),
         voice_flatness: args.squelch_voice_flatness,
         split: !args.no_split,
         min_samples: (args.min_transmission_ms * args.rate as u64) / 1000,

@@ -306,10 +306,14 @@ SNR margin run low (sensitive to distant/weak keyings) without chattering:
   (or raise `--squelch-voice-flatness`, e.g. `0.65`, to admit noisier voice) if you
   are missing towers you can see in the waterfall. The gate only vetoes the *open*
   transition; a brief non-voice frame mid-transmission never chops open audio.
+  Enable it on **specific channels only** with `--squelch-voice-gate-channels`
+  (comma-separated indices, e.g. `9` or `9,12`) — for a single channel with a large
+  receive-power swing — instead of the global `--squelch-voice-gate`.
 
 - `--squelch off|auto|manual|carrier` (`--squelch-snr`, `--squelch-level` dBFS,
   `--squelch-hang-ms`, `--squelch-hysteresis-db`, `--squelch-voice-gate`,
-  `--squelch-voice-flatness`) — gating, threshold, hang time, hysteresis, voice gate.
+  `--squelch-voice-gate-channels`, `--squelch-voice-flatness`) — gating, threshold,
+  hang time, hysteresis, voice gate (global or per-channel).
 - `--denoise` (off by default), `--denoise-floor-db <dB>` — spectral noise
   reduction (more negative floor = deeper, more aggressive cut).
 - `--filter` (off by default), `--filter-low`/`--filter-high` — voice band-pass

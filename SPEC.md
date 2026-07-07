@@ -486,10 +486,13 @@ default; `--squelch-voice-flatness`, default 0.5): a spectral-flatness discrimin
 opens only on tonal/voice-like audio (flatness below the ceiling) and vetoes flat
 broadband noise (flatness ≈ 1) — the "detect voice, not just energy" half of a
 classic dual-metric airband squelch. It gates only the *open* transition (a brief
-non-voice frame never chops an open tx). It is **off in the shipped deploy**: weak,
-noisy distant transmissions can read as broadband and be vetoed, which loses towers
-visible in the waterfall; raise `--squelch-voice-flatness` (e.g. 0.65) to admit
-noisier voice if band-wide noise starts leaking through.
+non-voice frame never chops an open tx). A global `--squelch-voice-gate` gates every
+channel; `--squelch-voice-gate-channels <list>` gates only the listed indices (union
+of the two). In the shipped deploy it is on for **ch9 only** (122.975 S50 CTAF, the
+largest receive-power swing) and **off elsewhere**: weak, noisy distant transmissions
+can read as broadband and be vetoed, which loses towers visible in the waterfall.
+Raise `--squelch-voice-flatness` (e.g. 0.65) to admit noisier voice if band-wide
+noise leaks through on a gated channel.
 
 In carrier mode the audio-energy VOX is retained internally only to drive
 the speech-present flag that gates AGC gain and denoise noise-learning (the
