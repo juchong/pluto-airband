@@ -21,10 +21,34 @@ from datetime import datetime, timezone
 import sounddevice as sd
 
 from .plan import Channel
-from .stream import monitor_url, open_stream, peak_dbfs
+from .stream import fetch_status, monitor_url, open_stream, peak_dbfs
 
 VOL_STEP = 0.1
 VOL_MAX = 4.0
+SCAN_POLL_S = 0.3   # how often to poll /status while scanning
+SCAN_HANG_S = 1.5   # stay on a channel this long after it closes before hopping
+
+
+def choose_scan_target(
+    status_channels: list[dict], current: int, idle_secs: float, hang: float
+) -> int | None:
+    """Scanner decision (pure, so it is unit-testable): given the reader's
+    per-channel ``/status`` list, the current channel, how long the current
+    channel has been closed, and the hang time, return the channel to hop to, or
+    ``None`` to stay put.
+
+    Stay while the current channel is keyed (open) or still within the hang
+    window; otherwise hop to the open channel with the strongest carrier."""
+    if any(c.get("ch") == current and c.get("open") for c in status_channels):
+        return None  # current is active — ride the transmission out
+    if idle_secs < hang:
+        return None  # brief gap in speech — do not hop yet
+    opens = [c for c in status_channels if c.get("open")]
+    if not opens:
+        return None
+    best = max(opens, key=lambda c: c.get("carrier_dbc", float("-inf")))
+    ch = best.get("ch")
+    return ch if ch != current else None
 
 
 def _safe_name(label: str, index: int) -> str:
@@ -42,9 +66,11 @@ class MonitorApp:
         channel: int = 0,
         tap: str = "pre",
         record_dir: str | None = None,
+        status_hostport: str | None = None,
     ) -> None:
         self.pi = pi
         self.channels = channels
+        self.status_hostport = status_hostport  # reader /status (--metrics-port)
         self._lock = threading.Lock()
         self._stop = threading.Event()
         # Two generations: playback restarts on channel OR tap change; recorders
@@ -69,12 +95,16 @@ class MonitorApp:
         # playback fully independent.
         self.record_taps: set[str] = set()
         self._recorders: dict[str, dict] = {}  # tap -> {thread, stop, resp, path}
+        self.scan = False
+        self.scan_status = ""
         self._thread = threading.Thread(target=self._worker, daemon=True)
+        self._scan_thread = threading.Thread(target=self._scanner, daemon=True)
 
     # ---- control (called from the UI thread) -----------------------------
 
     def start(self) -> None:
         self._thread.start()
+        self._scan_thread.start()
 
     def stop(self) -> None:
         self._stop.set()
@@ -82,6 +112,18 @@ class MonitorApp:
             self._stop_recorder(tap)
         self._bump_and_close(chan=True)
         self._thread.join(timeout=2.0)
+        self._scan_thread.join(timeout=2.0)
+
+    def toggle_scan(self) -> None:
+        """`s`: auto-scan — follow whichever channels are active."""
+        if not self.status_hostport:
+            with self._lock:
+                self.scan_status = "scan needs the reader's --metrics-port (pass --metrics-port)"
+            return
+        with self._lock:
+            self.scan = not self.scan
+            if not self.scan:
+                self.scan_status = ""
 
     def _bump_and_close(self, chan: bool) -> None:
         """Bump the relevant generation(s) and close the live response(s) so a
@@ -295,6 +337,43 @@ class MonitorApp:
             if not self._stop.is_set() and not changed:
                 self._stop.wait(1.0)  # backoff after a real error
 
+    # ---- scanner ---------------------------------------------------------
+
+    def _scanner(self) -> None:
+        """While scanning, poll the reader's /status and hop playback to the
+        strongest active channel, riding out each transmission."""
+        last_open = time.monotonic()
+        while not self._stop.is_set():
+            if not self.scan:
+                last_open = time.monotonic()
+                self._stop.wait(0.2)
+                continue
+            try:
+                chans = fetch_status(self.status_hostport)  # type: ignore[arg-type]
+            except Exception as e:  # noqa: BLE001
+                with self._lock:
+                    self.scan_status = f"scan: /status unreachable ({e})"
+                self._stop.wait(1.0)
+                continue
+            with self._lock:
+                cur = self.channel
+            now = time.monotonic()
+            cur_open = any(c.get("ch") == cur and c.get("open") for c in chans)
+            if cur_open:
+                last_open = now
+            idle = now - last_open
+            n_active = sum(1 for c in chans if c.get("open"))
+            with self._lock:
+                self.scan_status = (
+                    f"scan: {n_active} active"
+                    + ("" if cur_open else f", idle {idle:.1f}s")
+                )
+            target = choose_scan_target(chans, cur, idle, SCAN_HANG_S)
+            if target is not None:
+                self.set_channel(target)
+                last_open = now
+            self._stop.wait(SCAN_POLL_S)
+
     # ---- snapshot for the UI --------------------------------------------
 
     def snapshot(self) -> dict:
@@ -305,6 +384,8 @@ class MonitorApp:
                 "record_taps": sorted(self.record_taps),
                 "record_paths": {t: r.get("path") for t, r in self._recorders.items()},
                 "rec_error": self.rec_error,
+                "scan": self.scan,
+                "scan_status": self.scan_status,
                 "volume": self.volume,
                 "mute": self.mute,
                 "rate": self.rate,
@@ -357,6 +438,8 @@ def _tui_loop(stdscr, app: MonitorApp) -> None:
                 app.toggle_record()
             elif ch in (ord("b"), ord("B")):
                 app.toggle_record_both()
+            elif ch in (ord("s"), ord("S")):
+                app.toggle_scan()
             elif ch in (ord("+"), ord("=")):
                 app.change_volume(VOL_STEP)
             elif ch in (ord("-"), ord("_")):
@@ -396,13 +479,16 @@ def _draw(stdscr, app: MonitorApp, pending: str) -> None:
     vol = "MUTE" if snap["mute"] else f"{snap['volume']:.1f}x"
     header = (
         f" pluto airband monitor  pi={app.pi}  tap={snap['tap']}  "
-        f"vol={vol}  rec={rec} "
+        f"vol={vol}  rec={rec}  scan={'ON' if snap['scan'] else 'off'} "
     )
     _addline(stdscr, 0, header, w, curses.A_REVERSE)
 
     _addline(stdscr, 1, f" {_meter_bar(app.meter_dbfs)}", w)
     _addline(stdscr, 2, f" status: {snap['status']}", w)
     row = 3
+    if snap["scan_status"]:
+        _addline(stdscr, row, f" {snap['scan_status']}", w)
+        row += 1
     for tap in snap["record_taps"]:
         path = snap["record_paths"].get(tap)
         _addline(stdscr, row, f" rec {tap}: {path or '(connecting...)'}", w)
@@ -422,7 +508,7 @@ def _draw(stdscr, app: MonitorApp, pending: str) -> None:
         line = f"{marker} {i:>2}  {c.freq_mhz:10.3f}  {c.label}"
         _addline(stdscr, r, line, w, curses.A_REVERSE if i == cur else curses.A_NORMAL)
 
-    footer = " j/k: channel  digits+Enter: jump  t: pre/post  r: rec tap  b: rec both  +/-: vol  m: mute  q: quit "
+    footer = " j/k: channel  #+Enter: jump  t: pre/post  s: scan  r: rec tap  b: rec both  +/-: vol  m: mute  q: quit "
     if pending:
         footer = f" jump-> {pending}   " + footer
     _addline(stdscr, h - 1, footer, w, curses.A_REVERSE)

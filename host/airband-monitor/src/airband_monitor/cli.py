@@ -56,6 +56,17 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Start recording the initial tap immediately.",
     )
     p.add_argument(
+        "--metrics-port",
+        type=int,
+        default=DEFAULT_METRICS_PORT,
+        help="Reader's /status port for scan mode (default: %(default)s, 0 = disable scan).",
+    )
+    p.add_argument(
+        "--scan",
+        action="store_true",
+        help="Start in scan mode: auto-follow whichever channels are active.",
+    )
+    p.add_argument(
         "--no-tui",
         action="store_true",
         help="Headless: play the selected channel/tap without the curses UI.",
@@ -64,6 +75,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 DEFAULT_MONITOR_PORT = 8082  # matches deploy/airband-feeds.service (--monitor-port)
+DEFAULT_METRICS_PORT = 9108  # matches deploy/airband-feeds.service (--metrics-port)
 
 
 def with_default_port(s: str, default: int) -> str:
@@ -131,15 +143,21 @@ def main(argv: list[str] | None = None) -> int:
 
     from .app import MonitorApp, run_headless, run_tui
 
+    pi_host = args.pi.rsplit(":", 1)[0]
+    status_hostport = f"{pi_host}:{args.metrics_port}" if args.metrics_port else None
+
     app = MonitorApp(
         args.pi,
         channels,
         channel=args.channel,
         tap=args.tap,
         record_dir=args.record_dir,
+        status_hostport=status_hostport,
     )
     if args.record:
         app.toggle_record()  # start recording the initial tap
+    if args.scan:
+        app.toggle_scan()
 
     if args.no_tui:
         run_headless(app)

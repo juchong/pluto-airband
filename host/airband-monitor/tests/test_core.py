@@ -109,6 +109,28 @@ def test_with_default_port():
             pass
 
 
+def test_choose_scan_target():
+    from airband_monitor.app import choose_scan_target
+
+    chans = [
+        {"ch": 0, "open": False, "carrier_dbc": 0.0},
+        {"ch": 1, "open": True, "carrier_dbc": 5.0},
+        {"ch": 2, "open": True, "carrier_dbc": 12.0},
+    ]
+    # current is open -> stay
+    assert choose_scan_target(chans, current=2, idle_secs=99, hang=1.5) is None
+    # current closed but within hang -> stay
+    assert choose_scan_target(chans, current=0, idle_secs=0.5, hang=1.5) is None
+    # current closed past hang -> hop to strongest open (ch2 @ 12 dBc)
+    assert choose_scan_target(chans, current=0, idle_secs=2.0, hang=1.5) == 2
+    # nothing open -> stay
+    idle = [{"ch": i, "open": False, "carrier_dbc": 0.0} for i in range(3)]
+    assert choose_scan_target(idle, current=0, idle_secs=9, hang=1.5) is None
+    # only current open would be a hop to itself -> None
+    one = [{"ch": 0, "open": True, "carrier_dbc": 3.0}]
+    assert choose_scan_target(one, current=0, idle_secs=9, hang=1.5) is None
+
+
 def test_monitor_url():
     assert monitor_url("pi.local:8081", 3, "pre") == "http://pi.local:8081/listen/3.wav?tap=pre"
     assert monitor_url("10.0.0.5:9000", 0, "post") == "http://10.0.0.5:9000/listen/0.wav?tap=post"

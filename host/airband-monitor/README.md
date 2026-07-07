@@ -59,11 +59,22 @@ uv run airband-monitor rfpi.chongflix.tv --no-tui --channel 3
 | `up`/`down`, `j`/`k` | previous / next channel |
 | digits then `Enter` | jump to a channel index |
 | `t` | toggle pre / post tap (playback) |
+| `s` | toggle **scan** mode (auto-follow active channels) |
 | `r` | toggle recording the tap you're listening to |
 | `b` | toggle recording **both** taps at once (pre + post simultaneously) |
 | `+` / `-` | volume up / down |
 | `m` | mute |
 | `q` / `Esc` | quit |
+
+## Scan mode (`s`)
+
+Scan auto-switches the played channel to follow live traffic, so you hear as
+much as possible without manually hopping. It polls the reader's `/status`
+endpoint (its `--metrics-port`, default `9108`) for each channel's squelch
+state, stays on a channel while it is keyed, and after it closes (a short hang
+to ride over gaps in speech) hops to the open channel with the strongest
+carrier. Recording (`r`/`b`) keeps working and follows the hops. Scan needs the
+reader started with `--metrics-port`; disable it with `--metrics-port 0`.
 
 Recordings are written as `<label>_<tap>_<UTCtimestamp>.wav` (mono s16le at the
 stream's native rate, i.e. the raw un-volume-adjusted samples). Recording is
@@ -83,6 +94,8 @@ for the new channel.
 | `--feeds FILE` | `feeds.json` to fill blank channel labels from per-channel `name`. |
 | `--record-dir DIR` | Directory for WAV recordings (default `./out`, created on demand). |
 | `--record` | Start recording the initial tap immediately. |
+| `--metrics-port N` | Reader's `/status` port for scan mode (default `9108`; `0` disables scan). |
+| `--scan` | Start in scan mode (auto-follow active channels). |
 | `--no-tui` | Headless playback, no curses UI. |
 
 ## Tests
@@ -95,8 +108,7 @@ uv run python tests/test_core.py
 
 - The monitor endpoint serves one channel per connection, so the level meter
   shows only the channel you are listening to (unlike `airband-listen`, which
-  reads all channels from the Pluto directly). `ponytail:` all-channel activity
-  would need the reader's `/status` (`--metrics-port`) or a direct `:30000`
-  connection; not implemented since streaming is Pi-only by design.
+  reads all channels from the Pluto directly). Cross-channel activity comes from
+  the reader's `/status` (`--metrics-port`) and is used by scan mode.
 - The channel plan is fetched once at startup; restart the tool to pick up a
   changed plan (the receiver itself only applies plan changes on restart).

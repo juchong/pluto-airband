@@ -14,6 +14,7 @@ fully-enhanced audio that LiveATC receives.
 from __future__ import annotations
 
 import array
+import json
 import math
 from urllib.parse import quote
 from urllib.request import urlopen
@@ -55,6 +56,14 @@ def open_stream(url: str, timeout: float = 10.0):
     resp = urlopen(url, timeout=timeout)  # noqa: S310 (trusted LAN device)
     header = _read_exact(resp, WAV_HEADER_LEN)
     return parse_header_rate(header), resp
+
+
+def fetch_status(hostport: str, timeout: float = 3.0) -> list[dict]:
+    """Fetch the reader's ``/status`` (on its ``--metrics-port``) and return the
+    per-channel list: ``[{"ch", "open", "carrier_dbc", ...}, ...]``. Used by the
+    scanner to find active channels without opening every audio stream."""
+    with urlopen(f"http://{hostport}/status", timeout=timeout) as resp:  # noqa: S310
+        return json.load(resp).get("channels", [])
 
 
 def peak_dbfs(block: bytes) -> float:
