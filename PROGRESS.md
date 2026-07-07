@@ -1333,6 +1333,32 @@ Config/deploy only — no firmware or host-binary rebuild.
   redeploying the template no longer reverts the gain. Docs updated
   (`README.md` channel-plan/deploy, `SPEC.md` §5).
 
+### 3.4 kHz cleanup-FIR corner + 12 dB LNA gain (2026-07-07)
+Bitstream rebuild (`maia-sdr` fork `00fcaaa3`) + config, flashed to the live Pluto+.
+
+- **Cleanup/channel-select FIR narrowed to a 3.4 kHz voice corner.** From the
+  original ±8 kHz (`design_cic_compensation(160, 3, 63, 0.164, 0.2625)`,
+  `out_shift=17`) → **3.4 kHz** (`design_cic_compensation(160, 3, 63, 0.068, 0.109)`,
+  `out_shift=19`): −3.4 dB @3.4 kHz, −5.6 dB @4 kHz, −19 dB @6 kHz, −49 dB @8 kHz.
+  Tap count stays 63 so DSP/BRAM/place-and-route/timing are unchanged (post-route
+  WNS +0.275 ns). An interim ±5 kHz build measured neutral on the voice/HF ratio;
+  moving the corner into the voice band audibly reduced the buzz (maintainer
+  confirmed "improved significantly"). Coeffs are embedded in
+  `maia-sdr/maia-hdl/maia_hdl/maia_sdr.py`; docs updated (`SPEC.md` §4.2,
+  `SPUR-INVESTIGATION.md` step 6).
+- **Operating gain 30 → 12 dB (external-LNA front end).** `gain_db` set to **12** on
+  the live SD card (persisted) and in the tracked template `firmware/airband.json`
+  (+ `README.md` example), lifting weak signals off the 0 dB ADC quantization floor
+  without over-driving the AD9361 gain stage. Motivated by weak/one-sided
+  transmissions (e.g. tower) visible in the waterfall but inaudible at low gain.
+- **Provenance/flash:** build baked `UserID=00FCAAA3` (== fork HEAD); flashed both
+  `boot.dfu` (mtd0) + `plutoplus.dfu` (mtd3). u-boot env survived intact (AD9364
+  attrs, refclk, `usb_ethernet_mode=ncm`) — no re-apply needed. 18 ch @ ~20000 sps,
+  0 drops after the Pi feeder reconnected.
+- *Open item:* the residual buzz is a conducted spur comb; the standing next-step is
+  an upstream complex-LMS spur canceller on the wideband IQ (fixes all channels at
+  once) — see "Next steps" / SPUR-INVESTIGATION.
+
 ## Next steps
 - **Buzz spurs are characterized** (see "Buzz spur taxonomy", 2026-06-24): the
   dominant 126.000 MHz tooth is the AD9361 sample-clock 9th harmonic (9×14 MHz), plus

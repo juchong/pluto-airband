@@ -186,7 +186,7 @@ These are the exact constants baked into the shipping bitstream.
 | Channels per lane (`chans_per_lane`) | **3** | → `ceil(18/3)` = **6 lanes** (`[3,3,3,3,3,3]`) |
 | Input | **12-bit IQ @ 16 Msps** | AD9361 delivers the working rate directly (no separate front-end decimator) |
 | Lane decimation (`decimation`) | **160** | channel rate = 16 MHz / 160 = 100000 sps |
-| Cleanup FIR | **63-tap complex, folded** | `design_cic_compensation(160, 3, 63, 0.164, 0.2625)`, `out_shift=17`; inverts CIC droop and doubles as the channel-select filter, set to the full AM voice bandwidth (~±8 kHz at the 100000 sps channel rate: flat through ~6 kHz, −1.1 dB @8 kHz, ~−95 dB at the 25 kHz adjacent channel) |
+| Cleanup FIR | **63-tap complex, folded** | `design_cic_compensation(160, 3, 63, 0.068, 0.109)`, `out_shift=19`; inverts CIC droop and doubles as the channel-select filter, set to a **3.4 kHz voice corner** at the 100000 sps channel rate: −3.4 dB @3.4 kHz, −5.6 dB @4 kHz, −19 dB @6 kHz, −49 dB @8 kHz, ~−112 dB at the 25 kHz adjacent channel. Narrowing the corner from the original ±8 kHz to the AM voice band trims out-of-voice noise/spurs the AM detector would otherwise fold into the audio; tap count (and therefore DSP/BRAM/timing) is unchanged — only the passband width and `out_shift` differ |
 | AM magnitude | **CORDIC vectoring**, 12 iterations | ripple-free `|I+jQ|`; no angle-dependent gain modulation (multiplier-free) |
 | DC block | one-pole high-pass, `dcblock_k=10` | strips the carrier-DC term left by the detector |
 | Audio decimation (`audio_decim`) | **5**, CIC order (`cic_stages`) **4** | audio rate = 100000 / 5 = **20000 sps** (order-4 CIC droop −1.6 dB @3.4 kHz, −5.1 dB @6 kHz) |

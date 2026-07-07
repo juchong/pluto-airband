@@ -212,7 +212,9 @@ Fix by mechanism (cheapest first). Full detail in
 
 **Bitstream / HDL (reflash)**
 6. **Tighten the channelizer cleanup FIR** (~±6 → ±3.5 kHz; same tap count) to reject
-   near-edge spurs.
+   near-edge spurs. **Done:** the cleanup FIR now has a 3.4 kHz voice corner
+   (`design_cic_compensation(160, 3, 63, 0.068, 0.109)`, `out_shift=19`), down from
+   the original ±8 kHz, trimming out-of-voice noise before AM detection (SPEC §4.2).
 7. **FPGA wideband notch** at the fixed offsets (if the chip FIR is insufficient).
 8. **Change Fs / decimation** so n·Fs lands in a guard gap — root fix for the
    sample-clock tooth, largest effort. **Done:** the 16 MHz build puts the in-band

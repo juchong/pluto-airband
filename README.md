@@ -614,7 +614,7 @@ the built-in default (no SD card) is **0 dB**:
   "center_hz":   126400000,   // AD9361 RX LO (capture center) — keep within the built window
   "samp_rate":   16000000,    // MUST stay 16 MHz (the rate the channelizer was built for)
   "rf_bandwidth":16000000,
-  "gain_db":     30.0,        // fixed manual gain — ADJUSTABLE; built-in default (no SD card) is 0 dB (see Gain)
+  "gain_db":     12.0,        // fixed manual gain — ADJUSTABLE; built-in default (no SD card) is 0 dB (see Gain)
   "agc":         "manual",    // "manual" | "slow_attack" | "fast_attack" | "hybrid"
   "poll_ms":     20,
   "channels_hz": [ 119200000, 119900000, /* … your channels, up to 18 … */ 126875000, 133650000 ]
