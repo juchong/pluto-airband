@@ -52,6 +52,20 @@ uv run airband-monitor rfpi.chongflix.tv --feeds ../../feeds.json --record-dir .
 uv run airband-monitor rfpi.chongflix.tv --no-tui --channel 3
 ```
 
+## Connection indicators
+
+The header's second line shows live health for the two continuous data sources:
+
+- **Pi audio** — the monitor audio stream: `STREAMING` (green, data flowing),
+  `IDLE` (yellow, connected but no data — normal for a squelched `post` tap), or
+  `DOWN` (red, not connected).
+- **Pluto squelch** — the reader's `/status` squelch feed: `CONNECTED` (green),
+  `DOWN` (red, `/status` unreachable), or `disabled` (no `--metrics-port`).
+
+Channels whose squelch is currently open are marked with `*` and shown in green
+in the list, so you can see live activity across the plan. In `--no-tui` mode the
+same two states are printed on each status line.
+
 ## Keys (TUI)
 
 | Key | Action |

@@ -25,8 +25,13 @@ from .stream import fetch_status, monitor_url, open_stream, peak_dbfs
 
 VOL_STEP = 0.1
 VOL_MAX = 4.0
-SCAN_POLL_S = 0.3   # how often to poll /status while scanning
+SCAN_POLL_S = 0.3   # how often to poll /status
 SCAN_HANG_S = 1.5   # stay on a channel this long after it closes before hopping
+
+# curses color pair ids for the health indicators
+CLR_OK = 1
+CLR_WARN = 2
+CLR_BAD = 3
 
 
 def choose_scan_target(
@@ -97,6 +102,12 @@ class MonitorApp:
         self._recorders: dict[str, dict] = {}  # tap -> {thread, stop, resp, path}
         self.scan = False
         self.scan_status = ""
+        # Health/liveness for the two continuous data sources.
+        self.audio_connected = False       # playback HTTP stream is established
+        self._last_audio_ts = 0.0          # monotonic time of the last audio block
+        self.status_ok = False             # last /status poll succeeded
+        self._last_status_ts = 0.0
+        self.status_channels: list[dict] = []  # latest per-channel squelch/carrier
         self._thread = threading.Thread(target=self._worker, daemon=True)
         self._scan_thread = threading.Thread(target=self._scanner, daemon=True)
 
@@ -310,11 +321,13 @@ class MonitorApp:
                     self.status = f"connected  ch{ch:02d} {tap} @ {rate} Hz"
                 out = sd.RawOutputStream(samplerate=rate, channels=1, dtype="int16")
                 out.start()
+                self.audio_connected = True
                 chunk = max(2, int(rate * 0.02) * 2)  # ~20 ms of s16 mono
                 while not self._stop.is_set():
                     block = resp.read(chunk)
                     if not block:
                         break
+                    self._last_audio_ts = time.monotonic()
                     self.meter_dbfs = peak_dbfs(block)
                     out.write(self._process(block))
             except Exception as e:  # noqa: BLE001 (surface any error, then retry)
@@ -322,6 +335,7 @@ class MonitorApp:
                     self.status = f"reconnecting: {e}"
                 self.meter_dbfs = float("-inf")
             finally:
+                self.audio_connected = False
                 if out is not None:
                     out.stop()
                     out.close()
@@ -337,47 +351,58 @@ class MonitorApp:
             if not self._stop.is_set() and not changed:
                 self._stop.wait(1.0)  # backoff after a real error
 
-    # ---- scanner ---------------------------------------------------------
+    # ---- /status poller (squelch health + scanner) ----------------------
 
     def _scanner(self) -> None:
-        """While scanning, poll the reader's /status and hop playback to the
-        strongest active channel, riding out each transmission."""
+        """Continuously poll the reader's /status: keeps the squelch-data health
+        indicator and per-channel open flags live, and (while scanning) hops
+        playback to the strongest active channel, riding out transmissions."""
         last_open = time.monotonic()
         while not self._stop.is_set():
-            if not self.scan:
-                last_open = time.monotonic()
-                self._stop.wait(0.2)
-                continue
-            try:
-                chans = fetch_status(self.status_hostport)  # type: ignore[arg-type]
-            except Exception as e:  # noqa: BLE001
-                with self._lock:
-                    self.scan_status = f"scan: /status unreachable ({e})"
+            if not self.status_hostport:
                 self._stop.wait(1.0)
                 continue
-            with self._lock:
-                cur = self.channel
+            try:
+                chans = fetch_status(self.status_hostport)
+            except Exception as e:  # noqa: BLE001
+                with self._lock:
+                    self.status_ok = False
+                    if self.scan:
+                        self.scan_status = f"scan: /status unreachable ({e})"
+                self._stop.wait(1.0)
+                continue
             now = time.monotonic()
+            with self._lock:
+                self.status_ok = True
+                self._last_status_ts = now
+                self.status_channels = chans
+                cur = self.channel
+                scanning = self.scan
             cur_open = any(c.get("ch") == cur and c.get("open") for c in chans)
             if cur_open:
                 last_open = now
             idle = now - last_open
-            n_active = sum(1 for c in chans if c.get("open"))
-            with self._lock:
-                self.scan_status = (
-                    f"scan: {n_active} active"
-                    + ("" if cur_open else f", idle {idle:.1f}s")
-                )
-            target = choose_scan_target(chans, cur, idle, SCAN_HANG_S)
-            if target is not None:
-                self.set_channel(target)
-                last_open = now
+            if scanning:
+                n_active = sum(1 for c in chans if c.get("open"))
+                with self._lock:
+                    self.scan_status = (
+                        f"scan: {n_active} active"
+                        + ("" if cur_open else f", idle {idle:.1f}s")
+                    )
+                target = choose_scan_target(chans, cur, idle, SCAN_HANG_S)
+                if target is not None:
+                    self.set_channel(target)
+                    last_open = now
             self._stop.wait(SCAN_POLL_S)
 
     # ---- snapshot for the UI --------------------------------------------
 
     def snapshot(self) -> dict:
+        now = time.monotonic()
         with self._lock:
+            audio_fresh = self.audio_connected and (now - self._last_audio_ts) < 1.5
+            status_fresh = self.status_ok and (now - self._last_status_ts) < 3.0
+            open_chs = {c.get("ch") for c in self.status_channels if c.get("open")}
             return {
                 "channel": self.channel,
                 "tap": self.tap,
@@ -390,6 +415,11 @@ class MonitorApp:
                 "mute": self.mute,
                 "rate": self.rate,
                 "status": self.status,
+                "audio_connected": self.audio_connected,
+                "audio_fresh": audio_fresh,
+                "status_configured": self.status_hostport is not None,
+                "status_ok": status_fresh,
+                "open_channels": open_chs,
             }
 
 
@@ -415,6 +445,12 @@ def _tui_loop(stdscr, app: MonitorApp) -> None:
     curses.curs_set(0)
     stdscr.nodelay(True)
     stdscr.timeout(100)
+    if curses.has_colors():
+        curses.start_color()
+        curses.use_default_colors()
+        curses.init_pair(CLR_OK, curses.COLOR_GREEN, -1)
+        curses.init_pair(CLR_WARN, curses.COLOR_YELLOW, -1)
+        curses.init_pair(CLR_BAD, curses.COLOR_RED, -1)
     app.start()
     pending = ""  # digits typed for a channel jump
     try:
@@ -470,6 +506,33 @@ def _addline(stdscr, y: int, text: str, width: int, attr: int = 0) -> None:
         pass
 
 
+def _clr(pair: int) -> int:
+    return (curses.color_pair(pair) | curses.A_BOLD) if curses.has_colors() else curses.A_BOLD
+
+
+def _add_segments(stdscr, y: int, segments: list[tuple[str, int]], width: int) -> None:
+    """Write ``(text, attr)`` segments left-to-right on one row, clipped to
+    ``width - 1`` and swallowing the bottom-right-corner error."""
+    x = 0
+    for text, attr in segments:
+        if x >= width - 1:
+            break
+        chunk = text[: width - 1 - x]
+        try:
+            stdscr.addnstr(y, x, chunk, len(chunk), attr)
+        except curses.error:
+            pass
+        x += len(chunk)
+
+
+def _indicator(label: str, ok: bool, warn: bool = False, ok_text: str = "UP", bad_text: str = "DOWN"):
+    """Return the (text, attr) segments for one health indicator."""
+    if warn:
+        return [(f"  {label}: ", curses.A_NORMAL), ("IDLE", _clr(CLR_WARN))]
+    state = ok_text if ok else bad_text
+    return [(f"  {label}: ", curses.A_NORMAL), (state, _clr(CLR_OK if ok else CLR_BAD))]
+
+
 def _draw(stdscr, app: MonitorApp, pending: str) -> None:
     snap = app.snapshot()
     stdscr.erase()
@@ -483,9 +546,20 @@ def _draw(stdscr, app: MonitorApp, pending: str) -> None:
     )
     _addline(stdscr, 0, header, w, curses.A_REVERSE)
 
-    _addline(stdscr, 1, f" {_meter_bar(app.meter_dbfs)}", w)
-    _addline(stdscr, 2, f" status: {snap['status']}", w)
-    row = 3
+    # Connection health for the two continuous sources.
+    audio = _indicator(
+        "Pi audio", snap["audio_connected"], warn=snap["audio_connected"] and not snap["audio_fresh"],
+        ok_text="STREAMING",
+    )
+    if snap["status_configured"]:
+        squelch = _indicator("Pluto squelch", snap["status_ok"], ok_text="CONNECTED")
+    else:
+        squelch = [("  Pluto squelch: ", curses.A_NORMAL), ("disabled", _clr(CLR_WARN))]
+    _add_segments(stdscr, 1, [(" ", curses.A_NORMAL), *audio, *squelch], w)
+
+    _addline(stdscr, 2, f" {_meter_bar(app.meter_dbfs)}", w)
+    _addline(stdscr, 3, f" status: {snap['status']}", w)
+    row = 4
     if snap["scan_status"]:
         _addline(stdscr, row, f" {snap['scan_status']}", w)
         row += 1
@@ -498,15 +572,23 @@ def _draw(stdscr, app: MonitorApp, pending: str) -> None:
         row += 1
 
     top = row + 1
-    _addline(stdscr, top, "  #   freq (MHz)  label", w, curses.A_BOLD)
+    _addline(stdscr, top, "  # o freq (MHz)  label   (o = squelch open)", w, curses.A_BOLD)
     cur = snap["channel"]
+    open_chs = snap["open_channels"]
     for i, c in enumerate(app.channels):
         r = top + 1 + i
         if r >= h - 1:
             break
         marker = ">" if i == cur else " "
-        line = f"{marker} {i:>2}  {c.freq_mhz:10.3f}  {c.label}"
-        _addline(stdscr, r, line, w, curses.A_REVERSE if i == cur else curses.A_NORMAL)
+        is_open = i in open_chs
+        line = f"{marker}{i:>2} {'*' if is_open else ' '} {c.freq_mhz:10.3f}  {c.label}"
+        if i == cur:
+            attr = curses.A_REVERSE
+        elif is_open:
+            attr = _clr(CLR_OK)  # squelch open -> green (live squelch data)
+        else:
+            attr = curses.A_NORMAL
+        _addline(stdscr, r, line, w, attr)
 
     footer = " j/k: channel  #+Enter: jump  t: pre/post  s: scan  r: rec tap  b: rec both  +/-: vol  m: mute  q: quit "
     if pending:
@@ -528,9 +610,12 @@ def run_headless(app: MonitorApp) -> None:
     try:
         while True:
             snap = app.snapshot()
-            if snap["status"] != last:
-                print(snap["status"], flush=True)
-                last = snap["status"]
+            audio = "streaming" if snap["audio_fresh"] else ("connected" if snap["audio_connected"] else "DOWN")
+            sq = "n/a" if not snap["status_configured"] else ("connected" if snap["status_ok"] else "DOWN")
+            line = f"[Pi audio: {audio}] [Pluto squelch: {sq}] {snap['status']}"
+            if line != last:
+                print(line, flush=True)
+                last = line
             time.sleep(0.5)
     except KeyboardInterrupt:
         pass
