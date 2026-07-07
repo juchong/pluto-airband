@@ -80,10 +80,18 @@ pub struct SquelchConfig {
     /// carrier to lose, so a normal speech gap would trip it and reintroduce
     /// chatter; **disabled by default** (`0.0`). Set > 0 only with a real carrier.
     pub low_signal_abort_ms: f32,
+    /// Open/close hysteresis in dB: the *close* threshold sits this many dB below
+    /// the *open* threshold, so a transmission that has opened holds until the
+    /// level falls to `open_threshold / 10^(hysteresis_db/20)` (a distinct, lower
+    /// bar than the one it opened on). This lets a weak station ride through fades
+    /// and lets the open threshold be run low for sensitivity without chatter.
+    /// `0.0` = a single threshold (original behaviour).
+    pub hysteresis_db: f32,
 }
 
 impl SquelchConfig {
-    /// Defaults tuned for DC-blocked audio: 1 s hang, carrier-loss abort off.
+    /// Defaults tuned for DC-blocked audio: 1 s hang, carrier-loss abort off,
+    /// single threshold (no hysteresis).
     pub fn new(mode: SquelchMode, rate: u32) -> SquelchConfig {
         SquelchConfig {
             mode,
@@ -91,12 +99,19 @@ impl SquelchConfig {
             open_delay_ms: 5.0,
             close_delay_ms: 1000.0,
             low_signal_abort_ms: 0.0,
+            hysteresis_db: 0.0,
         }
     }
 
     /// Sets the hang time (close delay) in milliseconds (builder style).
     pub fn with_hang_ms(mut self, ms: f32) -> SquelchConfig {
         self.close_delay_ms = ms;
+        self
+    }
+
+    /// Sets the open/close hysteresis in dB (builder style; clamped to >= 0).
+    pub fn with_hysteresis_db(mut self, db: f32) -> SquelchConfig {
+        self.hysteresis_db = db.max(0.0);
         self
     }
 }
@@ -126,6 +141,9 @@ pub struct Squelch {
 
     noise_floor: f32,
     level: f32,
+    /// Close threshold as a fraction of the open threshold (`10^(-hysteresis_db/20)`,
+    /// so `1.0` = no hysteresis). See [`SquelchConfig::hysteresis_db`].
+    close_ratio: f32,
 
     state: SquelchState,
     delay: u32,
@@ -162,6 +180,7 @@ impl Squelch {
             // floor converges downward to the true inter-transmission noise level.
             noise_floor: SAMPLE_SCALE * 0.01,
             level: 0.0,
+            close_ratio: 10f32.powf(-cfg.hysteresis_db.max(0.0) / 20.0),
             state: SquelchState::Closed,
             delay: 0,
             open_delay: ms_to_samples(cfg.open_delay_ms),
@@ -240,6 +259,19 @@ impl Squelch {
     /// `mag` is the instantaneous magnitude `|sample|` in raw 24-bit units. Returns
     /// the post-update state. When the squelch is disabled, always reports `Open`.
     pub fn process(&mut self, mag: f32) -> SquelchState {
+        self.process_gated(mag, true)
+    }
+
+    /// Like [`process`](Self::process) but an external discriminator may veto a
+    /// *new* opening. While `allow_open` is false the squelch cannot transition
+    /// CLOSED->OPEN (used to require voice-like structure, not just energy — see
+    /// [`crate::SpectralFlatness`]), but an already-open transmission is **not**
+    /// force-closed by it: energy + hysteresis + hang still manage closing, so a
+    /// brief non-voice frame mid-transmission does not chop the audio.
+    ///
+    /// Opening is gated by the open threshold; closing by the (lower) close
+    /// threshold `open_threshold * close_ratio` (see [`SquelchConfig::hysteresis_db`]).
+    pub fn process_gated(&mut self, mag: f32, allow_open: bool) -> SquelchState {
         self.just_opened = false;
         self.just_closed = false;
 
@@ -260,10 +292,12 @@ impl Squelch {
                 .max(MIN_NOISE_FLOOR);
         }
 
-        let thr = self.threshold();
+        let open_thr = self.threshold();
+        let close_thr = open_thr * self.close_ratio;
 
-        // Fast drop detection works on the instantaneous magnitude.
-        if mag < thr {
+        // Fast drop detection works on the instantaneous magnitude against the
+        // lower (close) bar, so a marginal open signal is not aborted prematurely.
+        if mag < close_thr {
             self.low_signal_count = self.low_signal_count.saturating_add(1);
         } else {
             self.low_signal_count = 0;
@@ -271,13 +305,15 @@ impl Squelch {
 
         match self.state {
             SquelchState::Closed => {
-                if self.level >= thr {
+                if allow_open && self.level >= open_thr {
                     self.state = SquelchState::Opening;
                     self.delay = 0;
                 }
             }
             SquelchState::Opening => {
-                if self.level < thr {
+                // Revert if the discriminator withdraws consent or the level drops
+                // below the (high) open bar before the open delay elapses.
+                if !allow_open || self.level < open_thr {
                     self.state = SquelchState::Closed;
                 } else {
                     self.delay += 1;
@@ -293,7 +329,7 @@ impl Squelch {
                     self.state = SquelchState::LowSignalAbort;
                     self.delay = 0;
                     self.just_closed = true;
-                } else if self.level < thr {
+                } else if self.level < close_thr {
                     self.state = SquelchState::Closing;
                     self.delay = 0;
                 }
@@ -303,7 +339,8 @@ impl Squelch {
                     self.state = SquelchState::LowSignalAbort;
                     self.delay = 0;
                     self.just_closed = true;
-                } else if self.level >= thr {
+                } else if self.level >= close_thr {
+                    // Recovered above the low bar within the hang window: stay open.
                     self.state = SquelchState::Open;
                 } else {
                     self.delay += 1;
@@ -415,8 +452,22 @@ impl CarrierFloor {
     /// [`MIN`](Self::MIN). Returns `f32::MAX` (always shut) until seeded.
     #[inline]
     pub fn threshold(&self, snr_ratio: f32) -> f32 {
+        self.threshold_common(snr_ratio, 0.0)
+    }
+
+    /// Threshold using the larger of this channel's slow per-channel floor and a
+    /// live `common_mode` noise reference (the ~real-time cross-channel median
+    /// from [`carrier_noise_threshold`]). The per-channel floor handles each
+    /// channel's steady conducted-comb baseline; the common-mode term tracks the
+    /// fast, band-wide fluctuation a nearby broadband emitter causes on **all**
+    /// channels at once — which the 5 s per-channel EWMA is far too slow to
+    /// follow. Taking the max means a band-wide noise burst raises the threshold
+    /// immediately (no false open), and the moment it passes the threshold drops
+    /// back so a weak station is not masked. Returns `f32::MAX` until seeded.
+    #[inline]
+    pub fn threshold_common(&self, snr_ratio: f32, common_mode: f32) -> f32 {
         if self.seeded {
-            self.floor.max(Self::MIN) * snr_ratio
+            self.floor.max(common_mode).max(Self::MIN) * snr_ratio
         } else {
             f32::MAX
         }
@@ -632,6 +683,79 @@ mod tests {
             f.update(1.0e6, false);
         }
         assert_eq!(f.threshold(1.0), before, "floor must not move while open");
+    }
+
+    #[test]
+    fn hysteresis_holds_open_below_open_threshold() {
+        // With 12 dB hysteresis (close bar at 1/4 of the open bar), a signal that
+        // opened then fades to *below* the open threshold but *above* the close
+        // threshold must stay open — where a single-threshold squelch would close.
+        let rate = 15625;
+        let cfg = SquelchConfig::new(SquelchMode::AutoSnr { snr_db: 9.0 }, rate)
+            .with_hysteresis_db(12.0);
+        let mut sq = Squelch::new(cfg);
+        for _ in 0..200_000 {
+            sq.process(50.0); // settle floor ~50 -> open thr ~141, close thr ~35
+        }
+        for _ in 0..4000 {
+            sq.process(750.0);
+        }
+        assert!(sq.is_open(), "strong signal opens");
+        let open_thr = sq.threshold();
+        // Fade to just under the open threshold but well over the close bar.
+        for _ in 0..4000 {
+            sq.process(open_thr * 0.5);
+        }
+        assert!(sq.is_open(), "must hold open between the close and open bars");
+        // A single-threshold squelch (no hysteresis) closes at the same level.
+        let mut plain = Squelch::new(SquelchConfig::new(SquelchMode::AutoSnr { snr_db: 9.0 }, rate));
+        for _ in 0..200_000 {
+            plain.process(50.0);
+        }
+        for _ in 0..4000 {
+            plain.process(750.0);
+        }
+        let pthr = plain.threshold();
+        for _ in 0..30_000 {
+            plain.process(pthr * 0.5);
+        }
+        assert!(!plain.is_open(), "no-hysteresis squelch closes below its threshold");
+    }
+
+    #[test]
+    fn gate_vetoes_open_but_does_not_chop() {
+        // allow_open=false must block a fresh open even on a strong level, but must
+        // NOT close an already-open transmission (a brief non-voice frame).
+        let mut sq = auto(15625, 9.0);
+        for _ in 0..200_000 {
+            sq.process_gated(50.0, true);
+        }
+        // Strong level, but discriminator says "not voice" -> stays shut.
+        for _ in 0..4000 {
+            sq.process_gated(750.0, false);
+        }
+        assert!(!sq.is_open(), "veto must block opening on non-voice energy");
+        // Now allow it -> opens.
+        for _ in 0..4000 {
+            sq.process_gated(750.0, true);
+        }
+        assert!(sq.is_open(), "opens once the discriminator consents");
+        // A single vetoed sample mid-transmission must not close it.
+        sq.process_gated(750.0, false);
+        assert!(sq.is_open(), "a brief non-voice frame must not chop an open tx");
+    }
+
+    #[test]
+    fn threshold_common_takes_the_larger_floor() {
+        let mut f = CarrierFloor::new(20000);
+        f.seed(100.0);
+        // Per-channel floor at ~100; a live common-mode burst of 500 dominates.
+        assert_eq!(f.threshold_common(1.0, 500.0), 500.0);
+        // When the common-mode is below the per-channel floor, the floor wins.
+        assert_eq!(f.threshold_common(1.0, 10.0), 100.0);
+        // Unseeded stays always-shut regardless of the common-mode reference.
+        let g = CarrierFloor::new(20000);
+        assert_eq!(g.threshold_common(1.0, 500.0), f32::MAX);
     }
 
     #[test]

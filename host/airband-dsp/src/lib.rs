@@ -9,11 +9,13 @@
 mod agc;
 mod denoise;
 mod filter;
+mod flatness;
 mod squelch;
 
 pub use agc::Agc;
 pub use denoise::Denoise;
 pub use filter::{HighShelf, LowPass, Notch, VoiceFilter};
+pub use flatness::SpectralFlatness;
 pub use squelch::{
     carrier_noise_threshold, CarrierFloor, Squelch, SquelchConfig, SquelchMode, SquelchState,
 };

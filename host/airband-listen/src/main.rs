@@ -37,8 +37,8 @@
 //!   q                   quit
 
 use airband_dsp::{
-    carrier_noise_threshold, decode_carrier, Agc, CarrierFloor, Denoise, LowPass, Notch, Squelch,
-    SquelchConfig, SquelchMode, SquelchState, VoiceFilter, SAMPLE_SCALE,
+    carrier_noise_threshold, decode_carrier, Agc, CarrierFloor, Denoise, LowPass, Notch,
+    SpectralFlatness, Squelch, SquelchConfig, SquelchMode, SquelchState, VoiceFilter, SAMPLE_SCALE,
 };
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
@@ -146,6 +146,22 @@ struct Args {
     /// pauses in continuous speech like AWOS/ATIS so it does not chatter).
     #[arg(long, default_value_t = 1000.0)]
     squelch_hang_ms: f32,
+    /// Squelch open/close hysteresis in dB. Once a transmission opens, hold it
+    /// until the level falls this far *below* the open threshold (a distinct,
+    /// lower close bar). Lets a weak station ride through fades and lets a low
+    /// `--squelch-snr` stay chatter-free (0 = single threshold).
+    #[arg(long, default_value_t = 6.0)]
+    squelch_hysteresis_db: f32,
+    /// Gate squelch opening on a spectral-flatness voice detector: only open on
+    /// voice-like (tonal) audio, not flat broadband noise. Pair with a low
+    /// `--squelch-snr` to stay sensitive to weak stations while a band-wide noise
+    /// burst (a nearby transmitter) cannot open the squelch. Off by default.
+    #[arg(long)]
+    squelch_voice_gate: bool,
+    /// Max spectral flatness (0-1) still treated as voice for `--squelch-voice-gate`
+    /// (broadband noise ~1, voiced audio well below; lower = stricter).
+    #[arg(long, default_value_t = 0.5)]
+    squelch_voice_flatness: f32,
     /// Disable the AGC (play raw, band-passed audio scaled by the sink volume).
     #[arg(long)]
     no_agc: bool,
@@ -223,6 +239,9 @@ struct DspCfg {
     lpf_hz: f64,
     squelch_mode: SquelchMode,
     squelch_hang_ms: f32,
+    squelch_hysteresis_db: f32,
+    voice_gate: bool,
+    voice_flatness: f32,
     notch_freq: Option<f64>,
     notch_q: f64,
     denoise_floor_db: f32,
@@ -487,6 +506,10 @@ struct ChannelDsp {
 /// STFT frame size for the spectral denoiser (~13 ms at 20000 sps).
 const DENOISE_FRAME: usize = 256;
 
+/// FFT frame for the spectral-flatness voice gate (~26 ms at 20000 sps; longer
+/// than the denoiser's for finer voice-band bin resolution).
+const VOICE_FRAME: usize = 512;
+
 impl ChannelDsp {
     fn new(cfg: &DspCfg) -> ChannelDsp {
         ChannelDsp {
@@ -563,13 +586,24 @@ fn reader_loop(shared: Arc<Shared>, addr: String, n: usize, cfg: DspCfg, mix: bo
     let mut squelches: Vec<Squelch> = (0..n)
         .map(|_| {
             Squelch::new(
-                SquelchConfig::new(cfg.squelch_mode, cfg.rate).with_hang_ms(cfg.squelch_hang_ms),
+                SquelchConfig::new(cfg.squelch_mode, cfg.rate)
+                    .with_hang_ms(cfg.squelch_hang_ms)
+                    .with_hysteresis_db(cfg.squelch_hysteresis_db),
             )
         })
         .collect();
     // Per-channel adaptive carrier-noise floor (carrier mode): each channel gates
     // a fixed dB margin above its *own* drifting baseline, not one shared line.
     let mut carrier_floors: Vec<CarrierFloor> = (0..n).map(|_| CarrierFloor::new(cfg.rate)).collect();
+    // Per-channel spectral-flatness voice gate (--squelch-voice-gate): blocks a
+    // *new* open on flat broadband noise so a low SNR margin stays sensitive to
+    // weak stations. `None` per channel when disabled.
+    let mut voice_gates: Vec<Option<SpectralFlatness>> = (0..n)
+        .map(|_| {
+            (cfg.voice_gate && !matches!(cfg.squelch_mode, SquelchMode::Off))
+                .then(|| SpectralFlatness::new(cfg.rate as f64, VOICE_FRAME, cfg.voice_flatness))
+        })
+        .collect();
     // In carrier-squelch mode the main squelch keys on the carrier; this
     // audio-energy VOX drives the `above` (speech-present) flag for AGC/denoise.
     let mut audio_gates: Vec<Option<Squelch>> = (0..n)
@@ -654,8 +688,11 @@ fn reader_loop(shared: Arc<Shared>, addr: String, n: usize, cfg: DspCfg, mix: bo
 
                     let mag = sample.unsigned_abs() as f32;
                     atomic_max_f32(&shared.peak[chan], mag);
-                    // Voice-band magnitude for VOX squelch (excludes comb/rumble).
-                    let sq_mag = sq_filters[chan].process(sample as f64).abs() as f32;
+                    // Voice-band signal for VOX squelch and the voice/noise gate
+                    // (excludes comb/rumble). Keep the pre-rectified value for the
+                    // flatness detector (it needs the spectrum, not the magnitude).
+                    let sq_filt = sq_filters[chan].process(sample as f64) as f32;
+                    let sq_mag = sq_filt.abs();
 
                     // Carrier mode keys the squelch on the FPGA carrier level; all
                     // other modes key on voice-band modulation energy (VOX).
@@ -663,18 +700,27 @@ fn reader_loop(shared: Arc<Shared>, addr: String, n: usize, cfg: DspCfg, mix: bo
                         SquelchMode::Carrier { .. } => decode_carrier(carrier),
                         _ => sq_mag,
                     };
+                    // (B) Spectral-flatness voice gate: only permit a *new* open on
+                    // voice-like audio, never on flat broadband noise. Fed every
+                    // sample; true (no veto) when disabled.
+                    let allow_open = match voice_gates[chan].as_mut() {
+                        Some(v) => v.process(sq_filt),
+                        None => true,
+                    };
                     // Squelch runs on every channel so the meter shows activity.
                     let sq = &mut squelches[chan];
-                    // Carrier mode: gate a fixed dB margin above this channel's own
-                    // adaptive floor (seeded from the cross-channel reference; the
-                    // floor then tracks this channel's idle baseline itself).
+                    // Carrier mode: gate a fixed dB margin above the *larger* of this
+                    // channel's own slow adaptive floor and the live cross-channel
+                    // common-mode noise reference (A) — so a band-wide noise burst
+                    // raises every channel's bar at once (no lag, no false open),
+                    // while the per-channel floor still handles the steady comb.
                     if carrier_mode {
                         let f = &mut carrier_floors[chan];
                         f.seed(last_noise);
                         f.update(sq_level, sq.state() == SquelchState::Closed);
-                        sq.set_threshold(f.threshold(carrier_snr_ratio));
+                        sq.set_threshold(f.threshold_common(carrier_snr_ratio, last_noise));
                     }
-                    let st = sq.process(sq_level);
+                    let st = sq.process_gated(sq_level, allow_open);
                     shared.sq_open[chan].store(sq.is_open(), Ordering::Relaxed);
 
                     let filter_on = shared.filter_on.load(Ordering::Relaxed);
@@ -957,6 +1003,9 @@ fn main() -> Result<()> {
         lpf_hz: args.lpf_hz,
         squelch_mode,
         squelch_hang_ms: args.squelch_hang_ms,
+        squelch_hysteresis_db: args.squelch_hysteresis_db,
+        voice_gate: args.squelch_voice_gate,
+        voice_flatness: args.squelch_voice_flatness,
         notch_freq: args.notch,
         notch_q: args.notch_q,
         denoise_floor_db: args.denoise_floor_db,

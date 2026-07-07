@@ -41,7 +41,8 @@ mod mqtt;
 use airband_dfn::{DfnEnhancer, DfnParams, InferencePermit, Presence};
 use airband_dsp::{
     carrier_noise_threshold, decode_carrier, level_to_dbfs, Agc, CarrierFloor, Denoise, LowPass,
-    Notch, Squelch, SquelchConfig, SquelchMode, SquelchState, VoiceFilter, SAMPLE_SCALE,
+    Notch, SpectralFlatness, Squelch, SquelchConfig, SquelchMode, SquelchState, VoiceFilter,
+    SAMPLE_SCALE,
 };
 
 /// Carrier-squelch: population percentile used as the cross-channel noise
@@ -135,6 +136,23 @@ struct Args {
     /// a single transmission in one file).
     #[arg(long, default_value_t = 1000.0)]
     squelch_hang_ms: f32,
+    /// Squelch open/close hysteresis in dB. Once a transmission opens, hold it
+    /// until the level falls this far *below* the open threshold (a distinct,
+    /// lower close bar). Lets a weak station ride through fades and lets a low
+    /// `--squelch-snr` stay chatter-free (0 = single threshold).
+    #[arg(long, default_value_t = 6.0)]
+    squelch_hysteresis_db: f32,
+    /// Gate squelch opening on a spectral-flatness voice detector: only open on
+    /// voice-like (tonal) audio, not flat broadband noise. Pair with a low
+    /// `--squelch-snr` to stay sensitive to weak stations while a band-wide noise
+    /// burst (a nearby transmitter) cannot open the squelch. Off by default;
+    /// field-tune `--squelch-voice-flatness` before enabling on a feed.
+    #[arg(long)]
+    squelch_voice_gate: bool,
+    /// Max spectral flatness (0-1) still treated as voice for `--squelch-voice-gate`
+    /// (broadband noise ~1, voiced audio well below; lower = stricter).
+    #[arg(long, default_value_t = 0.5)]
+    squelch_voice_flatness: f32,
     /// Write one continuous file per channel instead of one file per transmission.
     #[arg(long)]
     no_split: bool,
@@ -303,6 +321,9 @@ struct Config {
     shift: i32,
     squelch_mode: SquelchMode,
     squelch_hang_ms: f32,
+    squelch_hysteresis_db: f32,
+    voice_gate: bool,
+    voice_flatness: f32,
     split: bool,
     min_samples: u64,
     agc_on: bool,
@@ -487,6 +508,10 @@ impl Recorder {
 
 /// STFT frame size for the spectral denoiser (~13 ms at 20000 sps).
 const DENOISE_FRAME: usize = 256;
+
+/// FFT frame for the spectral-flatness voice gate (~26 ms at 20000 sps; longer
+/// than the denoiser's for finer voice-band bin resolution).
+const VOICE_FRAME: usize = 512;
 
 /// Counting semaphore bounding how many DeepFilterNet **inferences** run at once
 /// (`--dfn-max-active`). It is acquired per NN hop (see [`InferencePermit`]) —
@@ -677,6 +702,10 @@ struct Worker {
     /// decision independent of the playback filter and excludes the out-of-band
     /// conducted comb and low-frequency rumble.
     sq_filter: VoiceFilter,
+    /// Spectral-flatness voice discriminator gating the squelch *open* transition
+    /// (`--squelch-voice-gate`): blocks opening on flat broadband noise so a low
+    /// SNR margin can stay sensitive to weak stations. `None` when disabled.
+    voice: Option<SpectralFlatness>,
     vf: VoiceFilter,
     lpf: Option<LowPass>,
     notch: Option<Notch>,
@@ -712,7 +741,9 @@ impl Worker {
         Worker {
             index,
             squelch: Squelch::new(
-                SquelchConfig::new(cfg.squelch_mode, cfg.rate).with_hang_ms(cfg.squelch_hang_ms),
+                SquelchConfig::new(cfg.squelch_mode, cfg.rate)
+                    .with_hang_ms(cfg.squelch_hang_ms)
+                    .with_hysteresis_db(cfg.squelch_hysteresis_db),
             ),
             carrier_floor: CarrierFloor::new(cfg.rate),
             carrier_snr_ratio: match cfg.squelch_mode {
@@ -727,6 +758,8 @@ impl Worker {
                 _ => None,
             },
             sq_filter: VoiceFilter::new(cfg.rate as f64, 300.0, 3400.0),
+            voice: (cfg.voice_gate && !matches!(cfg.squelch_mode, SquelchMode::Off))
+                .then(|| SpectralFlatness::new(cfg.rate as f64, VOICE_FRAME, cfg.voice_flatness)),
             vf: VoiceFilter::new(cfg.rate as f64, cfg.low, cfg.high),
             lpf: (cfg.lpf_hz > 0.0).then(|| LowPass::new(cfg.rate as f64, cfg.lpf_hz)),
             notch: cfg
@@ -884,30 +917,44 @@ impl Worker {
         sem: &Semaphore,
         metric: &metrics::ChannelMetric,
     ) -> Result<()> {
-        // Voice-band magnitude drives both the VOX squelch and the speech-present
-        // flag (excludes the conducted comb / rumble).
-        let sq_mag = self.sq_filter.process(sample as f64).abs() as f32;
+        // Voice-band signal drives the VOX squelch, the speech-present flag, and
+        // the voice/noise discriminator (excludes the conducted comb / rumble).
+        // Keep the pre-rectified value for the flatness detector (it needs the
+        // waveform's spectrum, not its magnitude).
+        let sq_filt = self.sq_filter.process(sample as f64) as f32;
+        let sq_mag = sq_filt.abs();
         // Carrier mode keys the squelch on the FPGA carrier level; all other
         // modes on voice-band modulation energy (VOX).
         let sq_level = match cfg.squelch_mode {
             SquelchMode::Carrier { .. } => decode_carrier(carrier),
             _ => sq_mag,
         };
-        // Carrier mode: gate a fixed dB margin above this channel's *own* adaptive
-        // noise floor (not one absolute line shared by all channels). `carrier_thr`
-        // carries the cross-channel noise reference, used only to seed the floor
-        // (>0 once the router warms up); the floor then tracks this channel's idle
-        // baseline itself, updating only while the squelch is shut.
+        // (B) Spectral-flatness voice gate: only permit a *new* open on voice-like
+        // audio, never on flat broadband noise. Fed every sample so its frames
+        // advance; returns true (no veto) when the gate is disabled.
+        let allow_open = match self.voice.as_mut() {
+            Some(v) => v.process(sq_filt),
+            None => true,
+        };
+        // Carrier mode: gate a fixed dB margin above the *larger* of this channel's
+        // own slow adaptive floor and the live cross-channel common-mode noise
+        // reference. `carrier_thr` carries that reference (raw units, no SNR),
+        // refreshed ~every 23 ms — it (A) drives the threshold in real time so a
+        // band-wide noise burst raises every channel's bar at once (no false open,
+        // no lag), and also seeds the per-channel floor on warm-up.
         if matches!(cfg.squelch_mode, SquelchMode::Carrier { .. }) {
+            let common = carrier_thr.unwrap_or(0.0);
             if let Some(noise) = carrier_thr {
                 self.carrier_floor.seed(noise);
             }
             self.carrier_floor
                 .update(sq_level, self.squelch.state() == SquelchState::Closed);
-            self.squelch
-                .set_threshold(self.carrier_floor.threshold(self.carrier_snr_ratio));
+            self.squelch.set_threshold(
+                self.carrier_floor
+                    .threshold_common(self.carrier_snr_ratio, common),
+            );
         }
-        self.squelch.process(sq_level);
+        self.squelch.process_gated(sq_level, allow_open);
         let gated = !matches!(cfg.squelch_mode, SquelchMode::Off);
         let open = !gated || self.squelch.is_open();
         let just_opened = gated && self.squelch.just_opened();
@@ -989,6 +1036,9 @@ impl Worker {
         }
         if let Some(p) = self.presence.as_mut() {
             p.reset();
+        }
+        if let Some(v) = self.voice.as_mut() {
+            v.reset();
         }
         self.since_checkpoint = 0;
     }
@@ -1212,6 +1262,9 @@ fn main() -> Result<()> {
         shift: args.shift,
         squelch_mode,
         squelch_hang_ms: args.squelch_hang_ms,
+        squelch_hysteresis_db: args.squelch_hysteresis_db,
+        voice_gate: args.squelch_voice_gate,
+        voice_flatness: args.squelch_voice_flatness,
         split: !args.no_split,
         min_samples: (args.min_transmission_ms * args.rate as u64) / 1000,
         agc_on: !args.no_agc,
