@@ -118,6 +118,40 @@ LiveATC?" without extra daemons:
   Change the channel by changing the URL — no restart. End-to-end latency is just
   the client's buffer (~100–200 ms), versus 30–60 s through Icecast.
 
+### Auto-recovery watchdog (`airband-watchdog.service`)
+
+The feeder's own `WatchdogSec=30` restarts a *hung* reader, but it does **not**
+cover a Pluto that goes offline: the reader keeps petting the systemd watchdog
+while it reconnects (by design — a healthy reader waiting for the board back
+shouldn't be killed), so a crashed `maia-httpd`, a wedged FPGA/DMA, or a dropped
+link is a **silent outage** — nothing restarts and `OnFailure=` never fires.
+
+`airband-watchdog.service` closes that gap. It polls the reader's `/status`
+heartbeat and, when `system_healthy` stays false past a threshold, escalates
+recovery on a cooldown (each stage gets time to work before the next):
+
+1. **restart `airband-feeds`** — clears a wedged reader / forces a clean reconnect;
+2. **bounce `maia-httpd` on the Pluto** (over SSH) — recovers a crashed daemon
+   without a full reboot;
+3. **reboot the Pluto** (over SSH) — recovers a wedged FPGA/DMA or kernel.
+
+Every action is announced to `AIRBAND_ALERT_URL` (same hook as the crash alert),
+and a "recovered" note fires when `/status` goes healthy again. A last-resort Pi
+reboot is available but **off by default** (`AIRBAND_WATCHDOG_REBOOT_PI=0`) — a Pi
+reboot can't fix a dead Pluto and takes the whole feeder down. All knobs live in
+`/etc/airband-feeds.env` (`AIRBAND_WATCHDOG_*`, see `airband-feeds.env.example`)
+and default to safe values; the only prerequisite for Pluto-side recovery is
+`sshpass` on the Pi (`sudo apt-get install -y sshpass`) or a key-based
+`AIRBAND_WATCHDOG_PLUTO_SSH` override.
+
+```bash
+sudo apt-get install -y sshpass                # for the Pluto-bounce/reboot stages
+sudo cp deploy/airband-watchdog.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now airband-watchdog.service
+journalctl -u airband-watchdog -f              # watch probes + recovery actions
+```
+
 ### MQTT → Home Assistant
 
 `ExecStart` already passes `--mqtt-broker/--mqtt-user/--mqtt-pass` from the

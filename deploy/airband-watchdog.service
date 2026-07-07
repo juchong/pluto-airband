@@ -1,0 +1,28 @@
+# /etc/systemd/system/airband-watchdog.service
+# Pluto<->Pi capture watchdog: detects a Pluto that has gone offline (which the
+# reader's own systemd WatchdogSec deliberately ignores — it keeps petting while
+# reconnecting, see airband-watchdog.sh) and escalates recovery the reader/systemd
+# cannot: restart the Pi feeder -> bounce the Pluto's maia-httpd -> reboot the
+# Pluto. Polls the reader's /status heartbeat on the metrics port.
+[Unit]
+Description=Pluto airband capture watchdog (Pluto<->Pi heartbeat + auto-recovery)
+Documentation=https://github.com/juchong/pluto-airband
+After=network-online.target airband-feeds.service
+Wants=network-online.target
+# Not a hard dependency: the watchdog should keep polling (and can restart the
+# feeder) even if the feeder is momentarily down.
+
+[Service]
+Type=simple
+# Runs as root: needs `systemctl restart airband-feeds` and, if enabled, `reboot`.
+# Reuses the feeder's env file for AIRBAND_ALERT_URL + the AIRBAND_WATCHDOG_* knobs
+# (all optional; the script has safe defaults). '-' => don't fail if it's absent.
+EnvironmentFile=-/etc/airband-feeds.env
+ExecStart=/home/pi/pluto-airband/deploy/airband-watchdog.sh
+Restart=always
+RestartSec=10
+# The script is a tiny poll loop; keep it lean.
+MemoryMax=64M
+
+[Install]
+WantedBy=multi-user.target
