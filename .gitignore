@@ -25,6 +25,9 @@ hdl/out/
 # OS / editor cruft
 .DS_Store
 
+# Local diagnostic captures/analysis (IQ recordings, WAVs, plots, scripts, logs)
+.ch9-analysis/
+
 # Built firmware images (large binaries)
 firmware/images/
 firmware/build/
