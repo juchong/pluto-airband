@@ -58,8 +58,15 @@ alert() {
         || log "alert POST to AIRBAND_ALERT_URL failed"
 }
 
-# Extract a boolean field from the flat /status JSON ("field":true|false).
+# Extract a boolean field from the flat /status JSON ("field":true|false). The
+# leading quote + trailing colon anchor the exact key, so a short name never
+# matches a longer one (e.g. stream_up vs maia_httpd_up); missing field -> empty.
 jbool() { printf '%s' "$1" | grep -o "\"$2\":[a-z]*" | head -1 | cut -d: -f2; }
+
+# deploy/airband-watchdog-selftest.sh sources this file with AIRBAND_WATCHDOG_LIB=1
+# to exercise jbool (the parse whose failure would silently misjudge health, or
+# falsely reboot the Pluto) without entering the poll loop.
+[ -n "${AIRBAND_WATCHDOG_LIB:-}" ] && return 0
 
 log "starting: url=$URL poll=${POLL}s threshold=$THRESH cooldown=${COOLDOWN}s grace=${GRACE}s reboot_pluto=$REBOOT_PLUTO reboot_pi=$REBOOT_PI"
 # Let the just-started feeder load its DeepFilterNet models and connect before we
