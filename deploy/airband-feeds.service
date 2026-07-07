@@ -41,11 +41,14 @@ EnvironmentFile=/etc/airband-feeds.env
 # quiet channel and a comb-hot one (e.g. ch17/133.650) with no per-channel tuning,
 # and the common-mode term makes a band-wide noise burst (a nearby transmitter)
 # raise every channel's bar at once instead of false-opening. Lowered 10 -> 8 to
-# catch weaker keyings; the voice gate + hysteresis below keep that chatter-free.
-# Raise if a channel false-opens (tx climbing while peak stays ~-120 dBFS = no audio).
-# --squelch-voice-gate: only OPEN on voice-like (tonal) audio, not flat broadband
-# noise (spectral-flatness discriminator). This is what makes the lower SNR safe:
-# a band-wide noise burst can exceed the threshold but cannot open the squelch.
+# catch weaker/distant tower keyings; the common-mode term + hysteresis below keep
+# that chatter-free. Raise if a channel false-opens (tx climbing while peak stays
+# ~-120 dBFS = no audio).
+# NOTE: --squelch-voice-gate (spectral-flatness discriminator) is deliberately OFF.
+# It rejects any non-tonal audio, and weak/distant tower transmissions are noisy
+# enough to read as broadband -> they were being vetoed and missed. The binary
+# still supports the flag (--squelch-voice-flatness, default 0.5) if band-wide
+# noise starts leaking; raise the flatness ceiling to admit noisier voice.
 # --squelch-hysteresis-db defaults to 6: once open, hold until the level falls 6 dB
 # below the open bar, so a weak keying rides through fades without re-arming.
 # --metrics-port 9108: serves Prometheus /metrics, a /healthz liveness probe, and
@@ -55,7 +58,7 @@ EnvironmentFile=/etc/airband-feeds.env
 # --mqtt-* -> Home Assistant: broker/user/pass come from the EnvironmentFile. An
 #   empty ${AIRBAND_MQTT_BROKER} (var unset) disables MQTT in-reader, so this line
 #   is safe whether or not the broker is configured — no separate "MQTT off" variant.
-ExecStart=/home/pi/pluto-airband/host/target/release/airband-reader plutoplus.chongflix.tv:30000 --feeds /home/pi/pluto-airband/feeds.json --channels 18 --rate 20000 --squelch carrier --squelch-snr 8 --squelch-voice-gate --metrics-port 9108 --monitor-port 8082 --mqtt-broker ${AIRBAND_MQTT_BROKER} --mqtt-user ${AIRBAND_MQTT_USER} --mqtt-pass ${AIRBAND_MQTT_PASS}
+ExecStart=/home/pi/pluto-airband/host/target/release/airband-reader plutoplus.chongflix.tv:30000 --feeds /home/pi/pluto-airband/feeds.json --channels 18 --rate 20000 --squelch carrier --squelch-snr 8 --metrics-port 9108 --monitor-port 8082 --mqtt-broker ${AIRBAND_MQTT_BROKER} --mqtt-user ${AIRBAND_MQTT_USER} --mqtt-pass ${AIRBAND_MQTT_PASS}
 # airband-reader reconnects to the Pluto and to Icecast on its own, so this only
 # fires on a real crash. Wait between restarts so a wedged Pluto isn't hammered.
 Restart=always
