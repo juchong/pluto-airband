@@ -274,16 +274,42 @@ push-to-talk traffic; raise it if a feed still chatters between words.
 
 A bitstream built from the current `hdl/` also ships a per-channel **carrier
 level** in each audio frame; with it, `--squelch carrier` gates on carrier power
-instead of voice energy. All channels of one receiver see the same wideband
-noise, so the host takes the **median** (50th percentile) of the live per-channel
-carrier levels as a shared **noise reference** and opens any channel whose carrier sits
-`--squelch-snr` dB above it. Because that threshold comes from the *other*
-channels' noise (not a channel's own level), it holds a continuous carrier
-(AWOS/ATIS) open with no hang and no chatter, while empty channels stay shut. The
-new bitstream and host tools must be deployed together.
+instead of voice energy. Each channel tracks its **own** adaptive carrier-noise
+floor (an EWMA sampled only while that channel is shut, so a held transmission
+never learns itself into the floor) and opens `--squelch-snr` dB above it — a
+fixed dB margin per channel, so a quiet channel and a comb-hot one (e.g.
+ch17/133.650) share one setting with no per-channel tuning. The per-channel floor
+is seeded from, and backstopped by, a live **cross-channel reference**: all
+channels see the same wideband noise, so a high percentile of the live
+per-channel carrier levels is a real-time **common-mode** noise estimate. The open
+threshold is `--squelch-snr` dB above the **larger** of the two, so a band-wide
+noise burst (a nearby broadband emitter) raises every channel's bar at once —
+which the slow 5 s per-channel EWMA cannot follow — and drops back the moment the
+burst passes, so a weak station is not masked. Because the threshold never comes
+from a channel's own held level, a continuous carrier (AWOS/ATIS) stays open with
+no hang and no chatter, while empty channels stay shut. The new bitstream and host
+tools must be deployed together.
+
+**Weak-signal / fluctuating-noise tuning** (all modes). Two extra gates let the
+SNR margin run low (sensitive to distant/weak keyings) without chattering:
+
+- **Open/close hysteresis** (`--squelch-hysteresis-db`, default `6`): once open, a
+  transmission holds until its level falls this many dB *below* the open bar, so a
+  weak station rides through fades instead of re-arming on every dip. `0` = a
+  single threshold (original behaviour).
+- **Voice gate** (`--squelch-voice-gate`, off by default; `--squelch-voice-flatness`,
+  default `0.5`): a spectral-flatness discriminator that opens only on tonal /
+  voice-like audio (flatness below the ceiling) and vetoes flat broadband noise
+  (flatness near `1.0`). This makes a low SNR margin safe against a band-wide noise
+  burst that clears the energy bar but is not voice. **Trade-off:** weak, noisy
+  distant transmissions can read as broadband and be vetoed, so leave it **off**
+  (or raise `--squelch-voice-flatness`, e.g. `0.65`, to admit noisier voice) if you
+  are missing towers you can see in the waterfall. The gate only vetoes the *open*
+  transition; a brief non-voice frame mid-transmission never chops open audio.
 
 - `--squelch off|auto|manual|carrier` (`--squelch-snr`, `--squelch-level` dBFS,
-  `--squelch-hang-ms`) — gating, threshold, and hang time.
+  `--squelch-hang-ms`, `--squelch-hysteresis-db`, `--squelch-voice-gate`,
+  `--squelch-voice-flatness`) — gating, threshold, hang time, hysteresis, voice gate.
 - `--denoise` (off by default), `--denoise-floor-db <dB>` — spectral noise
   reduction (more negative floor = deeper, more aggressive cut).
 - `--filter` (off by default), `--filter-low`/`--filter-high` — voice band-pass

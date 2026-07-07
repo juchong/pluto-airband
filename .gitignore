@@ -28,6 +28,9 @@ hdl/out/
 # Local diagnostic captures/analysis (IQ recordings, WAVs, plots, scripts, logs)
 .ch9-analysis/
 
+# Local working notes / analysis docs (not part of the tracked project docs)
+.notes/
+
 # Built firmware images (large binaries)
 firmware/images/
 firmware/build/

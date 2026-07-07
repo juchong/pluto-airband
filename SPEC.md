@@ -459,17 +459,39 @@ channel keeps its **own adaptive carrier-noise floor** (`airband-dsp::CarrierFlo
 an EWMA of that channel's carrier sampled **only while its squelch is shut**, so
 the floor follows the conducted comb's per-channel, diurnal drift up and down but
 never learns a transmission into itself. The open threshold is
-`floor × 10^(--squelch-snr/20)` — a fixed dB margin above *each channel's own*
-noise, so one `--squelch-snr` fits a quiet channel and a comb-hot one alike (the
-old single shared threshold could not separate a quiet channel's weak keyings from
-a comb-hot channel's noise, since both sat the same distance from one absolute
-line). Each floor is **seeded once** from a robust cross-channel noise reference —
-the **median** (50th percentile) of the live per-channel carrier levels, recomputed
-every 8192 frames (`airband-dsp::carrier_noise_threshold`); that median is also the
-`dB·c` meter's reference. A continuous carrier (e.g. ATIS) opens on the seed and
-then freezes its floor while open, so it is **not** learned away. The carrier byte
-is decoded with `airband-dsp::decode_carrier`; channels start shut until their
-floor is seeded. In carrier mode the audio-energy VOX is retained internally only to drive
+`max(floor, common_mode) × 10^(--squelch-snr/20)` — a fixed dB margin above *each
+channel's own* noise, so one `--squelch-snr` fits a quiet channel and a comb-hot
+one alike (the old single shared threshold could not separate a quiet channel's
+weak keyings from a comb-hot channel's noise, since both sat the same distance from
+one absolute line). The `common_mode` term is the **median** (50th percentile) of
+the live per-channel carrier levels, recomputed every 8192 frames
+(`airband-dsp::carrier_noise_threshold`, also the `dB·c` meter's reference); it both
+**seeds** each floor on warm-up and is fed **live** into the threshold. Taking the
+`max` of the slow per-channel floor and this ~real-time cross-channel median means a
+band-wide noise burst (a nearby broadband emitter fluctuating the whole band) raises
+every channel's bar **at once** — which the ~5 s per-channel EWMA is far too slow to
+follow — and the bar drops back the instant the burst passes, so a weak station is
+not masked (`airband-dsp::CarrierFloor::threshold_common`). A continuous carrier
+(e.g. ATIS) opens on the seed and then freezes its floor while open, so it is
+**not** learned away. The carrier byte is decoded with `airband-dsp::decode_carrier`;
+channels start shut until their floor is seeded.
+
+Two gates let `--squelch-snr` run low (sensitive to weak/distant keyings) without
+chatter. **Open/close hysteresis** (`--squelch-hysteresis-db`, default 6): once
+open, a transmission holds until it fades to `open_threshold × 10^(-hysteresis/20)`,
+a distinct lower close bar, so a weak station rides through fades instead of
+re-arming (`0` = single threshold). **Voice gate** (`--squelch-voice-gate`, off by
+default; `--squelch-voice-flatness`, default 0.5): a spectral-flatness discriminator
+(`airband-dsp::SpectralFlatness`, 512-pt FFT over the 300–3400 Hz voice band) that
+opens only on tonal/voice-like audio (flatness below the ceiling) and vetoes flat
+broadband noise (flatness ≈ 1) — the "detect voice, not just energy" half of a
+classic dual-metric airband squelch. It gates only the *open* transition (a brief
+non-voice frame never chops an open tx). It is **off in the shipped deploy**: weak,
+noisy distant transmissions can read as broadband and be vetoed, which loses towers
+visible in the waterfall; raise `--squelch-voice-flatness` (e.g. 0.65) to admit
+noisier voice if band-wide noise starts leaking through.
+
+In carrier mode the audio-energy VOX is retained internally only to drive
 the speech-present flag that gates AGC gain and denoise noise-learning (the
 carrier alone can't distinguish speech from inter-word silence within an open
 transmission).
