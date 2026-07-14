@@ -54,6 +54,17 @@ struct Entity {
 
 fn entities(cfg: &MqttConfig) -> Vec<Entity> {
     let mut v = Vec::new();
+    // Consolidated outage flag first: device_class "problem" so HA shows on = a
+    // problem, giving the user one entity to trigger an outage notification on
+    // (and it flips to `unavailable` if the reader/Pi dies, via the LWT).
+    v.push(Entity {
+        component: "binary_sensor",
+        key: "outage".to_string(),
+        name: "Outage".to_string(),
+        value_template: "{{ value_json.outage }}".to_string(),
+        extra: "\"payload_on\":\"True\",\"payload_off\":\"False\",\"device_class\":\"problem\"".to_string(),
+    });
+
     let mut binary = |key: &str, name: &str| {
         v.push(Entity {
             component: "binary_sensor",

@@ -168,13 +168,41 @@ broker as "off", so the same unit works with or without a broker.
 
 The reader publishes a retained JSON state topic (`pluto-airband/state`) and Home
 Assistant **MQTT discovery** configs once per connect, so the entities — including
-the two headline tiles **Capture healthy** (`system_healthy`) and **LiveATC
-healthy** (`liveatc_healthy`), plus `pluto_reachable`, `maia_httpd_up`,
-`data_flowing`, and the Pluto FPGA flags `dma_advancing` / `fpga_overflow` — 
-auto-appear in HA with no manual YAML. A Last Will
-flips `pluto-airband/availability` to `offline` the instant the feeder dies, so the
-whole dashboard greys out on a crash or Pi outage. Add `--mqtt-per-channel` for the
-(noisier) per-channel open/carrier entities.
+the consolidated **Outage** tile (`outage`, `device_class: problem`), the two
+headline tiles **Capture healthy** (`system_healthy`) and **LiveATC healthy**
+(`liveatc_healthy`), plus `pluto_reachable`, `maia_httpd_up`, `data_flowing`, and
+the Pluto FPGA flags `dma_advancing` / `fpga_overflow` — auto-appear in HA with no
+manual YAML. A Last Will flips `pluto-airband/availability` to `offline` the instant
+the feeder dies, so the whole dashboard greys out on a crash or Pi outage. Add
+`--mqtt-per-channel` for the (noisier) per-channel open/carrier entities.
+
+**Outage notifications.** `outage` is the single signal to alert on: it is `on`
+whenever the **Pluto→Pi capture** is unhealthy (Pluto unreachable, stream down, or
+no samples flowing) **or** any **output feed** is down — including the previously
+silent case where a feed socket stays connected but ships dead air because the
+Pluto is off (now `liveatc_healthy` also requires data to be flowing). A total
+**reader/Pi outage** is caught out-of-band: the MQTT Last-Will marks every entity
+`unavailable`. One automation covers both:
+
+```yaml
+automation:
+  - alias: Pluto Airband outage alert
+    trigger:
+      - trigger: state
+        entity_id: binary_sensor.pluto_airband_outage
+        to: "on"                 # capture/feed outage (Pluto or feeds down)
+      - trigger: state
+        entity_id: binary_sensor.pluto_airband_outage
+        to: "unavailable"        # reader/Pi down (Last-Will offline)
+        for: "00:02:00"          # ride out a brief reader restart
+    action:
+      - action: notify.notify
+        data:
+          title: "Pluto Airband outage"
+          message: >-
+            {{ 'Reader/Pi offline' if trigger.to_state.state == 'unavailable'
+               else 'Capture or feed outage (check Pluto reachable / data flowing)' }}
+```
 
 ### Failure alerting
 

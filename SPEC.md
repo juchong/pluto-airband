@@ -697,8 +697,12 @@ Consequences, both addressed by this design:
     operator's questions — `pluto_reachable` (periodic TCP probe of the Pluto web
     port), `maia_httpd_up`/`airband_link_up` (the `:30000` stream is established),
     `data_flowing` (recent sample) — rolling up into `system_healthy` and
-    `liveatc_healthy`. Curated metrics + those two headline tiles publish over
-    **MQTT** with Home Assistant auto-discovery and a Last-Will availability topic.
+    `liveatc_healthy` (feeds connected **and** `data_flowing`, so a feed shipping
+    dead air while the Pluto is down is not counted healthy), plus a consolidated
+    `outage` flag (either side unhealthy) for a one-line alert trigger. Curated
+    metrics + those tiles publish over **MQTT** with Home Assistant auto-discovery
+    (the `outage` entity uses `device_class: problem`) and a Last-Will availability
+    topic that flips entities `unavailable` if the reader/Pi dies.
     A **low-latency raw-PCM debug monitor** (`--monitor-port`,
     `GET /listen/<ch>.wav?tap=pre|post`) streams one selectable channel in-process
     (no Icecast/MP3, ~100–200 ms). The systemd unit is `Type=notify` with

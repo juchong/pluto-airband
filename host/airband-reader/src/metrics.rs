@@ -215,12 +215,28 @@ impl Metrics {
             && self.data_flowing()
     }
 
-    /// Headline tile: every output feed is connected (what we ship to LiveATC).
+    /// Headline tile: we are delivering real audio to LiveATC — every output feed
+    /// is connected **and** the capture side is actually flowing data. Gating on
+    /// `data_flowing` closes the blind spot where a feed socket stays connected and
+    /// ships dead air while the Pluto is down (a connected-but-silent outage).
     /// Vacuously true when no feeds are configured.
     pub fn liveatc_healthy(&self) -> bool {
-        self.feeds
-            .iter()
-            .all(|f| f.connected.load(Ordering::Relaxed))
+        if self.feeds.is_empty() {
+            return true;
+        }
+        self.data_flowing()
+            && self
+                .feeds
+                .iter()
+                .all(|f| f.connected.load(Ordering::Relaxed))
+    }
+
+    /// Single consolidated outage flag for a one-line Home Assistant trigger: true
+    /// whenever the capture side or any output feed is unhealthy. (A reader/Pi that
+    /// is entirely down is signaled out-of-band by the MQTT Last-Will availability
+    /// going `offline`, which makes the HA entity `unavailable`.)
+    pub fn outage(&self) -> bool {
+        !(self.system_healthy() && self.liveatc_healthy())
     }
 
     /// Each channel's carrier in dB over the cross-channel noise reference
@@ -294,6 +310,7 @@ impl Metrics {
 \"fpga_overflow\":{ovf},\
 \"system_healthy\":{sys},\
 \"liveatc_healthy\":{live},\
+\"outage\":{outage},\
 \"seconds_since_last_sample\":{since:.1},\
 \"uptime_secs\":{up},\
 \"active_channels\":{active},\
@@ -306,6 +323,7 @@ impl Metrics {
             ovf = self.fpga_overflow.load(Ordering::Relaxed),
             sys = self.system_healthy(),
             live = self.liveatc_healthy(),
+            outage = self.outage(),
             since = self.seconds_since_last_sample(),
             up = self.uptime_secs(),
         )
@@ -335,9 +353,12 @@ impl Metrics {
         s.push_str("# HELP airband_system_healthy Capture side (Pluto->Pi) healthy.\n");
         s.push_str("# TYPE airband_system_healthy gauge\n");
         s.push_str(&format!("airband_system_healthy {}\n", b(self.system_healthy())));
-        s.push_str("# HELP airband_liveatc_healthy All output feeds connected.\n");
+        s.push_str("# HELP airband_liveatc_healthy Output feeds connected and capture flowing.\n");
         s.push_str("# TYPE airband_liveatc_healthy gauge\n");
         s.push_str(&format!("airband_liveatc_healthy {}\n", b(self.liveatc_healthy())));
+        s.push_str("# HELP airband_outage Capture side or any output feed is unhealthy.\n");
+        s.push_str("# TYPE airband_outage gauge\n");
+        s.push_str(&format!("airband_outage {}\n", b(self.outage())));
         s.push_str("# HELP airband_dma_advancing Pluto FPGA airband DMA write pointer is advancing.\n");
         s.push_str("# TYPE airband_dma_advancing gauge\n");
         s.push_str(&format!("airband_dma_advancing {}\n", b(self.dma_advancing.load(Ordering::Relaxed))));
@@ -414,6 +435,34 @@ impl Metrics {
             s.push_str(&format!("airband_squelch_open{{channel=\"{c}\"}} {v}\n"));
         }
         s
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn feed_connected_but_no_data_is_an_outage() {
+        // The regression this guards: a feed socket stays `connected` while the
+        // Pluto is down, so it ships dead air. `liveatc_healthy` must NOT read true
+        // (and `outage` must be true) unless data is actually flowing.
+        let feed = FeedMetric::new(0, "/m.mp3".to_string());
+        feed.set_connected(true);
+        let m = Metrics::new(1, vec![feed]);
+        // Capture side down (stream never came up) -> no data flowing.
+        assert!(!m.data_flowing(), "no stream => no data");
+        assert!(!m.liveatc_healthy(), "connected-but-silent feed is not healthy");
+        assert!(m.outage(), "either side unhealthy => outage");
+
+        // Bring the capture side up with a fresh sample -> everything healthy.
+        m.set_pluto_reachable(true);
+        m.set_stream_up(true);
+        m.note_active();
+        assert!(m.data_flowing());
+        assert!(m.system_healthy());
+        assert!(m.liveatc_healthy(), "connected feed + flowing data is healthy");
+        assert!(!m.outage(), "no outage when both sides are healthy");
     }
 }
 

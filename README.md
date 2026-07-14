@@ -366,8 +366,10 @@ otherwise). The same signals answer the three questions directly — *is the Plu
 connected?* (a periodic TCP probe of the Pluto web port), *is the application
 running?* (the stream is established), *is data flowing?* (a recent sample) — and
 roll up into two headline booleans, `system_healthy` (capture side) and
-`liveatc_healthy` (every output feed connected), exported to both Prometheus and
-MQTT. Running under systemd, the reader uses `Type=notify`/`WatchdogSec` so a hung
+`liveatc_healthy` (every output feed connected **and** data flowing — so a feed
+shipping dead air while the Pluto is down no longer reads healthy), plus a single
+`outage` flag (either side unhealthy) for one-line alerting, all exported to both
+Prometheus and MQTT. Running under systemd, the reader uses `Type=notify`/`WatchdogSec` so a hung
 reader is restarted; see [`deploy/README.md`](deploy/README.md) for the full
 monitoring/alerting setup.
 
