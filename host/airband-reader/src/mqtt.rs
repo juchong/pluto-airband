@@ -12,7 +12,7 @@
 
 use crate::metrics::Metrics;
 use rumqttc::{Client, Event, LastWill, MqttOptions, Packet, QoS};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -165,34 +165,60 @@ fn announce(client: &Client, cfg: &MqttConfig, ents: &[Entity]) {
     }
 }
 
-/// Spawns the MQTT publisher. Returns immediately; failures are logged and the
-/// rumqttc event loop reconnects on its own.
+/// Spawns the MQTT publisher. Returns immediately.
+///
+/// Two threads share the live client through a swappable slot: a **connection**
+/// thread owns the client/eventloop lifecycle and a **publisher** thread pushes the
+/// retained state snapshot on the interval. The connection thread wraps the whole
+/// client in an **outer reconnect loop** so that when rumqttc's event-loop iterator
+/// *ends* (not just errors) after a broker drop — a Mosquitto/HA restart closing the
+/// socket, which otherwise leaves the connection stuck half-closed and never
+/// reconnecting — a fresh client is built and `announce()` re-publishes
+/// availability=online + discovery, clearing the latched Last-Will `offline` in HA.
 pub fn spawn(metrics: Arc<Metrics>, cfg: MqttConfig) {
+    // The current live client, or `None` while (re)connecting. The publisher reads
+    // it; the connection thread swaps it on every (re)build.
+    let slot: Arc<Mutex<Option<Client>>> = Arc::new(Mutex::new(None));
+
+    // Publisher: publish the snapshot whenever a client is live. A publish while
+    // disconnected is simply skipped; the next reconnect re-announces state.
+    let pub_slot = Arc::clone(&slot);
+    let pub_cfg = cfg.clone();
     thread::spawn(move || {
-        let mut opts = MqttOptions::new(cfg.prefix.clone(), cfg.broker.clone(), cfg.port);
-        opts.set_keep_alive(Duration::from_secs(15));
-        if let (Some(u), Some(p)) = (cfg.user.clone(), cfg.pass.clone()) {
-            opts.set_credentials(u, p);
+        let state = pub_cfg.state_topic();
+        loop {
+            thread::sleep(pub_cfg.interval);
+            let client = pub_slot.lock().unwrap().clone();
+            if let Some(c) = client {
+                let _ = c.publish(state.clone(), QoS::AtLeastOnce, true, metrics.status_json());
+            }
         }
-        opts.set_last_will(LastWill::new(
-            cfg.availability_topic(),
-            "offline",
-            QoS::AtLeastOnce,
-            true,
-        ));
+    });
 
-        let (client, mut connection) = Client::new(opts, 32);
+    // Connection: build the client, drive the eventloop, and rebuild if it ends.
+    thread::spawn(move || {
+        let ents = entities(&cfg);
+        loop {
+            let mut opts = MqttOptions::new(cfg.prefix.clone(), cfg.broker.clone(), cfg.port);
+            opts.set_keep_alive(Duration::from_secs(15));
+            if let (Some(u), Some(p)) = (cfg.user.clone(), cfg.pass.clone()) {
+                opts.set_credentials(u, p);
+            }
+            opts.set_last_will(LastWill::new(
+                cfg.availability_topic(),
+                "offline",
+                QoS::AtLeastOnce,
+                true,
+            ));
 
-        // Drive the event loop; (re)announce on each successful connect.
-        let ev_client = client.clone();
-        let ev_cfg = cfg.clone();
-        thread::spawn(move || {
-            let ents = entities(&ev_cfg);
+            let (client, mut connection) = Client::new(opts, 32);
+            *slot.lock().unwrap() = Some(client.clone());
+
             for ev in connection.iter() {
                 match ev {
                     Ok(Event::Incoming(Packet::ConnAck(_))) => {
-                        eprintln!("mqtt: connected to {}:{}", ev_cfg.broker, ev_cfg.port);
-                        announce(&ev_client, &ev_cfg, &ents);
+                        eprintln!("mqtt: connected to {}:{}", cfg.broker, cfg.port);
+                        announce(&client, &cfg, &ents);
                     }
                     Ok(_) => {}
                     Err(e) => {
@@ -201,13 +227,12 @@ pub fn spawn(metrics: Arc<Metrics>, cfg: MqttConfig) {
                     }
                 }
             }
-        });
 
-        // Publish the curated snapshot on the retained state topic.
-        let state = cfg.state_topic();
-        loop {
-            thread::sleep(cfg.interval);
-            let _ = client.publish(state.clone(), QoS::AtLeastOnce, true, metrics.status_json());
+            // The iterator ended: the eventloop is dead and will not reconnect on
+            // its own. Drop the stale client and rebuild from scratch.
+            eprintln!("mqtt: event loop ended; rebuilding client");
+            *slot.lock().unwrap() = None;
+            thread::sleep(Duration::from_secs(2));
         }
     });
 }
