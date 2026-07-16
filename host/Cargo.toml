@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["airband-dsp", "airband-dfn", "airband-listen", "airband-reader"]
+members = ["airband-dsp", "airband-dfn", "airband-listen", "airband-reader", "airband-tune"]
 
 [profile.release]
 lto = true

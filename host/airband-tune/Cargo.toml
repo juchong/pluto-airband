@@ -1,0 +1,17 @@
+[package]
+name = "airband-tune"
+version = "0.1.0"
+edition = "2021"
+description = "Offline WAV enhancer for A/B tuning the airband DeepFilterNet + presence chain on recordings"
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "airband-tune"
+path = "src/main.rs"
+
+[dependencies]
+airband-dsp = { path = "../airband-dsp" }
+airband-dfn = { path = "../airband-dfn" }
+anyhow = "1.0"
+clap = { version = "4", features = ["derive"] }
+hound = "3"
