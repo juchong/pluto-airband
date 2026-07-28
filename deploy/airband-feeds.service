@@ -35,17 +35,20 @@ EnvironmentFile=/etc/airband-feeds.env
 # the airband-reader default; passed explicitly so the unit is self-documenting.
 # --squelch carrier: gate on the FPGA AM-carrier byte, not voice-band VOX, so
 # keyed transmissions open reliably even through speech pauses.
-# --squelch-snr 15: dB above the LARGER of each channel's own adaptive carrier-noise
+# --squelch-snr 11: dB above the LARGER of each channel's own adaptive carrier-noise
 # floor and the live cross-channel common-mode reference. Every channel tracks its
 # own idle baseline (EWMA sampled only while shut), so a single margin fits both a
 # quiet channel and a comb-hot one (e.g. ch17/133.650) with no per-channel tuning,
 # and the common-mode term makes a band-wide noise burst (a nearby transmitter)
-# raise every channel's bar at once instead of false-opening. Held at 15: dropping
-# to 8 put the open bar INSIDE the conducted-comb idle spread -- idle/spur carriers
-# ride ~10-15 dB.c (observed ch1 opening on a flat 12 dB.c comb tone with no audio),
-# while real keyings sit 30-60 dB.c, so 15 clears the comb with wide margin. Lower
-# only if a genuinely weak/distant tower keying is missed (and prefer the per-channel
-# voice gate below over dropping this band-wide).
+# raise every channel's bar at once instead of false-opening. Balance point: 8 sat
+# inside the conducted-comb idle spread (idle/spur carriers ride ~12-16 dB.c on the
+# hot channels ch1/2/3) and false-opened on silence; 15 cleared the comb but clipped
+# the weakest real keyings, which bottom out ~18-20 dB.c (ch4/120.950, ch7/121.700)
+# -- and the effective bar is snr ABOVE the adaptive floor, so raw carrier_dbc runs
+# higher than the number here. 11 recovers those weak keyings while staying above the
+# flat comb. The one unsolvable case band-wide is ch4, whose comb (~20) overlaps its
+# own signal (~19); if it false-opens, add it to --squelch-voice-gate-channels rather
+# than raising this and re-clipping weak traffic elsewhere.
 # --squelch-voice-gate-channels 9: enable the spectral-flatness voice gate on ONLY
 # ch9 (122.975 S50 Auburn CTAF), the channel with the largest receive-power swing,
 # where a band-wide noise burst most easily false-opens the squelch. The gate opens
@@ -71,7 +74,7 @@ EnvironmentFile=/etc/airband-feeds.env
 # --mqtt-* -> Home Assistant: broker/user/pass come from the EnvironmentFile. An
 #   empty ${AIRBAND_MQTT_BROKER} (var unset) disables MQTT in-reader, so this line
 #   is safe whether or not the broker is configured — no separate "MQTT off" variant.
-ExecStart=/home/pi/pluto-airband/host/target/release/airband-reader plutoplus.chongflix.tv:30000 --feeds /home/pi/pluto-airband/feeds.json --channels 18 --rate 20000 --squelch carrier --squelch-snr 15 --squelch-hysteresis-db 3 --squelch-hang-ms 300 --squelch-voice-gate-channels 9 --metrics-port 9108 --monitor-port 8082 --mqtt-broker ${AIRBAND_MQTT_BROKER} --mqtt-user ${AIRBAND_MQTT_USER} --mqtt-pass ${AIRBAND_MQTT_PASS}
+ExecStart=/home/pi/pluto-airband/host/target/release/airband-reader plutoplus.chongflix.tv:30000 --feeds /home/pi/pluto-airband/feeds.json --channels 18 --rate 20000 --squelch carrier --squelch-snr 11 --squelch-hysteresis-db 3 --squelch-hang-ms 300 --squelch-voice-gate-channels 9 --metrics-port 9108 --monitor-port 8082 --mqtt-broker ${AIRBAND_MQTT_BROKER} --mqtt-user ${AIRBAND_MQTT_USER} --mqtt-pass ${AIRBAND_MQTT_PASS}
 # airband-reader reconnects to the Pluto and to Icecast on its own, so this only
 # fires on a real crash. Wait between restarts so a wedged Pluto isn't hammered.
 Restart=always
