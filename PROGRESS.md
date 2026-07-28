@@ -1359,6 +1359,40 @@ Bitstream rebuild (`maia-sdr` fork `00fcaaa3`) + config, flashed to the live Plu
   an upstream complex-LMS spur canceller on the wideband IQ (fixes all channels at
   once) — see "Next steps" / SPUR-INVESTIGATION.
 
+### Carrier-squelch retune after RF filter (2026-07-27)
+Config/deploy only (`deploy/airband-feeds.service` ExecStart) — no rebuild. An RF
+band-pass filter was added to the front end; the carrier squelch was retuned live
+on the Pi (edit → commit → `git pull` on Pi → `systemctl restart airband-feeds`),
+each step verified against the `--metrics-port 9108` gauges (`airband_carrier_dbc`,
+`airband_squelch_open`, `airband_transmissions_total`).
+
+- **Close timing — busy channels stopped merging overs.** ch4 (120.950 Twr West) was
+  gluing a whole multi-over exchange into one ~40 s open and closing ~1 s late. With
+  `--squelch-snr 8` and the 6 dB hysteresis default the close bar sat ~+2 dB·c —
+  inside the 0–2 dB·c inter-over gap carrier — so the level never fell below it, and
+  the 1000 ms (VOX-era) hang then bridged the ~1 s inter-over gaps. Carrier squelch
+  keys on the steady AM carrier, so it needs almost no hang: **`--squelch-hysteresis-db
+  6 → 3`** (close bar ~+5 dB·c, above the gap floor) and **`--squelch-hang-ms 1000 →
+  300`**. Verified: overs now close promptly and separately.
+- **Open bar — comb false-opens vs missed weak keyings.** `--squelch-snr` chased both
+  failure modes before settling: **8** sat *inside* the conducted-comb idle spread and
+  false-opened on silence (observed ch1 opening on a flat, dead-steady 12 dB·c comb
+  tone with no audio). **15** cleared the comb but clipped the weakest real keyings.
+  A 120 s per-channel capture pinned the overlap: real opens bottom out ~**18–20 dB·c**
+  (ch4/120.950, ch7/121.700) while idle comb tops ~**12–16 dB·c** on the hot channels
+  (ch1/2/3). Settled **`--squelch-snr 11`** — below the weak-keying floor to recover
+  missed transmissions, above the flat comb. (The effective bar is `snr` *above* each
+  channel's adaptive floor + cross-channel common-mode, so raw `carrier_dbc` runs
+  higher than 11.)
+- **ch4 is the one band-wide-unsolvable case:** its comb (~20 dB·c) overlaps its own
+  signal median (~19). If it barks on silence, add it to `--squelch-voice-gate-channels`
+  (currently just ch9/122.975) rather than raising the band-wide bar and re-clipping
+  weak traffic elsewhere.
+- **Deployed ExecStart squelch flags:** `--squelch carrier --squelch-snr 11
+  --squelch-hysteresis-db 3 --squelch-hang-ms 300 --squelch-voice-gate-channels 9`.
+  The `airband-reader` *binary* defaults are unchanged (`auto`, snr 9, hyst 6,
+  hang 1000); the unit file is the per-host source of truth (`deploy/README.md`).
+
 ## Next steps
 - **Buzz spurs are characterized** (see "Buzz spur taxonomy", 2026-06-24): the
   dominant 126.000 MHz tooth is the AD9361 sample-clock 9th harmonic (9×14 MHz), plus
