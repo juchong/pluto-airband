@@ -180,7 +180,13 @@ the feeder dies, so the whole dashboard greys out on a crash or Pi outage. Add
 whenever the **Pluto→Pi capture** is unhealthy (Pluto unreachable, stream down, or
 no samples flowing) **or** any **output feed** is down — including the previously
 silent case where a feed socket stays connected but ships dead air because the
-Pluto is off (now `liveatc_healthy` also requires data to be flowing). A total
+Pluto is off (now `liveatc_healthy` also requires data to be flowing). It is
+**debounced by 30 s** — the underlying condition must persist continuously that
+long before `outage` flips `on` — so a routine feed reconnect or a brief
+data-flow gap never pulses the flag (which would otherwise fire a spurious
+"recovered" a minute later). The granular tiles (`system_healthy`,
+`liveatc_healthy`, per-feed `connected`) and `/healthz` stay instantaneous for
+diagnostics. A total
 **reader/Pi outage** is caught out-of-band: the MQTT Last-Will marks every entity
 `unavailable`. One automation covers both:
 

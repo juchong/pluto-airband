@@ -21,6 +21,26 @@ use std::time::Instant;
 /// stalled even if the TCP socket is still nominally connected.
 const DATA_FLOW_TIMEOUT_S: f64 = 5.0;
 
+/// Minimum time the raw (instantaneous) unhealthy condition must persist before
+/// the consolidated [`Metrics::outage`] flag reports true. `outage` is the
+/// dedicated alerting signal (the HA `binary_sensor` + the Prometheus
+/// `airband_outage` gauge), so a sub-threshold transient — a single feed's
+/// routine reconnect, a brief `data_flowing` gap, or a stream reconnect (up to
+/// the 10 s read timeout) — must NOT produce an outage pulse: each pulse's
+/// return-to-healthy otherwise fires a spurious "recovered" notification. The
+/// granular signals (`system_healthy`, `liveatc_healthy`, per-feed `connected`)
+/// stay instantaneous for diagnostics, and `/healthz` is intentionally
+/// undebounced for fast liveness probing.
+///
+/// ponytail: fixed 30 s hysteresis on the assert edge only; the `since` clock
+/// resets the instant the condition clears, so `outage` asserts only after a
+/// *continuous* 30 s of unhealth. Ceiling: rapid flapping that self-heals inside
+/// each 30 s window never pages (by design — it is visible in the granular
+/// sensors/counters instead). A real outage still asserts well inside Home
+/// Assistant's own `for:` hold, so end-to-end alert latency is essentially
+/// unchanged.
+const OUTAGE_DEBOUNCE_S: u64 = 30;
+
 /// Per-channel metric cells. The router updates the sample/drop/peak counters
 /// (it sees every record); each channel worker updates the squelch-derived
 /// gauges. All cells are atomic so they double as the cross-thread stats bus
@@ -154,6 +174,9 @@ pub struct Metrics {
     start: Instant,
     /// `start.elapsed()` in ms at the last received sample.
     last_sample_ms: AtomicU64,
+    /// `start.elapsed()` in ms when the raw unhealthy condition was first seen
+    /// (0 = currently healthy). Drives the [`Metrics::outage`] debounce.
+    outage_since_ms: AtomicU64,
 }
 
 impl Metrics {
@@ -168,6 +191,7 @@ impl Metrics {
             fpga_overflow: AtomicBool::new(false),
             start: Instant::now(),
             last_sample_ms: AtomicU64::new(0),
+            outage_since_ms: AtomicU64::new(0),
         })
     }
 
@@ -232,11 +256,41 @@ impl Metrics {
     }
 
     /// Single consolidated outage flag for a one-line Home Assistant trigger: true
-    /// whenever the capture side or any output feed is unhealthy. (A reader/Pi that
-    /// is entirely down is signaled out-of-band by the MQTT Last-Will availability
-    /// going `offline`, which makes the HA entity `unavailable`.)
+    /// whenever the capture side or any output feed is unhealthy **and has been so
+    /// continuously for at least [`OUTAGE_DEBOUNCE_S`]**. The debounce swallows
+    /// routine transients (a feed reconnect, a brief data-flow gap) so the flag
+    /// does not pulse — a pulse's return-to-healthy would otherwise fire a
+    /// spurious "recovered" notification. (A reader/Pi that is entirely down is
+    /// signaled out-of-band by the MQTT Last-Will availability going `offline`,
+    /// which makes the HA entity `unavailable`.)
     pub fn outage(&self) -> bool {
-        !(self.system_healthy() && self.liveatc_healthy())
+        self.outage_at(self.now_ms())
+    }
+
+    /// The debounced outage decision, evaluated against an explicit `now` (ms
+    /// since start) so the time-based hysteresis is unit-testable without
+    /// sleeping. Records the first-seen timestamp of a raw-unhealthy episode and
+    /// reports true only once it has persisted past [`OUTAGE_DEBOUNCE_S`]; a
+    /// return to healthy resets the clock immediately.
+    fn outage_at(&self, now_ms: u64) -> bool {
+        let raw = !(self.system_healthy() && self.liveatc_healthy());
+        if !raw {
+            self.outage_since_ms.store(0, Ordering::Relaxed);
+            return false;
+        }
+        // Claim the first-seen timestamp (map 0 -> 1 so it never collides with
+        // the "healthy" sentinel); a concurrent claim just keeps the earlier one.
+        let stamp = now_ms.max(1);
+        let since = match self.outage_since_ms.compare_exchange(
+            0,
+            stamp,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => stamp,
+            Err(existing) => existing,
+        };
+        now_ms.saturating_sub(since) >= OUTAGE_DEBOUNCE_S * 1000
     }
 
     /// Each channel's carrier in dB over the cross-channel noise reference
@@ -445,15 +499,26 @@ mod tests {
     #[test]
     fn feed_connected_but_no_data_is_an_outage() {
         // The regression this guards: a feed socket stays `connected` while the
-        // Pluto is down, so it ships dead air. `liveatc_healthy` must NOT read true
-        // (and `outage` must be true) unless data is actually flowing.
+        // Pluto is down, so it ships dead air. `liveatc_healthy` must NOT read true;
+        // the debounced `outage` asserts once the condition has *persisted*.
+        // (`outage_at` drives synthetic time so we don't sleep; the health inputs
+        // are set explicitly and dominate `data_flowing`'s real-clock reading.)
         let feed = FeedMetric::new(0, "/m.mp3".to_string());
         feed.set_connected(true);
         let m = Metrics::new(1, vec![feed]);
         // Capture side down (stream never came up) -> no data flowing.
         assert!(!m.data_flowing(), "no stream => no data");
         assert!(!m.liveatc_healthy(), "connected-but-silent feed is not healthy");
-        assert!(m.outage(), "either side unhealthy => outage");
+        let onset = 1_000; // nonzero onset (in prod, `start` precedes any unhealth)
+        assert!(!m.outage_at(onset), "outage debounced: not asserted at onset");
+        assert!(
+            !m.outage_at(onset + OUTAGE_DEBOUNCE_S * 1000 - 1),
+            "still within the debounce window"
+        );
+        assert!(
+            m.outage_at(onset + OUTAGE_DEBOUNCE_S * 1000),
+            "sustained outage asserts once past the debounce"
+        );
 
         // Bring the capture side up with a fresh sample -> everything healthy.
         m.set_pluto_reachable(true);
@@ -462,7 +527,45 @@ mod tests {
         assert!(m.data_flowing());
         assert!(m.system_healthy());
         assert!(m.liveatc_healthy(), "connected feed + flowing data is healthy");
-        assert!(!m.outage(), "no outage when both sides are healthy");
+        assert!(
+            !m.outage_at(onset + OUTAGE_DEBOUNCE_S * 1000 + 1),
+            "no outage when both sides are healthy"
+        );
+    }
+
+    #[test]
+    fn transient_blip_never_asserts_outage() {
+        // The churn regression: a single feed's routine reconnect flips the raw
+        // unhealthy condition for a few seconds. The debounced `outage` must stay
+        // false the whole time, so no ON pulse (hence no spurious "recovered") is
+        // ever published — while a later *sustained* outage still asserts.
+        let feed = FeedMetric::new(0, "/m.mp3".to_string());
+        let m = Metrics::new(1, vec![feed.clone()]);
+        m.set_pluto_reachable(true);
+        m.set_stream_up(true);
+        m.note_active();
+        feed.set_connected(true);
+        assert!(!m.outage_at(0), "healthy baseline");
+
+        // Feed drops for ~5 s (a routine reconnect), then comes back — well under
+        // the 30 s debounce, so `outage` never asserts.
+        feed.set_connected(false);
+        assert!(!m.outage_at(1_000), "raw unhealthy but under debounce");
+        assert!(!m.outage_at(5_000), "still under debounce");
+        feed.set_connected(true);
+        assert!(
+            !m.outage_at(6_000),
+            "recovered before debounce elapsed => outage never asserted"
+        );
+
+        // A subsequent *sustained* outage still asserts (the clock reset on
+        // recovery, so it debounces from the new onset, not the old blip).
+        feed.set_connected(false);
+        assert!(!m.outage_at(7_000), "new episode: under debounce");
+        assert!(
+            m.outage_at(7_000 + OUTAGE_DEBOUNCE_S * 1000),
+            "sustained new outage asserts"
+        );
     }
 }
 
