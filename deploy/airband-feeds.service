@@ -14,8 +14,10 @@ OnFailure=airband-alert@%n.service
 # live read loop, so a hung-but-alive reader (no data progressing) is restarted.
 Type=notify
 NotifyAccess=main
-# Restart if no WATCHDOG=1 ping arrives within this window. The reader pings once
-# per --stats-interval (5 s default) and across reconnects, so 30 s is ample slack.
+# Restart if no WATCHDOG=1 ping arrives within this window. The reader's watchdog
+# keeper pings every 5 s for as long as its router thread is making progress
+# (samples arriving, or reconnect attempts cycling while the Pluto is away), so a
+# wedged router stops the pings within ~20 s and 30 s is ample slack.
 WatchdogSec=30
 # Eager DeepFilterNet model load for 18 channels happens before READY=1; give it
 # room on a cold cache so systemd doesn't time out startup.
@@ -69,12 +71,19 @@ EnvironmentFile=/etc/airband-feeds.env
 # drops without chopping a single over.
 # --metrics-port 9108: serves Prometheus /metrics, a /healthz liveness probe, and
 #   a /status JSON snapshot (Pluto reachability, link/data-flow, per-feed health).
-# --monitor-port 8082: low-latency raw-PCM debug-listen on (8081 is taken by a
-#   GET /listen/<ch>.wav?tap=pre|post (no Icecast/MP3); coexists with the feeds.
-# --mqtt-* -> Home Assistant: broker/user/pass come from the EnvironmentFile. An
-#   empty ${AIRBAND_MQTT_BROKER} (var unset) disables MQTT in-reader, so this line
-#   is safe whether or not the broker is configured — no separate "MQTT off" variant.
-ExecStart=/home/pi/pluto-airband/host/target/release/airband-reader plutoplus.chongflix.tv:30000 --feeds /home/pi/pluto-airband/feeds.json --channels 18 --rate 20000 --squelch carrier --squelch-snr 11 --squelch-hysteresis-db 3 --squelch-hang-ms 300 --squelch-voice-gate-channels 9 --metrics-port 9108 --monitor-port 8082 --mqtt-broker ${AIRBAND_MQTT_BROKER} --mqtt-user ${AIRBAND_MQTT_USER} --mqtt-pass ${AIRBAND_MQTT_PASS}
+# --monitor-port 8082: low-latency raw-PCM debug-listen (8081 is taken by the
+#   PiAware web UI): GET /listen/<ch>.wav?tap=pre|post (no Icecast/MP3); coexists
+#   with the feeds.
+# --mqtt-* -> Home Assistant: broker/user come from the EnvironmentFile. The
+#   password is deliberately NOT a flag: the reader reads AIRBAND_MQTT_PASS straight
+#   from the environment, because a flag value lands in /proc/<pid>/cmdline where
+#   every local user (and `systemctl status`) can read it. An empty
+#   ${AIRBAND_MQTT_BROKER} (var unset) disables MQTT in-reader, so this line is
+#   safe whether or not the broker is configured — no separate "MQTT off" variant.
+# Stats: with stdout on the journal (not a TTY) the reader logs a one-line summary
+#   every 60 s instead of the 18-row table every 5 s; add --stats-table to get the
+#   table back (it duplicates /metrics and /status, and filled the 4 GB journal).
+ExecStart=/home/pi/pluto-airband/host/target/release/airband-reader plutoplus.chongflix.tv:30000 --feeds /home/pi/pluto-airband/feeds.json --channels 18 --rate 20000 --squelch carrier --squelch-snr 11 --squelch-hysteresis-db 3 --squelch-hang-ms 300 --squelch-voice-gate-channels 9 --metrics-port 9108 --monitor-port 8082 --mqtt-broker ${AIRBAND_MQTT_BROKER} --mqtt-user ${AIRBAND_MQTT_USER}
 # airband-reader reconnects to the Pluto and to Icecast on its own, so this only
 # fires on a real crash. Wait between restarts so a wedged Pluto isn't hammered.
 Restart=always

@@ -174,6 +174,12 @@ pub struct Metrics {
     start: Instant,
     /// `start.elapsed()` in ms at the last received sample.
     last_sample_ms: AtomicU64,
+    /// `start.elapsed()` in ms when the router thread last made progress — a
+    /// batch of samples arrived or a reconnect attempt completed. Drives the
+    /// systemd watchdog pet (see `spawn_watchdog_keeper` in main): unlike
+    /// `last_sample_ms`, this keeps advancing while the reader is merely waiting
+    /// for an offline Pluto, which must not get it killed.
+    heartbeat_ms: AtomicU64,
     /// `start.elapsed()` in ms when the raw unhealthy condition was first seen
     /// (0 = currently healthy). Drives the [`Metrics::outage`] debounce.
     outage_since_ms: AtomicU64,
@@ -191,12 +197,25 @@ impl Metrics {
             fpga_overflow: AtomicBool::new(false),
             start: Instant::now(),
             last_sample_ms: AtomicU64::new(0),
+            heartbeat_ms: AtomicU64::new(0),
             outage_since_ms: AtomicU64::new(0),
         })
     }
 
     fn now_ms(&self) -> u64 {
         self.start.elapsed().as_millis() as u64
+    }
+
+    /// Router: mark that the router thread is making progress (samples arriving
+    /// or a reconnect attempt completed). Drives the systemd watchdog pet.
+    pub fn note_heartbeat(&self) {
+        self.heartbeat_ms.store(self.now_ms(), Ordering::Relaxed);
+    }
+
+    /// Seconds since the router thread last recorded progress.
+    pub fn seconds_since_heartbeat(&self) -> f64 {
+        let last = self.heartbeat_ms.load(Ordering::Relaxed);
+        (self.now_ms().saturating_sub(last)) as f64 / 1000.0
     }
 
     /// Router: mark that audio is currently arriving (drives `data_flowing`).

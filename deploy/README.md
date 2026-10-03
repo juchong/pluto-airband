@@ -64,7 +64,7 @@ sudo cp deploy/airband-feeds.service deploy/airband-alert@.service /etc/systemd/
 sudo systemctl daemon-reload
 sudo systemctl enable --now airband-feeds.service
 systemctl status airband-feeds            # state
-journalctl -u airband-feeds -f            # live logs + per-channel stats
+journalctl -u airband-feeds -f            # live logs (one-line summary per minute; add --stats-table for the 5 s table)
 sudo systemctl restart airband-feeds      # apply a feeds.json edit
 sudo systemctl stop airband-feeds         # graceful stop (SIGINT closes feeds)
 ```
@@ -154,8 +154,11 @@ journalctl -u airband-watchdog -f              # watch probes + recovery actions
 
 ### MQTT → Home Assistant
 
-`ExecStart` already passes `--mqtt-broker/--mqtt-user/--mqtt-pass` from the
-`AIRBAND_MQTT_*` vars in `/etc/airband-feeds.env`; just fill them in:
+`ExecStart` already passes `--mqtt-broker/--mqtt-user` from the `AIRBAND_MQTT_*`
+vars in `/etc/airband-feeds.env`, and the reader reads the password straight from
+the `AIRBAND_MQTT_PASS` environment variable (never put it on the command line:
+`/proc/<pid>/cmdline` is world-readable, so a `--mqtt-pass` flag would leak it to
+every local user and to `systemctl status`). Just fill them in:
 
 ```
 AIRBAND_MQTT_BROKER=10.0.16.9

@@ -58,7 +58,7 @@ use icecast::{IcecastConfig, TlsMode};
 use metrics::{FeedMetric, Metrics};
 use std::{
     fs::{self, File},
-    io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write},
+    io::{BufReader, BufWriter, IsTerminal, Read, Seek, SeekFrom, Write},
     net::{TcpStream, ToSocketAddrs, UdpSocket},
     path::PathBuf,
     sync::{
@@ -196,9 +196,16 @@ struct Args {
     /// Notch quality factor (higher = narrower).
     #[arg(long, default_value_t = 10.0)]
     notch_q: f64,
-    /// Statistics print interval in seconds
+    /// Statistics interval in seconds. The per-channel table is printed at this
+    /// cadence only when stdout is a terminal (or with --stats-table); otherwise
+    /// a one-line summary goes out every 60 s, since the table duplicates
+    /// /metrics and floods the journal under systemd.
     #[arg(long, default_value_t = 5)]
     stats_interval: u64,
+    /// Always print the full per-channel stats table every --stats-interval,
+    /// even when stdout is not a terminal (e.g. under systemd).
+    #[arg(long)]
+    stats_table: bool,
     /// Serve Prometheus /metrics, /healthz, and /status on this TCP port (0 = disabled).
     #[arg(long, default_value_t = 0)]
     metrics_port: u16,
@@ -219,8 +226,10 @@ struct Args {
     /// MQTT username (optional; use ${ENV} via the systemd EnvironmentFile).
     #[arg(long)]
     mqtt_user: Option<String>,
-    /// MQTT password (optional; use ${ENV} via the systemd EnvironmentFile).
-    #[arg(long)]
+    /// MQTT password (optional). Prefer the AIRBAND_MQTT_PASS environment
+    /// variable (e.g. from the systemd EnvironmentFile) over the flag: a flag
+    /// value sits in /proc/<pid>/cmdline, readable by every local user.
+    #[arg(long, env = "AIRBAND_MQTT_PASS", hide_env_values = true)]
     mqtt_pass: Option<String>,
     /// MQTT base topic prefix and Home Assistant node id.
     #[arg(long, default_value = "pluto-airband")]
@@ -618,6 +627,30 @@ fn sd_notify(state: &str) {
 
 #[cfg(not(unix))]
 fn sd_notify(_state: &str) {}
+
+/// How long the router thread may go without recording progress before the
+/// watchdog keeper stops petting systemd. Must exceed the longest legitimate
+/// stall in the router loop (the 5 s connect timeout or the 10 s read timeout,
+/// plus the 1 s retry sleep) and sit comfortably inside the unit's
+/// `WatchdogSec=30` once the 5 s pet cadence is added.
+const WATCHDOG_STALE_S: f64 = 20.0;
+
+/// Pets systemd's `WatchdogSec` on a fixed cadence for as long as the router
+/// thread is making progress — samples arriving, or reconnect attempts cycling
+/// (a healthy reader waiting for an offline Pluto must not be killed; the
+/// external airband-watchdog owns Pluto-side recovery). Decoupled from the
+/// stats cadence and from how long any single blocking call in the router takes,
+/// so neither a long `--stats-interval` nor a slow connect can starve the pet. A
+/// router wedged anywhere for `WATCHDOG_STALE_S` stops the pets and systemd
+/// restarts the service. No-op outside systemd.
+fn spawn_watchdog_keeper(metrics: Arc<Metrics>) {
+    thread::spawn(move || loop {
+        if metrics.seconds_since_heartbeat() < WATCHDOG_STALE_S {
+            sd_notify("WATCHDOG=1");
+        }
+        thread::sleep(Duration::from_secs(5));
+    });
+}
 
 /// Spawns the Pluto reachability probe: a periodic lightweight TCP connect to
 /// the maia-httpd web port (the host is taken from the stream address). Sets the
@@ -1104,16 +1137,25 @@ struct StatsPrinter {
     interval: Duration,
     last: Instant,
     prev_samples: Vec<u64>,
-    mode: Mode,
+    /// Print the full per-channel table (stats mode on a terminal, or forced).
+    table: bool,
+    /// Cadence of the one-line summary when the table is off: the interval on a
+    /// terminal, otherwise at least 60 s so the journal isn't flooded.
+    summary_every: Duration,
+    last_summary: Instant,
 }
 
 impl StatsPrinter {
-    fn new(interval_secs: u64, n: usize, mode: Mode) -> StatsPrinter {
+    fn new(interval_secs: u64, n: usize, mode: Mode, force_table: bool) -> StatsPrinter {
+        let interval = Duration::from_secs(interval_secs.max(1));
+        let tty = std::io::stdout().is_terminal();
         StatsPrinter {
-            interval: Duration::from_secs(interval_secs.max(1)),
+            interval,
             last: Instant::now(),
             prev_samples: vec![0; n],
-            mode,
+            table: force_table || (mode == Mode::Stats && tty),
+            summary_every: if tty { interval } else { interval.max(Duration::from_secs(60)) },
+            last_summary: Instant::now(),
         }
     }
 
@@ -1123,7 +1165,7 @@ impl StatsPrinter {
 
     fn emit(&mut self, metrics: &Metrics) {
         let elapsed = self.last.elapsed().as_secs_f64();
-        if self.mode == Mode::Stats {
+        if self.table {
             println!("---- airband {elapsed:.1}s ----");
             println!("  ch    sps   total      drops   peak(dBFS)  carrier(dB·c)  tx");
         }
@@ -1144,7 +1186,7 @@ impl StatsPrinter {
             }
             if interval_samples > 0 {
                 active += 1;
-                if self.mode == Mode::Stats {
+                if self.table {
                     let sps = interval_samples as f64 / elapsed;
                     let peak_db = level_to_dbfs(m.take_peak());
                     let cdb = metrics.carrier_dbc(i);
@@ -1156,12 +1198,14 @@ impl StatsPrinter {
                 let _ = m.take_peak();
             }
         }
-        if self.mode == Mode::Stats {
+        if self.table {
             println!("  active channels: {active}, cumulative drops: {total_drops}");
-        } else {
+        } else if self.last_summary.elapsed() >= self.summary_every {
             eprintln!(
-                "[{elapsed:.0}s] {total_active_channels} channels active, {total_tx} transmissions, cumulative drops {total_drops}"
+                "[{up}s] {total_active_channels} channels active, {total_tx} transmissions, cumulative drops {total_drops}",
+                up = metrics.uptime_secs()
             );
+            self.last_summary = Instant::now();
         }
         self.last = Instant::now();
     }
@@ -1179,7 +1223,17 @@ fn run_session(
     carrier_thr: &AtomicU32,
     stats: &mut StatsPrinter,
 ) -> Result<()> {
-    let stream = TcpStream::connect(addr).with_context(|| format!("connecting to {addr}"))?;
+    // Resolve, then connect with a bound. A plain `TcpStream::connect` to a
+    // SYN-blackholed Pluto (board hung, link half-up) blocks for the kernel's
+    // full SYN back-off (~2 min) — longer than the unit's WatchdogSec — and the
+    // reader was killed and restarted (18 model reloads) for a 25 s Pluto blip.
+    let sa = addr
+        .to_socket_addrs()
+        .with_context(|| format!("resolving {addr}"))?
+        .next()
+        .with_context(|| format!("no address for {addr}"))?;
+    let stream = TcpStream::connect_timeout(&sa, Duration::from_secs(5))
+        .with_context(|| format!("connecting to {addr}"))?;
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     eprintln!("connected to {addr}");
     metrics.set_stream_up(true);
@@ -1214,6 +1268,7 @@ fn run_session(
         since_active += 1;
         if since_active >= 256 {
             metrics.note_active();
+            metrics.note_heartbeat();
             since_active = 0;
         }
 
@@ -1244,9 +1299,6 @@ fn run_session(
 
         if stats.due() {
             stats.emit(metrics);
-            // Pet the systemd watchdog from the live read loop, so a hung-but-
-            // alive reader (no data progressing) is restarted (no-op off-systemd).
-            sd_notify("WATCHDOG=1");
         }
     }
 }
@@ -1442,10 +1494,14 @@ fn main() -> Result<()> {
         monitor::serve(args.monitor_port, senders.clone(), cfg.rate);
     }
 
-    // Signal readiness for systemd Type=notify (no-op otherwise).
+    // Signal readiness for systemd Type=notify (no-op otherwise), then start the
+    // watchdog keeper; the first heartbeat is stamped here so the keeper pets
+    // from its first tick while the initial connect is still in flight.
+    metrics.note_heartbeat();
     sd_notify("READY=1");
+    spawn_watchdog_keeper(Arc::clone(&metrics));
 
-    let mut stats = StatsPrinter::new(args.stats_interval, n, cfg.mode);
+    let mut stats = StatsPrinter::new(args.stats_interval, n, cfg.mode, args.stats_table);
     loop {
         if let Err(e) =
             run_session(&args.addr, n, &cfg, &senders, &metrics, &carrier_thr, &mut stats)
@@ -1456,9 +1512,10 @@ fn main() -> Result<()> {
             for s in &senders {
                 let _ = s.send(Msg::Reset);
             }
-            // Keep the watchdog satisfied across a Pluto/network outage so a
-            // reconnecting (but healthy) reader is not killed by WatchdogSec.
-            sd_notify("WATCHDOG=1");
+            // Count the attempt as router progress so the watchdog keeper keeps
+            // petting systemd across a Pluto/network outage: a reconnecting but
+            // healthy reader must not be killed by WatchdogSec.
+            metrics.note_heartbeat();
             thread::sleep(Duration::from_secs(1));
         }
     }

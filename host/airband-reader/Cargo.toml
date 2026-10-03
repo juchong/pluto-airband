@@ -13,7 +13,7 @@ path = "src/main.rs"
 airband-dsp = { path = "../airband-dsp" }
 airband-dfn = { path = "../airband-dfn" }
 anyhow = "1.0"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 mp3lame-encoder = "0.2.4"
 native-tls = "0.2"
 rumqttc = "0.24"
