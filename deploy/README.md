@@ -8,8 +8,12 @@ tower site — under **systemd**, so it auto-starts on boot and restarts on cras
 |---|---|
 | [`airband-feeds.service`](airband-feeds.service) | systemd unit that runs `airband-reader --feeds …`. **Edit it** for your host: the device address, checkout path, user, `--channels`, and squelch flags. |
 | [`airband-feeds.env.example`](airband-feeds.env.example) | template for the root-only env file that supplies the Icecast/LiveATC source passwords referenced as `${…}` in `feeds.json` (plus optional MQTT/alert settings). |
-| [`airband-alert@.service`](airband-alert@.service) | one-shot unit the feeder's `OnFailure=` triggers on crash/watchdog timeout; runs `airband-alert.sh`. |
-| [`airband-alert.sh`](airband-alert.sh) | notification hook: POSTs a one-line message to `$AIRBAND_ALERT_URL` (webhook/ntfy), or logs only if that is unset. |
+| [`airband-alert.sh`](airband-alert.sh) | failure hook run by the feeder's `ExecStopPost=` after every stop: silent on a clean stop/restart (`$SERVICE_RESULT=success`), otherwise POSTs a one-line message to `$AIRBAND_ALERT_URL` (webhook/ntfy), or logs only if that is unset. |
+| [`airband-alert@.service`](airband-alert@.service) | one-shot template around `airband-alert.sh`; the manual test harness (`systemctl start airband-alert@test`). No longer wired to the feeder — its old `OnFailure=` could never fire, see *Failure alerting*. |
+| [`airband-watchdog.service`](airband-watchdog.service) | root daemon that polls the reader's `/status` and escalates recovery (restart feeder → bounce `maia-httpd` → reboot Pluto) when the stream is really down; see *Auto-recovery watchdog*. |
+| [`airband-watchdog.sh`](airband-watchdog.sh) | the watchdog poll loop itself (POSIX sh; its knobs come from the env file through the unit's `EnvironmentFile=`). |
+| [`airband-watchdog-selftest.sh`](airband-watchdog-selftest.sh) | offline check of the watchdog's JSON parse and down/not-down decision against real `/status` shapes: `sh deploy/airband-watchdog-selftest.sh`. |
+| [`install.sh`](install.sh) | `sudo sh deploy/install.sh`: installs root-owned copies of the two scripts into `/usr/local/sbin` and the three units into `/etc/systemd/system`, `daemon-reload`s, and prints what changed and what to restart. Idempotent; never restarts anything itself. |
 
 The shipped `airband-feeds.service` is a **working example**, not a fixed
 recipe — its `User=`, `WorkingDirectory=`, `ExecStart=` device address, and
@@ -55,30 +59,44 @@ sudo $EDITOR /etc/airband-feeds.env        # fill in the AIRBAND_* passwords
 sudo chown root:root /etc/airband-feeds.env && sudo chmod 600 /etc/airband-feeds.env
 ```
 
-Install and start the service (edit `airband-feeds.service` first if your paths,
+Install and start the services (edit `airband-feeds.service` first if your paths,
 user, device address, or channel count differ):
 
 ```bash
-# Install the feeder unit and the OnFailure alert template together.
-sudo cp deploy/airband-feeds.service deploy/airband-alert@.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now airband-feeds.service
+# install.sh puts root-owned copies of airband-watchdog.sh + airband-alert.sh in
+# /usr/local/sbin (the units execute THOSE, never the pi-writable checkout), copies
+# the three units into /etc/systemd/system, daemon-reloads, and prints what
+# changed. It never restarts anything itself.
+sudo sh deploy/install.sh
+sudo systemctl enable --now airband-feeds.service airband-watchdog.service
 systemctl status airband-feeds            # state
 journalctl -u airband-feeds -f            # live logs (one-line summary per minute; add --stats-table for the 5 s table)
-sudo systemctl restart airband-feeds      # apply a feeds.json edit
-sudo systemctl stop airband-feeds         # graceful stop (SIGINT closes feeds)
+sudo systemctl restart airband-feeds      # apply a feeds.json edit (35-50 s gap on every feed: 18 DFN models reload)
+sudo systemctl stop airband-feeds         # stop (plain SIGTERM; see below)
 ```
 
-The unit sets `Restart=always` with `StartLimitIntervalSec=0` (never give up) and
-`KillSignal=SIGINT` so `stop` triggers the reader's graceful shutdown. Because the
-reader reconnects to both the Pluto and Icecast on its own, a restart only fires
-on an actual crash or a watchdog timeout.
+The unit sets `Restart=always` with `StartLimitIntervalSec=0` (never give up).
+`stop` uses systemd's default `SIGTERM`: the reader installs **no** signal handler,
+so there is no graceful shutdown to trigger — it simply exits and both Icecast
+servers drop the mounts within seconds (an earlier `KillSignal=SIGINT` "graceful
+stop" claim here was wrong). Because the reader reconnects to both the Pluto and
+Icecast on its own, a restart only fires on an actual crash or a watchdog timeout.
 
 It also runs as `Type=notify` with `WatchdogSec=30`: the reader signals readiness
-once its DeepFilterNet models are loaded and pings the watchdog from its live read
-loop, so a process that is *alive but no longer moving data* (a hang) is restarted,
-not just one that exits. `MemoryMax=1500M`/`OOMPolicy=kill` cap a runaway leak (well
-above normal RSS), and `OnFailure=` fires the alert hook below.
+once its DeepFilterNet models are loaded and pets the watchdog from its heartbeat
+keeper for as long as the router is making progress (samples arriving, or
+reconnect attempts cycling), so a process that is *alive but no longer moving
+data* (a hang) is restarted, not just one that exits. Every stop runs the
+`ExecStopPost=` alert hook (see *Failure alerting*). The unit also carries
+`Nice=-10`/`CPUWeight=1000` (the real-time DSP wins CPU over the ADS-B
+containers), `OOMScoreAdjust=-500`, and a conservative systemd sandbox
+(`ProtectSystem=strict`, `ProtectHome=read-only`, `PrivateDevices`, … — the reader
+writes nothing in `--feeds` mode; add `ReadWritePaths=` for the `--out-dir` if you
+ever add `--mode wav`). `MemoryMax=1500M`/`MemorySwapMax=0`/`OOMPolicy=kill` guard
+against a runaway leak, **but are inert on a kernel booted with
+`cgroup_disable=memory`** — as `rf-pi` is today (`cat
+/sys/fs/cgroup/cgroup.controllers` lacks `memory`); they take effect once the
+memory controller is enabled in `cmdline.txt` and the Pi rebooted.
 
 ## Monitoring, health & debugging
 
@@ -124,32 +142,54 @@ The feeder's own `WatchdogSec=30` restarts a *hung* reader, but it does **not**
 cover a Pluto that goes offline: the reader keeps petting the systemd watchdog
 while it reconnects (by design — a healthy reader waiting for the board back
 shouldn't be killed), so a crashed `maia-httpd`, a wedged FPGA/DMA, or a dropped
-link is a **silent outage** — nothing restarts and `OnFailure=` never fires.
+link is a **silent outage** — nothing restarts and, since the feeder never stops,
+the `ExecStopPost=` alert hook never runs either.
 
 `airband-watchdog.service` closes that gap. It polls the reader's `/status`
-heartbeat and, when `system_healthy` stays false past a threshold, escalates
-recovery on a cooldown (each stage gets time to work before the next):
+heartbeat every 15 s and classifies each snapshot: **down** when `/status` does not
+answer (reader crashed or reloading), when `stream_up` is false (the `:30000` link
+is gone — Pluto offline or `maia-httpd` dead), or when `data_flowing` is false
+(link up, no samples — wedged DMA/FPGA). After 4 consecutive down probes (60 s) it
+escalates recovery on a 300 s cooldown counted from the *end* of the previous
+action, so a restarted feeder gets settling time past its 180 s start timeout
+before the next stage:
 
 1. **restart `airband-feeds`** — clears a wedged reader / forces a clean reconnect;
 2. **bounce `maia-httpd` on the Pluto** (over SSH) — recovers a crashed daemon
    without a full reboot;
 3. **reboot the Pluto** (over SSH) — recovers a wedged FPGA/DMA or kernel.
 
+What does **not** trigger it: `pluto_reachable=false` on its own. That is the
+reader's 2 s HTTP probe of the Pluto's `:8000` web port, and it misses ~20×/day
+while audio flows perfectly (136 blips in 7 days on `rf-pi`); the previous gate on
+`system_healthy` — which folds that probe in — restarted a healthy feeder twice
+for nothing (once during a Pi-side DNS outage a restart cannot fix). A probe-only
+miss is logged as a warning and never counted. Once the ladder is exhausted the
+"still down" reminder backs off exponentially (300 s, 600 s, … capped at 1 h) so a
+long outage stays visible without paging every five minutes.
+
 Every action is announced to `AIRBAND_ALERT_URL` (same hook as the crash alert),
-and a "recovered" note fires when `/status` goes healthy again. A last-resort Pi
-reboot is available but **off by default** (`AIRBAND_WATCHDOG_REBOOT_PI=0`) — a Pi
-reboot can't fix a dead Pluto and takes the whole feeder down. All knobs live in
-`/etc/airband-feeds.env` (`AIRBAND_WATCHDOG_*`, see `airband-feeds.env.example`)
-and default to safe values; the only prerequisite for Pluto-side recovery is
+and a "recovered" note fires when the stream is up and flowing again. A last-resort
+Pi reboot is available but **off by default** (`AIRBAND_WATCHDOG_REBOOT_PI=0`) — a
+Pi reboot can't fix a dead Pluto and takes the whole feeder down. All knobs live in
+`/etc/airband-feeds.env` (`AIRBAND_WATCHDOG_*`, see `airband-feeds.env.example`),
+reach the script through the unit's `EnvironmentFile=` (the script does not source
+the file itself), and default to safe values. The Pluto-side stages (2 and 3) need
 `sshpass` on the Pi (`sudo apt-get install -y sshpass`) or a key-based
-`AIRBAND_WATCHDOG_PLUTO_SSH` override.
+`AIRBAND_WATCHDOG_PLUTO_SSH` override; every ssh stage is bounded by `timeout 60`
+plus keepalives, ignores the Pluto's churning host key, passes the password only
+through the environment, and logs ssh's stderr to the journal. After its startup
+grace period the watchdog runs one `ssh … true` against the Pluto and logs
+`Pluto ssh check …: ok` or the exact failure — keep
+`AIRBAND_WATCHDOG_REBOOT_PLUTO=0` (restart-feeder + alert only) until that line
+reads ok.
 
 ```bash
 sudo apt-get install -y sshpass                # for the Pluto-bounce/reboot stages
-sudo cp deploy/airband-watchdog.service /etc/systemd/system/
-sudo systemctl daemon-reload
+sudo sh deploy/install.sh                      # script -> /usr/local/sbin, unit -> /etc/systemd/system (if not done above)
 sudo systemctl enable --now airband-watchdog.service
-journalctl -u airband-watchdog -f              # watch probes + recovery actions
+journalctl -u airband-watchdog -f              # 'starting: …', the ssh check, then probes + recovery actions
+sh deploy/airband-watchdog-selftest.sh         # offline check of the parse + down/not-down decision
 ```
 
 ### MQTT → Home Assistant
@@ -215,11 +255,22 @@ automation:
 
 ### Failure alerting
 
-`airband-feeds.service` declares `OnFailure=airband-alert@%n.service`. Install the
-template (done above) and set `AIRBAND_ALERT_URL` in `/etc/airband-feeds.env` to a
-webhook or ntfy topic; the hook POSTs a one-line message on any crash or watchdog
-timeout. Left unset, it logs to the alert unit's journal only. Test it with
-`systemctl start airband-alert@test.service`.
+`airband-feeds.service` runs `ExecStopPost=/usr/local/sbin/airband-alert.sh %n`
+after **every** stop. systemd hands the script `$SERVICE_RESULT` / `$EXIT_CODE` /
+`$EXIT_STATUS`: on `success` (a clean `systemctl stop`/`restart`, including the
+watchdog's own recovery restart) it exits silently; on anything else — crash
+(`exit-code`), `signal`, `watchdog` timeout, `oom-kill`, start `timeout` — it logs
+to the feeder's journal and POSTs one line to `AIRBAND_ALERT_URL`
+(`/etc/airband-feeds.env`; a webhook or ntfy topic). **Set that URL**: left unset,
+everything is log-only and a crash loop or a dead Pluto goes unnoticed.
+
+Why not `OnFailure=`: the unit used to declare `OnFailure=airband-alert@%n.service`,
+but with `Restart=always` + `StartLimitIntervalSec=0` a service never enters the
+`failed` state (systemd only marks a restarting unit failed when its start-rate
+limit trips, and that limit is disabled), so the hook never fired — not even for
+the 2026-09-07 watchdog kill. `airband-alert@.service` is kept as the manual test
+harness: `sudo systemctl start airband-alert@test.service` sends a `test FAILED`
+line through the same script and URL.
 
 ## Updating a deployment
 
@@ -230,9 +281,12 @@ starves the compiler), then restart:
 ```bash
 cd /home/pi/pluto-airband
 git pull --ff-only
-# If a unit FILE changed (e.g. --channels/--rate, or the alert template), reinstall
-# it first — git pull only updates the repo copy, not the one under /etc/systemd/system:
-#   sudo cp deploy/airband-feeds.service deploy/airband-alert@.service /etc/systemd/system/ && sudo systemctl daemon-reload
+# If anything under deploy/ changed, reinstall it — git pull only updates the
+# checkout, not the unit copies under /etc/systemd/system nor the root-owned script
+# copies under /usr/local/sbin that the units actually execute:
+sudo sh deploy/install.sh              # idempotent; prints what changed + what to restart (restarts nothing)
+#   -> "airband-watchdog changed":      sudo systemctl restart airband-watchdog   (no feed impact)
+#   -> "airband-feeds.service changed": the stop/start below applies it
 sudo systemctl stop airband-feeds      # free all cores for the build (no-op if already stopped)
 
 # Rebuild detached + logged, then poll the log (survives SSH drops / command-timeouts).

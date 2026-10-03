@@ -18,7 +18,7 @@ what is left).
 | 5. AM demod block | **done** (envelope mag + DC-block + audio decimate, chain verified) |
 | 6. Single-channel end-to-end | **done** (verified on hardware as part of the 21-ch stream) |
 | 7. Multi-channel | **done** — 21 channels live on hardware, gap-free TCP stream, auto-start |
-| 8. Pi streamer | **done + deployed** — host reader on `rf-pi` feeds all 21 channels to the local Icecast (`feeds.json` + `deploy/airband-feeds.service`, auto-start/restart), end-to-end validated; live LiveATC mount validation + per-feed supervision pending |
+| 8. Pi streamer | **done + deployed** — host reader on `rf-pi` feeds all 18 channels (the 16 MHz-capture plan) to the local Icecast (`feeds.json` + `deploy/airband-feeds.service`, auto-start/restart), end-to-end validated; live LiveATC mount validation + per-feed supervision pending |
 | 9. Hardening | host DSP done (squelch/AGC/band-pass/notch in `host/airband-dsp`); 24/7 soak + feed supervision not started |
 
 ## Done
@@ -1406,7 +1406,7 @@ each step verified against the `--metrics-port 9108` gauges (`airband_carrier_db
   to do: a better antenna for weaker fields, and per-site tuning of `gain_db` /
   `--shift` (lower gain if a strong local signal ever overloads the front-end).
 - **LiveATC feeder validation** (`SPEC.md` §9): the Icecast source client is built
-  and now **validated end-to-end** on `rf-pi` — all 21 channels feed the local
+  and now **validated end-to-end** on `rf-pi` — all 18 channels feed the local
   Icecast (`feeds.json` + `deploy/airband-feeds.service`), plus a single TLS feed
   proven. Remaining is validating against a real **LiveATC** mount and per-feed
   supervision/alerting.
@@ -1439,8 +1439,14 @@ system defends on its own (full design in `SPEC.md` §9).
     ~100–200 ms). `pre` = raw demod (continuous), `post` = enhanced gated audio.
   - **systemd hardening** (`deploy/airband-feeds.service`): `Type=notify` +
     `WatchdogSec` + `sd_notify` (a hung-but-alive reader is restarted),
-    `MemoryMax`/`OOMPolicy`, and `OnFailure=airband-alert@.service`
-    (webhook/ntfy via `$AIRBAND_ALERT_URL`). Docs in `deploy/README.md`.
+    `MemoryMax`/`OOMPolicy`, and an alert hook (webhook/ntfy via
+    `$AIRBAND_ALERT_URL`). Docs in `deploy/README.md`. *Corrected 2026-10-03:*
+    the hook as shipped was `OnFailure=airband-alert@.service`, which can never
+    fire under `Restart=always` + `StartLimitIntervalSec=0` (the unit never
+    enters `failed`; the 2026-09-07 watchdog kill produced no alert) — it is now
+    `ExecStopPost=airband-alert.sh` keyed on `$SERVICE_RESULT`. `MemoryMax` /
+    `OOMPolicy` are inert on `rf-pi` until the memory cgroup controller is
+    enabled (the kernel boots with `cgroup_disable=memory`).
 - **Pluto `maia-httpd`:**
   - `airband::reader_loop` gained a **DMA-stall watchdog** (errors if the FPGA
     write pointer freezes for >5 s) and **overflow escalation** (>15 s sustained
@@ -1460,8 +1466,11 @@ system defends on its own (full design in `SPEC.md` §9).
   airband ring + spectrometer. Recorder size is read from sysfs, so maia-httpd's
   mmap stays consistent with no code change. Needs a coordinated bitstream + DT
   rebuild flashed as a set (BUILD.md).
-- **Fault-injection soak procedure (to run on hardware):** with the feeder under
-  systemd and metrics/MQTT up, induce each fault and confirm auto-recovery +
+- **Fault-injection soak procedure — NOT YET RUN (as of 2026-10-03 none of the
+  five steps below has been executed on hardware; the only "faults" seen so far
+  were unplanned: a 25 s Pluto blip that tripped `WatchdogSec` on 2026-09-07 and
+  a 10 min broker outage that deadlocked MQTT on 2026-10-01):** with the feeder
+  under systemd and metrics/MQTT up, induce each fault and confirm auto-recovery +
   visibility + alert:
   1. `ssh root@<pluto> killall maia-httpd` → supervisor relaunches it; Pi shows
      `airband_link_up` drop then recover; `/healthz` 503→200.
@@ -1469,8 +1478,12 @@ system defends on its own (full design in `SPEC.md` §9).
      MQTT availability still online (Pi alive); restore → recovers.
   3. `systemctl stop icecast` (or block LiveATC) → affected feed `connected` 0,
      `liveatc_healthy` 0, reconnects climb; restore → recovers.
-  4. `systemctl kill -s SIGKILL airband-feeds` → `Restart=always` + `OnFailure`
-     alert fires; MQTT LWT flips availability `offline` then `online` on restart.
+  4. `systemctl kill -s SIGKILL airband-feeds` → `Restart=always` + the
+     `ExecStopPost` alert fires (`SERVICE_RESULT=signal`; the old `OnFailure=`
+     never would have); MQTT LWT flips availability `offline` then `online` on
+     restart.
   5. Stress memory toward `MemoryMax` → cgroup OOM-kills + restart (no host-wide
-     OOM). Each step should be visible in `journalctl -u airband-feeds`,
-     `/metrics`, and the HA dashboard.
+     OOM). Requires the memory cgroup controller — inert while
+     `cgroup_disable=memory` is on the kernel cmdline, as on `rf-pi` today. Each
+     step should be visible in `journalctl -u airband-feeds`, `/metrics`, and the
+     HA dashboard.

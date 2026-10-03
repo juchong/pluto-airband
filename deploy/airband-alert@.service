@@ -1,8 +1,17 @@
-# One-shot alert fired by airband-feeds.service's OnFailure= when the feeder
-# crashes or trips its watchdog. Instantiated as airband-alert@airband-feeds.service
-# (the %i is the failed unit name). Sends a one-line notification to the webhook /
-# ntfy URL in $AIRBAND_ALERT_URL (set it in /etc/airband-feeds.env); if that is
-# unset it just logs to journald, so the hook is harmless when no alerting is set up.
+# One-shot alert template: `systemctl start airband-alert@<name>` sends a one-line
+# "<name> FAILED" notification to the webhook / ntfy URL in $AIRBAND_ALERT_URL (set
+# it in /etc/airband-feeds.env); if that is unset it just logs to journald.
+#
+# airband-feeds.service does NOT use this template any more. It used to declare
+# OnFailure=airband-alert@%n.service, but that hook can never fire: with
+# Restart=always + StartLimitIntervalSec=0 the feeder never enters the "failed"
+# state (systemd only marks a restarting service failed when its start-rate limit
+# trips, and that limit is disabled), so no crash or watchdog kill ever activated
+# it. The feeder now alerts through ExecStopPost=/usr/local/sbin/airband-alert.sh,
+# which runs after every stop and keys on $SERVICE_RESULT. This template is kept
+# as the manual test harness for the alert path (`systemctl start
+# airband-alert@test`) and for any other unit that does enter "failed" and wants
+# an OnFailure= hook.
 [Unit]
 Description=Alert that %i failed
 
@@ -10,4 +19,24 @@ Description=Alert that %i failed
 Type=oneshot
 # Reuse the feeder's secrets file (optional: '-' means don't fail if absent).
 EnvironmentFile=-/etc/airband-feeds.env
-ExecStart=/home/pi/pluto-airband/deploy/airband-alert.sh %i
+# Root-owned copy installed by deploy/install.sh (never run the pi-writable
+# checkout copy as root). ExecStart= gets no $SERVICE_RESULT, so the script
+# always sends.
+ExecStart=/usr/local/sbin/airband-alert.sh %i
+# Sandbox: it only runs hostname/date/curl. Same conservative set as the watchdog.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=

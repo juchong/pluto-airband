@@ -1,6 +1,15 @@
 #!/usr/bin/env python3
 """Idempotently make maia-httpd survive a tight-memory boot race.
 
+DEPRECATED -- do not run this. Use ``patch_maia_supervisor.py`` instead. The two
+are mutually exclusive: applying this *after* the supervisor leaves the init
+script with TWO respawn loops (the bounded one here plus the permanent one),
+which race each other and the deliberate ``S60maia-httpd restart`` the
+supervisor's intentional-stop flag exists to respect. ``patch_maia_supervisor.py``
+strips this script's ``airband-respawn`` block when it runs, so the supported
+migration is one-way: supervisor last. Kept in the tree, unexecutable from the
+build, for reference and historical provenance only.
+
 SUPERSEDED: the firmware build now installs a *permanent* restart-safe supervisor
 via ``patch_maia_supervisor.py`` (which also strips this script's bounded block on
 migration). This bounded respawn is retained only for reference / historical

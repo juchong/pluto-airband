@@ -685,8 +685,10 @@ Consequences, both addressed by this design:
   Icecast; **passwords are `${ENV_VAR}` references** expanded at load, so the file
   holds no secrets — they live in the systemd `EnvironmentFile`
   (`/etc/airband-feeds.env`). The Pi runs a plain **git checkout built on-device**
-  (never `rsync`); update with `git pull` + `cargo build --release -p
-  airband-reader` + service restart (see README → *Run the feeder as a service*).
+  (never `rsync`); update with `git pull` + `cargo build --release --manifest-path
+  host/Cargo.toml -p airband-reader` (the Cargo workspace is `host/`; there is no
+  root manifest, so a bare `cargo build` from the checkout root fails) + service
+  restart (see `deploy/README.md` → *Updating a deployment*).
   NB: the Pluto serves a **single client** on `:30000` — run exactly one reader
   per device.
 - **Reliability, observability & recovery (implemented; soak pending).** The
@@ -706,8 +708,15 @@ Consequences, both addressed by this design:
     A **low-latency raw-PCM debug monitor** (`--monitor-port`,
     `GET /listen/<ch>.wav?tap=pre|post`) streams one selectable channel in-process
     (no Icecast/MP3, ~100–200 ms). The systemd unit is `Type=notify` with
-    `WatchdogSec` + `sd_notify`, `MemoryMax`/`OOMPolicy`, and an `OnFailure=` alert
-    hook (webhook/ntfy).
+    `WatchdogSec` + `sd_notify`, an `ExecStopPost=` alert hook (webhook/ntfy, keyed
+    on `$SERVICE_RESULT` — the original `OnFailure=` hook could never fire under
+    `Restart=always` + `StartLimitIntervalSec=0`, since the unit never enters
+    `failed`), a conservative sandbox, and `MemoryMax`/`MemorySwapMax`/`OOMPolicy`
+    (inert on `rf-pi` until the memory cgroup controller is enabled: the kernel
+    currently boots with `cgroup_disable=memory`). An external
+    `airband-watchdog.service` covers the case systemd cannot see — a Pluto that is
+    offline while the reader keeps reconnecting — and acts only on `stream_up` /
+    `data_flowing` / no `/status`, never on the cosmetic `:8000` probe alone.
   - *Pluto (maia-httpd):* the airband `reader_loop` has a **DMA-stall watchdog**
     (fails if the FPGA write pointer freezes) and escalates sustained overflow; a
     failed airband task now **restarts in-process with backoff** (app.rs) instead

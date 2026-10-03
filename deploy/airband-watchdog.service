@@ -3,7 +3,13 @@
 # reader's own systemd WatchdogSec deliberately ignores — it keeps petting while
 # reconnecting, see airband-watchdog.sh) and escalates recovery the reader/systemd
 # cannot: restart the Pi feeder -> bounce the Pluto's maia-httpd -> reboot the
-# Pluto. Polls the reader's /status heartbeat on the metrics port.
+# Pluto. Polls the reader's /status heartbeat on the metrics port and acts only
+# when the stream is really down (stream_up/data_flowing false, or no answer);
+# a missed :8000 probe alone is a warning, never a restart.
+#
+# Install with `sudo sh deploy/install.sh` (copies the script to /usr/local/sbin
+# and this unit to /etc/systemd/system) — re-run it after every `git pull` that
+# touches deploy/, since the running copy is NOT the git checkout.
 [Unit]
 Description=Pluto airband capture watchdog (Pluto<->Pi heartbeat + auto-recovery)
 Documentation=https://github.com/juchong/pluto-airband
@@ -17,12 +23,46 @@ Type=simple
 # Runs as root: needs `systemctl restart airband-feeds` and, if enabled, `reboot`.
 # Reuses the feeder's env file for AIRBAND_ALERT_URL + the AIRBAND_WATCHDOG_* knobs
 # (all optional; the script has safe defaults). '-' => don't fail if it's absent.
+# This is the ONLY way the script gets its config — it no longer sources the file
+# itself — so a knob changed in the env file takes effect on the next
+# `systemctl restart airband-watchdog`.
 EnvironmentFile=-/etc/airband-feeds.env
-ExecStart=/home/pi/pluto-airband/deploy/airband-watchdog.sh
+# Root-owned copy installed by deploy/install.sh. Running the pi-writable checkout
+# copy directly would let any compromise of the pi account run code as root.
+ExecStart=/usr/local/sbin/airband-watchdog.sh
 Restart=always
 RestartSec=10
-# The script is a tiny poll loop; keep it lean.
+# The script is a tiny poll loop; keep it lean. (No-op while the kernel boots with
+# cgroup_disable=memory — see airband-feeds.service — but harmless, and live once
+# the memory controller is enabled.)
 MemoryMax=64M
+
+# --- Sandbox -----------------------------------------------------------------
+# Root-appropriate hardening for a shell loop that only needs: curl to the reader
+# and the alert URL, ssh/sshpass to the Pluto, DNS, and `systemctl` over the
+# manager's private AF_UNIX socket. Verified on rf-pi: `systemctl` works as uid 0
+# with an EMPTY capability set (PID 1 authorises the private socket by peer uid,
+# not by capability), so no capabilities are retained. PrivateDevices keeps the
+# pseudo-TTY subsystem, which sshpass needs for the password prompt.
+# ProtectHome=read-only (not yes) so a key-based AIRBAND_WATCHDOG_PLUTO_SSH can
+# still read /root/.ssh. Nothing here writes to the filesystem: ssh's known_hosts
+# is pointed at /dev/null by the script.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
 
 [Install]
 WantedBy=multi-user.target

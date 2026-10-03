@@ -5,8 +5,14 @@ After=network-online.target
 Wants=network-online.target
 # The Pluto serves a single client; never give up retrying if it restarts.
 StartLimitIntervalSec=0
-# Fire a one-shot notification (webhook/ntfy) on crash or watchdog timeout.
-OnFailure=airband-alert@%n.service
+# No OnFailure= here, on purpose. This unit used to declare
+# OnFailure=airband-alert@%n.service, but with Restart=always AND
+# StartLimitIntervalSec=0 the unit can never enter the "failed" state: systemd
+# only marks a restarting service failed once its start-rate limit trips, and
+# that limit is disabled above, so every crash/watchdog kill goes straight to
+# "activating (auto-restart)" and OnFailure= never fires (it did not fire for the
+# 2026-09-07 watchdog kill). Crash alerting is done by ExecStopPost= below,
+# which runs after EVERY stop and keys on $SERVICE_RESULT.
 
 [Service]
 # notify: the reader sends sd_notify(READY=1) once all DeepFilterNet models are
@@ -84,22 +90,82 @@ EnvironmentFile=/etc/airband-feeds.env
 #   every 60 s instead of the 18-row table every 5 s; add --stats-table to get the
 #   table back (it duplicates /metrics and /status, and filled the 4 GB journal).
 ExecStart=/home/pi/pluto-airband/host/target/release/airband-reader plutoplus.chongflix.tv:30000 --feeds /home/pi/pluto-airband/feeds.json --channels 18 --rate 20000 --squelch carrier --squelch-snr 11 --squelch-hysteresis-db 3 --squelch-hang-ms 300 --squelch-voice-gate-channels 9 --metrics-port 9108 --monitor-port 8082 --mqtt-broker ${AIRBAND_MQTT_BROKER} --mqtt-user ${AIRBAND_MQTT_USER}
+# Failure alerting. systemd runs this after EVERY stop (also when ExecStart itself
+# failed or timed out) with $SERVICE_RESULT/$EXIT_CODE/$EXIT_STATUS set. The
+# script exits 0 silently on SERVICE_RESULT=success (a clean `systemctl
+# stop/restart`, including the external watchdog's recovery restart) and
+# otherwise logs + POSTs to $AIRBAND_ALERT_URL from the EnvironmentFile above
+# (crash, signal, WatchdogSec timeout, OOM kill, start timeout). It runs as
+# User=pi inside the sandbox below, which is all curl needs. Root-owned copy
+# installed by deploy/install.sh. Bounded by `curl -m 10` < TimeoutStopSec, so it
+# never delays the Restart= below by more than that.
+ExecStopPost=/usr/local/sbin/airband-alert.sh %n
 # airband-reader reconnects to the Pluto and to Icecast on its own, so this only
 # fires on a real crash. Wait between restarts so a wedged Pluto isn't hammered.
 Restart=always
 RestartSec=5
-# The reader traps SIGINT for a graceful shutdown (close feeds/recorders); use it
-# for `systemctl stop` instead of the default SIGTERM.
-KillSignal=SIGINT
+# Default KillSignal (SIGTERM): the reader installs NO signal handler, so there is
+# no graceful shutdown to trigger — a `systemctl stop` just terminates it and the
+# Icecast servers notice the dropped source sockets within seconds (an earlier
+# KillSignal=SIGINT line here claimed otherwise and was wrong). TimeoutStopSec is
+# kept so a reader wedged in an uninterruptible write still gets SIGKILLed
+# promptly; it also bounds the ExecStopPost hook above.
 TimeoutStopSec=15
 # Single instance is inherent to a systemd service; keep memory/FD headroom for
 # 18 eager DeepFilterNet models (~10-15 MB each) plus encoders.
 LimitNOFILE=4096
+# CPU priority. The reader runs ~190% CPU of real-time DSP (18 DeepFilterNet
+# channels) on a Pi 5 that also hosts the ADS-B docker stack and has been seen
+# thermally throttled (soft temp limit, no fan). Nice=-10 wins scheduler ties
+# against ordinary processes; CPUWeight=1000 (default 100) does the same at the
+# cgroup level against the docker slice when the whole box is saturated, so audio
+# keeps its deadlines and the feeders, not the reader, lose cycles.
+Nice=-10
+CPUWeight=1000
 # Guard against a runaway leak: well above normal RSS (models + tract buffers +
 # encoders, a few hundred MB), so this only trips on a real leak. On breach the
 # cgroup OOM-kills the reader and Restart=always brings it back clean.
+# MemorySwapMax=0 keeps a real-time process out of swap (a swapped tract buffer is
+# an audio dropout). NOTE: rf-pi currently boots with cgroup_disable=memory on the
+# kernel cmdline (cgroup.controllers lacks "memory"), so MemoryMax, MemorySwapMax
+# and OOMPolicy are inert until the controller is enabled in cmdline.txt and the
+# Pi rebooted; they are kept so that reboot is the only step needed.
+# OOMScoreAdjust is a plain per-process knob (no cgroup needed): under host-wide
+# memory pressure the kernel kills the ADS-B containers before the feeder.
 MemoryMax=1500M
+MemorySwapMax=0
 OOMPolicy=kill
+OOMScoreAdjust=-500
+
+# --- Sandbox -----------------------------------------------------------------
+# Conservative hardening (systemd-analyze security scored the bare unit 9.2
+# UNSAFE). The reader in --feeds mode needs only: read access to the binary,
+# feeds.json and the models (embedded), outbound TCP (Pluto :30000/:8000, Icecast,
+# LiveATC TLS, MQTT), two listening TCP ports (:9108 metrics, :8082 monitor), DNS,
+# and the AF_UNIX sd_notify socket. It writes nothing: the deployed ExecStart has
+# no --mode wav/raw, so the --out-dir recorder path (main.rs: create_dir_all only
+# when mode != stats) is never taken — hence the whole tree, /home included, is
+# read-only. If you ever add --mode wav here, add
+# ReadWritePaths=<the --out-dir> too. SystemCallFilter and MemoryDenyWriteExecute
+# are deliberately NOT set (tract/DFN inference; not worth a silent SIGSYS).
+# PrivateDevices is fine for --feeds (no ALSA; that is airband-listen). An empty
+# CapabilityBoundingSet is a no-op for User=pi but documents the intent.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
 
 [Install]
 WantedBy=multi-user.target
