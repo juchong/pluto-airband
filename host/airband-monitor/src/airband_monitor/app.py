@@ -1,37 +1,51 @@
-"""Interactive live listener (curses TUI) and headless player.
+"""Live listener core: playback worker, per-tap recorders, /status poller.
 
 Runs one streaming worker thread that connects to the Pi monitor endpoint for
 the currently-selected channel + tap, plays it through the default output
 device, meters the level, and optionally records the raw stream to a WAV. The
-main thread drives the curses UI (or just idles in ``--no-tui`` mode); switching
-channel or tap closes the live HTTP response to unblock the worker, which then
-reconnects with the new parameters.
+main thread drives the curses UI (``tui.py``) or just idles in ``--no-tui``
+mode. Switching channel or tap bumps a generation counter and shuts down the
+live stream's socket, which wakes the worker out of a blocked ``read()`` so it
+reconnects with the new parameters at once.
+
+Both monitor taps stream bytes continuously, so a read that yields nothing for
+``stream.STREAM_TIMEOUT_S`` means the reader (or the network) is gone; the
+worker treats that ``TimeoutError`` as a stall and reconnects.
 """
 
 from __future__ import annotations
 
 import array
-import curses
 import os
+import socket
 import threading
 import time
 import wave
 from datetime import datetime, timezone
 
-import sounddevice as sd
-
 from .plan import Channel
-from .stream import fetch_status, monitor_url, open_stream, peak_dbfs
+from .stream import STREAM_TIMEOUT_S, fetch_status, monitor_url, open_stream, peak_dbfs
+
+# Playback needs PortAudio (via sounddevice). Import it tolerantly so this
+# module loads without it (tests, --help); cli.main() refuses to start when it
+# is missing and the worker reports it instead of crashing.
+AUDIO_BACKEND_ERROR: str | None = None
+try:
+    import sounddevice as sd
+except (ImportError, OSError) as _e:  # e.g. "PortAudio library not found"
+    sd = None  # type: ignore[assignment]
+    AUDIO_BACKEND_ERROR = str(_e)
 
 VOL_STEP = 0.1
 VOL_MAX = 4.0
-SCAN_POLL_S = 0.3   # how often to poll /status
-SCAN_HANG_S = 1.5   # stay on a channel this long after it closes before hopping
+STATUS_POLL_S = 1.0        # /status poll period with scan off (health indicator only)
+SCAN_POLL_S = 0.3          # /status poll period while scanning (bounds hop latency)
+SCAN_HANG_S = 1.5          # stay on a channel this long after it closes before hopping
+RECONNECT_BACKOFF_S = 1.0  # pause before reconnecting after a real error or stall
 
-# curses color pair ids for the health indicators
-CLR_OK = 1
-CLR_WARN = 2
-CLR_BAD = 3
+# socket.timeout has been an alias of TimeoutError since Python 3.10; both are
+# named so the intent is clear whichever one a reader expects.
+_STALL_ERRORS = (TimeoutError, socket.timeout)
 
 
 def choose_scan_target(
@@ -60,6 +74,36 @@ def _safe_name(label: str, index: int) -> str:
     """Filesystem-safe stem from a channel label (fallback to the index)."""
     stem = "".join(c if c.isalnum() or c in "-_." else "_" for c in label).strip("_")
     return stem or f"ch{index:02d}"
+
+
+def _abort_stream(stream) -> None:
+    """Wake another thread out of a blocked ``stream.read()``.
+
+    ``close()`` from a second thread does not interrupt a ``recv()`` in
+    progress (it blocks on the response's buffer lock until the read returns),
+    so shut the socket down instead: the reader sees EOF or an error at once
+    and closes the stream itself in its ``finally``. Objects without a
+    ``shutdown()`` are simply closed."""
+    if stream is None:
+        return
+    fn = getattr(stream, "shutdown", None)
+    if fn is None:
+        fn = getattr(stream, "close", None)
+    if fn is None:
+        return
+    try:
+        fn()
+    except Exception:  # noqa: BLE001 (already gone is fine)
+        pass
+
+
+def _describe_error(e: BaseException, connected: bool) -> str:
+    """Human-readable cause for the status line / rec_error."""
+    if isinstance(e, _STALL_ERRORS):
+        if connected:
+            return f"stream stalled (no data for {STREAM_TIMEOUT_S:g} s)"
+        return f"connect timed out after {STREAM_TIMEOUT_S:g} s"
+    return str(e) or e.__class__.__name__
 
 
 class MonitorApp:
@@ -92,7 +136,7 @@ class MonitorApp:
         self.meter_dbfs = float("-inf")
         self.status = "starting"
         self.rec_error: str | None = None
-        self._play_resp = None  # live playback response, closed on change
+        self._play_resp = None  # live playback stream, shut down on change
         # Recording is decoupled from playback: one recorder thread + its own
         # connection per tap being recorded. ponytail: recording the tap you are
         # also listening to opens a second identical stream (the monitor endpoint
@@ -122,8 +166,9 @@ class MonitorApp:
         for tap in list(self._recorders):
             self._stop_recorder(tap)
         self._bump_and_close(chan=True)
-        self._thread.join(timeout=2.0)
-        self._scan_thread.join(timeout=2.0)
+        for t in (self._thread, self._scan_thread):
+            if t.is_alive():  # start() may never have been called
+                t.join(timeout=2.0)
 
     def toggle_scan(self) -> None:
         """`s`: auto-scan — follow whichever channels are active."""
@@ -137,8 +182,8 @@ class MonitorApp:
                 self.scan_status = ""
 
     def _bump_and_close(self, chan: bool) -> None:
-        """Bump the relevant generation(s) and close the live response(s) so a
-        blocked ``read()`` returns at once. ``chan=True`` restarts everyone
+        """Bump the relevant generation(s) and shut down the live stream(s) so
+        a blocked ``read()`` returns at once. ``chan=True`` restarts everyone
         (channel change); ``chan=False`` restarts only playback (tap change)."""
         with self._lock:
             self._play_gen += 1
@@ -147,11 +192,7 @@ class MonitorApp:
                 self._chan_gen += 1
                 resps += [r.get("resp") for r in self._recorders.values()]
         for r in resps:
-            if r is not None:
-                try:
-                    r.close()
-                except Exception:
-                    pass
+            _abort_stream(r)
 
     def set_channel(self, index: int) -> None:
         with self._lock:
@@ -245,15 +286,11 @@ class MonitorApp:
     def _stop_recorder(self, tap: str) -> None:
         with self._lock:
             rec = self._recorders.pop(tap, None)
+            resp = rec.get("resp") if rec is not None else None
         if rec is None:
             return
         rec["stop"].set()
-        r = rec.get("resp")
-        if r is not None:
-            try:
-                r.close()
-            except Exception:
-                pass
+        _abort_stream(resp)  # wake a read() blocked on the live socket
         rec["thread"].join(timeout=2.0)
 
     def _recorder(self, tap: str, rec: dict) -> None:
@@ -274,6 +311,7 @@ class MonitorApp:
                 wfile, path = self._new_wav(ch, tap, rate)
                 with self._lock:
                     rec["path"] = path
+                    self.rec_error = None  # a fresh file supersedes any earlier failure
                 chunk = max(2, int(rate * 0.02) * 2)
                 while not self._stop.is_set() and not stop.is_set():
                     block = resp.read(chunk)
@@ -282,7 +320,10 @@ class MonitorApp:
                     wfile.writeframes(block)
             except Exception as e:  # noqa: BLE001
                 with self._lock:
-                    self.rec_error = f"record {tap}: {e}"
+                    # A channel change or stop shuts our socket down and can
+                    # surface here as EOF/OSError: intentional, not an error.
+                    if cgen == self._chan_gen and not stop.is_set() and not self._stop.is_set():
+                        self.rec_error = f"record {tap}: {_describe_error(e, resp is not None)}"
             finally:
                 if resp is not None:
                     try:
@@ -300,7 +341,7 @@ class MonitorApp:
             with self._lock:
                 changed = cgen != self._chan_gen
             if not self._stop.is_set() and not stop.is_set() and not changed:
-                stop.wait(1.0)  # backoff after a real error
+                stop.wait(RECONNECT_BACKOFF_S)  # backoff after a real error / stall
 
     # ---- playback worker -------------------------------------------------
 
@@ -311,6 +352,8 @@ class MonitorApp:
             url = monitor_url(self.pi, ch, tap)
             out = resp = None
             try:
+                if sd is None:
+                    raise RuntimeError(f"audio playback unavailable: {AUDIO_BACKEND_ERROR}")
                 rate, resp = open_stream(url)
                 with self._lock:
                     if pgen != self._play_gen:  # changed while connecting
@@ -321,8 +364,11 @@ class MonitorApp:
                     self.status = f"connected  ch{ch:02d} {tap} @ {rate} Hz"
                 out = sd.RawOutputStream(samplerate=rate, channels=1, dtype="int16")
                 out.start()
-                self.audio_connected = True
                 chunk = max(2, int(rate * 0.02) * 2)  # ~20 ms of s16 mono
+                # Stamp before flagging connected so no snapshot pairs
+                # "connected" with a stale timestamp (a spurious IDLE).
+                self._last_audio_ts = time.monotonic()
+                self.audio_connected = True
                 while not self._stop.is_set():
                     block = resp.read(chunk)
                     if not block:
@@ -332,7 +378,10 @@ class MonitorApp:
                     out.write(self._process(block))
             except Exception as e:  # noqa: BLE001 (surface any error, then retry)
                 with self._lock:
-                    self.status = f"reconnecting: {e}"
+                    # A channel/tap switch or stop shuts our socket down and can
+                    # surface here as EOF/OSError: intentional, not an error.
+                    if pgen == self._play_gen and not self._stop.is_set():
+                        self.status = f"reconnecting: {_describe_error(e, resp is not None)}"
                 self.meter_dbfs = float("-inf")
             finally:
                 self.audio_connected = False
@@ -349,14 +398,16 @@ class MonitorApp:
             with self._lock:
                 changed = pgen != self._play_gen
             if not self._stop.is_set() and not changed:
-                self._stop.wait(1.0)  # backoff after a real error
+                self._stop.wait(RECONNECT_BACKOFF_S)  # backoff after a real error / stall
 
     # ---- /status poller (squelch health + scanner) ----------------------
 
     def _scanner(self) -> None:
         """Continuously poll the reader's /status: keeps the squelch-data health
         indicator and per-channel open flags live, and (while scanning) hops
-        playback to the strongest active channel, riding out transmissions."""
+        playback to the strongest active channel, riding out transmissions.
+        Polls every ``SCAN_POLL_S`` while scanning (hop latency matters) and
+        only every ``STATUS_POLL_S`` otherwise (the indicator does not)."""
         last_open = time.monotonic()
         while not self._stop.is_set():
             if not self.status_hostport:
@@ -393,7 +444,7 @@ class MonitorApp:
                 if target is not None:
                     self.set_channel(target)
                     last_open = now
-            self._stop.wait(SCAN_POLL_S)
+            self._stop.wait(SCAN_POLL_S if scanning else STATUS_POLL_S)
 
     # ---- snapshot for the UI --------------------------------------------
 
@@ -421,180 +472,6 @@ class MonitorApp:
                 "status_ok": status_fresh,
                 "open_channels": open_chs,
             }
-
-
-# ---- meter rendering -----------------------------------------------------
-
-def _meter_bar(dbfs: float, width: int = 30, floor: float = -60.0) -> str:
-    if dbfs == float("-inf") or dbfs < floor:
-        filled = 0
-    else:
-        filled = int(round((dbfs - floor) / (0.0 - floor) * width))
-        filled = max(0, min(width, filled))
-    label = "  -inf" if dbfs == float("-inf") else f"{dbfs:6.1f}"
-    return f"[{'#' * filled}{'-' * (width - filled)}] {label} dBFS"
-
-
-# ---- curses UI -----------------------------------------------------------
-
-def run_tui(app: MonitorApp) -> None:
-    curses.wrapper(_tui_loop, app)
-
-
-def _tui_loop(stdscr, app: MonitorApp) -> None:
-    curses.curs_set(0)
-    stdscr.nodelay(True)
-    stdscr.timeout(100)
-    if curses.has_colors():
-        curses.start_color()
-        curses.use_default_colors()
-        curses.init_pair(CLR_OK, curses.COLOR_GREEN, -1)
-        curses.init_pair(CLR_WARN, curses.COLOR_YELLOW, -1)
-        curses.init_pair(CLR_BAD, curses.COLOR_RED, -1)
-    app.start()
-    pending = ""  # digits typed for a channel jump
-    try:
-        while True:
-            _draw(stdscr, app, pending)
-            try:
-                ch = stdscr.getch()
-            except KeyboardInterrupt:
-                break
-            if ch == -1:
-                continue
-            if ch in (ord("q"), 27):  # q / ESC
-                break
-            elif ch in (curses.KEY_UP, ord("k")):
-                app.step_channel(-1)
-            elif ch in (curses.KEY_DOWN, ord("j")):
-                app.step_channel(1)
-            elif ch in (ord("t"), ord("T")):
-                app.toggle_tap()
-            elif ch in (ord("r"), ord("R")):
-                app.toggle_record()
-            elif ch in (ord("b"), ord("B")):
-                app.toggle_record_both()
-            elif ch in (ord("s"), ord("S")):
-                app.toggle_scan()
-            elif ch in (ord("+"), ord("=")):
-                app.change_volume(VOL_STEP)
-            elif ch in (ord("-"), ord("_")):
-                app.change_volume(-VOL_STEP)
-            elif ch in (ord("m"), ord("M")):
-                app.toggle_mute()
-            elif ord("0") <= ch <= ord("9"):
-                pending += chr(ch)
-            elif ch in (curses.KEY_ENTER, 10, 13):
-                if pending:
-                    app.set_channel(int(pending))
-                pending = ""
-            elif ch in (curses.KEY_BACKSPACE, 127, 8):
-                pending = pending[:-1]
-            else:
-                pending = ""
-    finally:
-        app.stop()
-
-
-def _addline(stdscr, y: int, text: str, width: int, attr: int = 0) -> None:
-    """Write one padded row, clipped to ``width - 1``. Curses returns ERR when
-    the write reaches the bottom-right cell (the cursor can't advance past it),
-    so we cap at width-1 and ignore the harmless error."""
-    try:
-        stdscr.addnstr(y, 0, text.ljust(width)[: width - 1], width - 1, attr)
-    except curses.error:
-        pass
-
-
-def _clr(pair: int) -> int:
-    return (curses.color_pair(pair) | curses.A_BOLD) if curses.has_colors() else curses.A_BOLD
-
-
-def _add_segments(stdscr, y: int, segments: list[tuple[str, int]], width: int) -> None:
-    """Write ``(text, attr)`` segments left-to-right on one row, clipped to
-    ``width - 1`` and swallowing the bottom-right-corner error."""
-    x = 0
-    for text, attr in segments:
-        if x >= width - 1:
-            break
-        chunk = text[: width - 1 - x]
-        try:
-            stdscr.addnstr(y, x, chunk, len(chunk), attr)
-        except curses.error:
-            pass
-        x += len(chunk)
-
-
-def _indicator(label: str, ok: bool, warn: bool = False, ok_text: str = "UP", bad_text: str = "DOWN"):
-    """Return the (text, attr) segments for one health indicator."""
-    if warn:
-        return [(f"  {label}: ", curses.A_NORMAL), ("IDLE", _clr(CLR_WARN))]
-    state = ok_text if ok else bad_text
-    return [(f"  {label}: ", curses.A_NORMAL), (state, _clr(CLR_OK if ok else CLR_BAD))]
-
-
-def _draw(stdscr, app: MonitorApp, pending: str) -> None:
-    snap = app.snapshot()
-    stdscr.erase()
-    h, w = stdscr.getmaxyx()
-
-    rec = "+".join(snap["record_taps"]) if snap["record_taps"] else "off"
-    vol = "MUTE" if snap["mute"] else f"{snap['volume']:.1f}x"
-    header = (
-        f" pluto airband monitor  pi={app.pi}  tap={snap['tap']}  "
-        f"vol={vol}  rec={rec}  scan={'ON' if snap['scan'] else 'off'} "
-    )
-    _addline(stdscr, 0, header, w, curses.A_REVERSE)
-
-    # Connection health for the two continuous sources.
-    audio = _indicator(
-        "Pi audio", snap["audio_connected"], warn=snap["audio_connected"] and not snap["audio_fresh"],
-        ok_text="STREAMING",
-    )
-    if snap["status_configured"]:
-        squelch = _indicator("Pluto squelch", snap["status_ok"], ok_text="CONNECTED")
-    else:
-        squelch = [("  Pluto squelch: ", curses.A_NORMAL), ("disabled", _clr(CLR_WARN))]
-    _add_segments(stdscr, 1, [(" ", curses.A_NORMAL), *audio, *squelch], w)
-
-    _addline(stdscr, 2, f" {_meter_bar(app.meter_dbfs)}", w)
-    _addline(stdscr, 3, f" status: {snap['status']}", w)
-    row = 4
-    if snap["scan_status"]:
-        _addline(stdscr, row, f" {snap['scan_status']}", w)
-        row += 1
-    for tap in snap["record_taps"]:
-        path = snap["record_paths"].get(tap)
-        _addline(stdscr, row, f" rec {tap}: {path or '(connecting...)'}", w)
-        row += 1
-    if snap["rec_error"] and not snap["record_taps"]:
-        _addline(stdscr, row, f" record error: {snap['rec_error']}", w)
-        row += 1
-
-    top = row + 1
-    _addline(stdscr, top, "  # o freq (MHz)  label   (o = squelch open)", w, curses.A_BOLD)
-    cur = snap["channel"]
-    open_chs = snap["open_channels"]
-    for i, c in enumerate(app.channels):
-        r = top + 1 + i
-        if r >= h - 1:
-            break
-        marker = ">" if i == cur else " "
-        is_open = i in open_chs
-        line = f"{marker}{i:>2} {'*' if is_open else ' '} {c.freq_mhz:10.3f}  {c.label}"
-        if i == cur:
-            attr = curses.A_REVERSE
-        elif is_open:
-            attr = _clr(CLR_OK)  # squelch open -> green (live squelch data)
-        else:
-            attr = curses.A_NORMAL
-        _addline(stdscr, r, line, w, attr)
-
-    footer = " j/k: channel  #+Enter: jump  t: pre/post  s: scan  r: rec tap  b: rec both  +/-: vol  m: mute  q: quit "
-    if pending:
-        footer = f" jump-> {pending}   " + footer
-    _addline(stdscr, h - 1, footer, w, curses.A_REVERSE)
-    stdscr.refresh()
 
 
 # ---- headless mode -------------------------------------------------------

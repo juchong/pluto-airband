@@ -1,23 +1,20 @@
-"""Assert-based self-checks (no framework). Run: `uv run python tests/test_core.py`.
+"""Pure-logic tests. Run with ``uv run pytest``.
 
-Covers the pure logic that would silently corrupt audio or channel mapping if
-it broke: WAV-header parsing, s16le dBFS math, /api/airband + airband.json plan
-parsing (incl. the SD-card fallback and feeds.json enrichment), and the monitor
-URL builder.
+Covers the pure helpers that would silently corrupt audio or channel mapping if
+they broke: WAV-header parsing, s16le dBFS math, /api/airband + airband.json
+plan parsing (incl. the SD-card fallback and feeds.json enrichment), the
+monitor URL builder, port defaulting and the scanner decision.
 """
 
 import json
-import math
-import os
 import struct
-import sys
-import tempfile
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+import pytest
 
-from airband_monitor.cli import with_default_port  # noqa: E402
-from airband_monitor.plan import Channel, enrich_from_feeds, parse_plan  # noqa: E402
-from airband_monitor.stream import (  # noqa: E402
+from airband_monitor.app import choose_scan_target
+from airband_monitor.cli import with_default_port
+from airband_monitor.plan import Channel, enrich_from_feeds, parse_plan
+from airband_monitor.stream import (
     WAV_HEADER_LEN,
     monitor_url,
     parse_header_rate,
@@ -37,11 +34,8 @@ def test_header_rate():
     h = _wav_header(20000)
     assert len(h) == WAV_HEADER_LEN, len(h)
     assert parse_header_rate(h) == 20000
-    try:
+    with pytest.raises(ValueError):
         parse_header_rate(b"not a wav header........................xxxx")
-        assert False, "expected ValueError"
-    except ValueError:
-        pass
 
 
 def test_peak_dbfs():
@@ -79,20 +73,19 @@ def test_parse_plan_sdcard_fallback():
     assert abs(chans[1].freq_mhz - 121.5) < 1e-9
 
 
-def test_enrich_from_feeds():
+def test_enrich_from_feeds(tmp_path):
     chans = [Channel(0, 119200000.0, ""), Channel(1, 121500000.0, "keep")]
-    with tempfile.TemporaryDirectory() as d:
-        p = os.path.join(d, "feeds.json")
-        with open(p, "w") as f:
-            json.dump(
-                {"feeds": [
-                    {"channel": 0, "name": "Dep East"},
-                    {"channel": 0, "name": "second wins? no"},
-                    {"channel": 1, "name": "should not override"},
-                ]},
-                f,
-            )
-        out = enrich_from_feeds(chans, p)
+    p = tmp_path / "feeds.json"
+    p.write_text(
+        json.dumps(
+            {"feeds": [
+                {"channel": 0, "name": "Dep East"},
+                {"channel": 0, "name": "second wins? no"},
+                {"channel": 1, "name": "should not override"},
+            ]}
+        )
+    )
+    out = enrich_from_feeds(chans, str(p))
     assert out[0].label == "Dep East"  # filled from first feed for ch0
     assert out[1].label == "keep"  # existing Pluto label preserved
 
@@ -101,17 +94,15 @@ def test_with_default_port():
     assert with_default_port("rfpi.chongflix.tv", 8082) == "rfpi.chongflix.tv:8082"
     assert with_default_port("rfpi.chongflix.tv:9000", 8082) == "rfpi.chongflix.tv:9000"
     assert with_default_port("10.0.0.5", 8082) == "10.0.0.5:8082"
-    for bad in ("host:abc", "host:0", "host:99999"):
-        try:
-            with_default_port(bad, 8082)
-            assert False, f"expected ValueError for {bad}"
-        except ValueError:
-            pass
+
+
+@pytest.mark.parametrize("bad", ["host:abc", "host:0", "host:99999"])
+def test_with_default_port_rejects_bad_port(bad):
+    with pytest.raises(ValueError):
+        with_default_port(bad, 8082)
 
 
 def test_choose_scan_target():
-    from airband_monitor.app import choose_scan_target
-
     chans = [
         {"ch": 0, "open": False, "carrier_dbc": 0.0},
         {"ch": 1, "open": True, "carrier_dbc": 5.0},
@@ -134,20 +125,5 @@ def test_choose_scan_target():
 def test_monitor_url():
     assert monitor_url("pi.local:8081", 3, "pre") == "http://pi.local:8081/listen/3.wav?tap=pre"
     assert monitor_url("10.0.0.5:9000", 0, "post") == "http://10.0.0.5:9000/listen/0.wav?tap=post"
-    try:
+    with pytest.raises(ValueError):
         monitor_url("pi:1", 0, "bogus")
-        assert False, "expected ValueError"
-    except ValueError:
-        pass
-
-
-def main():
-    tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
-    for t in tests:
-        t()
-        print(f"ok  {t.__name__}")
-    print(f"\n{len(tests)} checks passed")
-
-
-if __name__ == "__main__":
-    main()

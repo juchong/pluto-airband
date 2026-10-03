@@ -1,2 +1,4 @@
 # Default recording output directory (WAV captures)
 out/
+# pytest cache (uv run pytest)
+.pytest_cache/

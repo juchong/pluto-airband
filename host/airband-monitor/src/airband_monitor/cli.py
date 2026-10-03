@@ -7,6 +7,9 @@ import sys
 
 from .plan import enrich_from_feeds, fetch_plan
 
+DEFAULT_MONITOR_PORT = 8082  # matches deploy/airband-feeds.service (--monitor-port)
+DEFAULT_METRICS_PORT = 9108  # matches deploy/airband-feeds.service (--metrics-port)
+
 
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
@@ -74,10 +77,6 @@ def _build_parser() -> argparse.ArgumentParser:
     return p
 
 
-DEFAULT_MONITOR_PORT = 8082  # matches deploy/airband-feeds.service (--monitor-port)
-DEFAULT_METRICS_PORT = 9108  # matches deploy/airband-feeds.service (--metrics-port)
-
-
 def with_default_port(s: str, default: int) -> str:
     """Return ``host:port``, applying ``default`` when no port was given.
 
@@ -102,6 +101,18 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
+
+    # Playback needs PortAudio (sounddevice). Check before touching the network
+    # so a missing library is reported plainly instead of as a reconnect loop.
+    from .app import AUDIO_BACKEND_ERROR, MonitorApp, run_headless
+
+    if AUDIO_BACKEND_ERROR is not None:
+        print(
+            f"error: audio playback unavailable: {AUDIO_BACKEND_ERROR}\n"
+            "       install PortAudio (Debian/Raspberry Pi OS: sudo apt install libportaudio2)",
+            file=sys.stderr,
+        )
+        return 1
 
     try:
         channels = fetch_plan(args.pluto)
@@ -141,8 +152,6 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
 
-    from .app import MonitorApp, run_headless, run_tui
-
     pi_host = args.pi.rsplit(":", 1)[0]
     status_hostport = f"{pi_host}:{args.metrics_port}" if args.metrics_port else None
 
@@ -162,6 +171,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.no_tui:
         run_headless(app)
     else:
+        from .tui import run_tui  # lazy: curses is only needed for the TUI
+
         run_tui(app)
     return 0
 

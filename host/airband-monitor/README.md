@@ -57,8 +57,11 @@ uv run airband-monitor rfpi.chongflix.tv --no-tui --channel 3
 The header's second line shows live health for the two continuous data sources:
 
 - **Pi audio** — the monitor audio stream: `STREAMING` (green, data flowing),
-  `IDLE` (yellow, connected but no data — normal for a squelched `post` tap), or
-  `DOWN` (red, not connected).
+  `IDLE` (yellow, connected but no bytes for 1.5 s — the stream has **stalled**;
+  both taps normally stream continuously, the `post` tap ships silence while
+  squelched, so IDLE never means "just quiet"), or `DOWN` (red, not connected).
+  After 2.5 s without data the monitor drops the stalled connection and
+  reconnects (`status: reconnecting: stream stalled ...`).
 - **Pluto squelch** — the reader's `/status` squelch feed: `CONNECTED` (green),
   `DOWN` (red, `/status` unreachable), or `disabled` (no `--metrics-port`).
 
@@ -115,8 +118,15 @@ for the new channel.
 ## Tests
 
 ```bash
-uv run python tests/test_core.py
+uv sync          # also installs the `dev` dependency group (pytest)
+uv run pytest
 ```
+
+The suite needs no reader, network or sound card: the worker/recorder tests
+drive `MonitorApp` against a fake monitor endpoint (channel rollover, stall
+reconnect, intentional switches not reported as errors, `rec_error` clearing),
+and the stream tests use a loopback socket server (read timeout, cross-thread
+`shutdown()` waking a blocked read).
 
 ## Notes / limitations
 
@@ -126,3 +136,11 @@ uv run python tests/test_core.py
   the reader's `/status` (`--metrics-port`) and is used by scan mode.
 - The channel plan is fetched once at startup; restart the tool to pick up a
   changed plan (the receiver itself only applies plan changes on restart).
+- Stall detection: every monitor stream is opened with a 2.5 s connect/read
+  timeout. Because the reader streams both taps continuously, a read that
+  yields nothing for that long means the reader or the network is gone, so the
+  monitor reconnects (a running recording rolls over to a new file). Channel
+  and tap switches shut the live socket down rather than waiting for the
+  current read, so the keys respond immediately even when the reader has died.
+- `--no-tui` does not need `curses` (the TUI module is imported only when it
+  runs), so headless playback works on Windows without `windows-curses`.
