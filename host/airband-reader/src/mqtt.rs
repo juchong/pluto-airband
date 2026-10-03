@@ -9,12 +9,33 @@
 //!
 //! Each HA sensor maps to the one state topic via a `value_template`, so a
 //! single publish updates every entity.
+//!
+//! # Never block on the request queue
+//!
+//! rumqttc's sync [`Client::publish`] is a *blocking* send into a bounded request
+//! queue that only the event loop drains — and the event loop drains nothing
+//! while the broker is unreachable. An earlier design published the state
+//! snapshot unconditionally (filling the queue during an outage) and ran the
+//! re-announce from the event-loop thread itself on `ConnAck`; the announce then
+//! blocked on the full queue, the event loop was never polled again, the broker
+//! expired the keepalive and published the Last Will, and every HA entity stayed
+//! `unavailable` until the reader was restarted. Hence the rules here:
+//!
+//! - the event-loop thread only sets flags; it never publishes or subscribes;
+//! - the publisher skips its tick while disconnected, so the queue stays empty
+//!   across an outage;
+//! - every send is `try_*` (non-blocking): a full queue drops that state
+//!   snapshot (it is a retained snapshot, the next one supersedes it) or re-arms
+//!   the announce for the next tick;
+//! - the queue capacity is sized from the entity count so a full re-announce
+//!   always fits.
 
 use crate::metrics::Metrics;
 use rumqttc::{Client, Event, LastWill, MqttOptions, Packet, QoS};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Clone)]
 pub struct MqttConfig {
@@ -36,6 +57,12 @@ impl MqttConfig {
     }
     fn availability_topic(&self) -> String {
         format!("{}/availability", self.prefix)
+    }
+    /// Home Assistant's birth/last-will topic: HA publishes `online` here when it
+    /// (re)starts, which is our cue to re-send discovery + availability in case
+    /// the broker lost its retained state.
+    fn ha_status_topic(&self) -> String {
+        format!("{}/status", self.discovery_prefix)
     }
     /// Slugged node id usable in `unique_id`s (HA dislikes dashes there).
     fn node(&self) -> String {
@@ -137,10 +164,14 @@ fn device_block(cfg: &MqttConfig) -> String {
     )
 }
 
-/// Publishes availability=online and all discovery configs (retained). Called on
-/// every (re)connect so a broker restart re-seeds discovery.
-fn announce(client: &Client, cfg: &MqttConfig, ents: &[Entity]) {
-    let _ = client.publish(cfg.availability_topic(), QoS::AtLeastOnce, true, "online");
+/// Queues availability=online and every discovery config (all retained) with
+/// non-blocking sends. Returns `false` if the request queue was full for any of
+/// them, so the caller re-arms and retries on its next tick rather than leaving
+/// HA with a partial entity set.
+fn announce(client: &Client, cfg: &MqttConfig, ents: &[Entity]) -> bool {
+    let mut ok = client
+        .try_publish(cfg.availability_topic(), QoS::AtLeastOnce, true, "online")
+        .is_ok();
     let state = cfg.state_topic();
     let avail = cfg.availability_topic();
     let dev = device_block(cfg);
@@ -161,43 +192,99 @@ fn announce(client: &Client, cfg: &MqttConfig, ents: &[Entity]) {
             key = e.key,
             vt = e.value_template,
         );
-        let _ = client.publish(topic, QoS::AtLeastOnce, true, payload);
+        ok &= client
+            .try_publish(topic, QoS::AtLeastOnce, true, payload)
+            .is_ok();
     }
+    ok
 }
 
 /// Spawns the MQTT publisher. Returns immediately.
 ///
-/// Two threads share the live client through a swappable slot: a **connection**
-/// thread owns the client/eventloop lifecycle and a **publisher** thread pushes the
-/// retained state snapshot on the interval. The connection thread wraps the whole
-/// client in an **outer reconnect loop** so that when rumqttc's event-loop iterator
-/// *ends* (not just errors) after a broker drop — a Mosquitto/HA restart closing the
-/// socket, which otherwise leaves the connection stuck half-closed and never
-/// reconnecting — a fresh client is built and `announce()` re-publishes
-/// availability=online + discovery, clearing the latched Last-Will `offline` in HA.
+/// Two threads: a **connection** thread drives rumqttc's event loop (which
+/// reconnects on its own after any error) and only records state — `connected`
+/// on ConnAck / cleared on error, and `reannounce` on ConnAck or on Home
+/// Assistant's birth message. A **publisher** thread wakes every interval and,
+/// only while connected, performs any pending announce (subscribe to HA's status
+/// topic, availability=online, discovery configs) and then pushes the retained
+/// state snapshot — all with non-blocking sends. See the module docs for why
+/// the event-loop thread must never publish itself.
 pub fn spawn(metrics: Arc<Metrics>, cfg: MqttConfig) {
-    // The current live client, or `None` while (re)connecting. The publisher reads
-    // it; the connection thread swaps it on every (re)build.
+    let ents = Arc::new(entities(&cfg));
+    // Request-queue capacity: a full re-announce (availability + every discovery
+    // config + the HA status subscribe) and a state snapshot must fit at once,
+    // with headroom, or the non-blocking sends would drop part of the announce.
+    // With `--mqtt-per-channel` the entity count scales with the channel count,
+    // which is why this is derived rather than a fixed small number.
+    let cap = (ents.len() + 2) * 2 + 16;
+
+    // The current live client, or `None` while (re)building. The publisher reads
+    // it; the connection thread swaps it whenever it builds a client.
     let slot: Arc<Mutex<Option<Client>>> = Arc::new(Mutex::new(None));
+    let connected = Arc::new(AtomicBool::new(false));
+    let reannounce = Arc::new(AtomicBool::new(false));
 
-    // Publisher: publish the snapshot whenever a client is live. A publish while
-    // disconnected is simply skipped; the next reconnect re-announces state.
-    let pub_slot = Arc::clone(&slot);
-    let pub_cfg = cfg.clone();
-    thread::spawn(move || {
-        let state = pub_cfg.state_topic();
-        loop {
-            thread::sleep(pub_cfg.interval);
-            let client = pub_slot.lock().unwrap().clone();
-            if let Some(c) = client {
-                let _ = c.publish(state.clone(), QoS::AtLeastOnce, true, metrics.status_json());
+    // Publisher.
+    {
+        let slot = Arc::clone(&slot);
+        let connected = Arc::clone(&connected);
+        let reannounce = Arc::clone(&reannounce);
+        let ents = Arc::clone(&ents);
+        let cfg = cfg.clone();
+        thread::spawn(move || {
+            let state = cfg.state_topic();
+            let ha_status = cfg.ha_status_topic();
+            let ticks = cfg.interval.as_secs().max(1);
+            let mut queue_full_logged = false;
+            loop {
+                // Sleep the interval in 1 s slices so a (re)connect is announced
+                // within a second instead of up to a full interval later.
+                for _ in 0..ticks {
+                    thread::sleep(Duration::from_secs(1));
+                    if reannounce.load(Ordering::Relaxed) {
+                        break;
+                    }
+                }
+                if !connected.load(Ordering::Relaxed) {
+                    continue;
+                }
+                let Some(client) = slot.lock().unwrap().clone() else {
+                    continue;
+                };
+
+                if reannounce.swap(false, Ordering::Relaxed) {
+                    let sub_ok = client
+                        .try_subscribe(ha_status.clone(), QoS::AtLeastOnce)
+                        .is_ok();
+                    let ann_ok = announce(&client, &cfg, &ents);
+                    if !(sub_ok && ann_ok) {
+                        eprintln!("mqtt: request queue full while announcing; retrying next tick");
+                        reannounce.store(true, Ordering::Relaxed);
+                        continue;
+                    }
+                    eprintln!(
+                        "mqtt: announced availability=online + {} discovery configs",
+                        ents.len()
+                    );
+                    queue_full_logged = false;
+                }
+
+                match client.try_publish(state.clone(), QoS::AtLeastOnce, true, metrics.status_json()) {
+                    Ok(()) => queue_full_logged = false,
+                    Err(_) => {
+                        if !queue_full_logged {
+                            eprintln!("mqtt: request queue full; dropping state snapshot");
+                            queue_full_logged = true;
+                        }
+                    }
+                }
             }
-        }
-    });
+        });
+    }
 
-    // Connection: build the client, drive the eventloop, and rebuild if it ends.
+    // Connection: build the client, drive the event loop, record state.
     thread::spawn(move || {
-        let ents = entities(&cfg);
+        let ha_status = cfg.ha_status_topic();
         loop {
             let mut opts = MqttOptions::new(cfg.prefix.clone(), cfg.broker.clone(), cfg.port);
             opts.set_keep_alive(Duration::from_secs(15));
@@ -211,26 +298,48 @@ pub fn spawn(metrics: Arc<Metrics>, cfg: MqttConfig) {
                 true,
             ));
 
-            let (client, mut connection) = Client::new(opts, 32);
-            *slot.lock().unwrap() = Some(client.clone());
+            let (client, mut connection) = Client::new(opts, cap);
+            *slot.lock().unwrap() = Some(client);
+            // Log the first error of an outage, then at most once a minute: the
+            // event loop retries every few seconds and a long outage would
+            // otherwise produce hundreds of identical lines.
+            let mut last_err_log: Option<Instant> = None;
 
             for ev in connection.iter() {
                 match ev {
                     Ok(Event::Incoming(Packet::ConnAck(_))) => {
                         eprintln!("mqtt: connected to {}:{}", cfg.broker, cfg.port);
-                        announce(&client, &cfg, &ents);
+                        last_err_log = None;
+                        reannounce.store(true, Ordering::Relaxed);
+                        connected.store(true, Ordering::Relaxed);
+                    }
+                    Ok(Event::Incoming(Packet::Publish(p))) => {
+                        if p.topic == ha_status && &p.payload[..] == b"online" {
+                            eprintln!("mqtt: Home Assistant came online; re-announcing");
+                            reannounce.store(true, Ordering::Relaxed);
+                        }
                     }
                     Ok(_) => {}
                     Err(e) => {
-                        eprintln!("mqtt: connection error ({e}); reconnecting");
+                        // Any error means rumqttc dropped the network and will
+                        // reconnect on the next poll; nothing is queued meanwhile.
+                        let was_connected = connected.swap(false, Ordering::Relaxed);
+                        let due = last_err_log
+                            .is_none_or(|t| t.elapsed() >= Duration::from_secs(60));
+                        if was_connected || due {
+                            eprintln!("mqtt: connection error ({e}); reconnecting");
+                            last_err_log = Some(Instant::now());
+                        }
                         thread::sleep(Duration::from_secs(2));
                     }
                 }
             }
 
-            // The iterator ended: the eventloop is dead and will not reconnect on
-            // its own. Drop the stale client and rebuild from scratch.
+            // The iterator only ends when every `Client` handle is gone, which
+            // cannot happen while the slot holds one; kept as a belt-and-braces
+            // rebuild so a future refactor can't silently strand the publisher.
             eprintln!("mqtt: event loop ended; rebuilding client");
+            connected.store(false, Ordering::Relaxed);
             *slot.lock().unwrap() = None;
             thread::sleep(Duration::from_secs(2));
         }
