@@ -49,6 +49,9 @@ pub struct MqttConfig {
     pub interval: Duration,
     pub per_channel: bool,
     pub n_channels: usize,
+    /// The host exposes a thermal zone (a Raspberry Pi): announce the CPU
+    /// temperature / fan / thermal-problem entities.
+    pub host_thermal: bool,
 }
 
 impl MqttConfig {
@@ -70,13 +73,17 @@ impl MqttConfig {
     }
 }
 
-/// A discovery entity bound to the shared state topic.
+/// A discovery entity bound to the shared state topic (or, for `state_topic =
+/// Some(..)`, to its own retained topic — used for the alert hook's
+/// `last_alert`, which is published by the shell scripts while the reader may
+/// be dead, so it also gets no availability binding).
 struct Entity {
     component: &'static str, // "binary_sensor" | "sensor"
     key: String,             // discovery object id + value_json field path
     name: String,
     value_template: String,
     extra: String, // trailing JSON fields (unit, device_class, payload_on/off…)
+    state_topic: Option<String>,
 }
 
 fn entities(cfg: &MqttConfig) -> Vec<Entity> {
@@ -90,6 +97,7 @@ fn entities(cfg: &MqttConfig) -> Vec<Entity> {
         name: "Outage".to_string(),
         value_template: "{{ value_json.outage }}".to_string(),
         extra: "\"payload_on\":\"True\",\"payload_off\":\"False\",\"device_class\":\"problem\"".to_string(),
+        state_topic: None,
     });
 
     let mut binary = |key: &str, name: &str| {
@@ -99,6 +107,7 @@ fn entities(cfg: &MqttConfig) -> Vec<Entity> {
             name: name.to_string(),
             value_template: format!("{{{{ value_json.{key} }}}}"),
             extra: "\"payload_on\":\"True\",\"payload_off\":\"False\"".to_string(),
+            state_topic: None,
         });
     };
     binary("system_healthy", "Capture healthy");
@@ -116,6 +125,7 @@ fn entities(cfg: &MqttConfig) -> Vec<Entity> {
             name: name.to_string(),
             value_template: format!("{{{{ value_json.{key} }}}}"),
             extra: extra.to_string(),
+            state_topic: None,
         });
     };
     sensor(
@@ -136,6 +146,56 @@ fn entities(cfg: &MqttConfig) -> Vec<Entity> {
         "\"state_class\":\"total_increasing\"",
     );
 
+    // Host cooling (Pi only). `thermal_problem` is the one to alert on: no fan
+    // detected, SoC at the throttling temperature, or a stalled fan while hot.
+    if cfg.host_thermal {
+        v.push(Entity {
+            component: "binary_sensor",
+            key: "thermal_problem".to_string(),
+            name: "Host thermal problem".to_string(),
+            value_template: "{{ value_json.thermal_problem }}".to_string(),
+            extra: "\"payload_on\":\"True\",\"payload_off\":\"False\",\"device_class\":\"problem\"".to_string(),
+            state_topic: None,
+        });
+        v.push(Entity {
+            component: "binary_sensor",
+            key: "fan_detected".to_string(),
+            name: "Fan detected".to_string(),
+            value_template: "{{ value_json.fan_detected }}".to_string(),
+            extra: "\"payload_on\":\"True\",\"payload_off\":\"False\",\"icon\":\"mdi:fan\"".to_string(),
+            state_topic: None,
+        });
+        v.push(Entity {
+            component: "sensor",
+            key: "cpu_temp_c".to_string(),
+            name: "CPU temperature".to_string(),
+            value_template: "{{ value_json.cpu_temp_c }}".to_string(),
+            extra: "\"unit_of_measurement\":\"°C\",\"device_class\":\"temperature\",\"state_class\":\"measurement\"".to_string(),
+            state_topic: None,
+        });
+        v.push(Entity {
+            component: "sensor",
+            key: "fan_rpm".to_string(),
+            name: "Fan speed".to_string(),
+            value_template: "{{ value_json.fan_rpm }}".to_string(),
+            extra: "\"unit_of_measurement\":\"rpm\",\"state_class\":\"measurement\",\"icon\":\"mdi:fan\"".to_string(),
+            state_topic: None,
+        });
+    }
+
+    // Latest alert from the deploy hooks (airband-alert.sh / airband-watchdog.sh
+    // publish it retained to `<prefix>/last_alert` over the same broker). Its own
+    // topic and no availability binding: those scripts fire precisely when this
+    // process may be dead, and HA must still show (and trigger on) the text.
+    v.push(Entity {
+        component: "sensor",
+        key: "last_alert".to_string(),
+        name: "Last alert".to_string(),
+        value_template: "{{ value }}".to_string(),
+        extra: "\"icon\":\"mdi:alert-circle-outline\"".to_string(),
+        state_topic: Some(format!("{}/last_alert", cfg.prefix)),
+    });
+
     if cfg.per_channel {
         for i in 0..cfg.n_channels {
             v.push(Entity {
@@ -144,6 +204,7 @@ fn entities(cfg: &MqttConfig) -> Vec<Entity> {
                 name: format!("Ch {i} squelch open"),
                 value_template: format!("{{{{ value_json.channels[{i}].open }}}}"),
                 extra: "\"payload_on\":\"True\",\"payload_off\":\"False\"".to_string(),
+                state_topic: None,
             });
             v.push(Entity {
                 component: "sensor",
@@ -151,6 +212,7 @@ fn entities(cfg: &MqttConfig) -> Vec<Entity> {
                 name: format!("Ch {i} carrier"),
                 value_template: format!("{{{{ value_json.channels[{i}].carrier_dbc }}}}"),
                 extra: "\"unit_of_measurement\":\"dB\"".to_string(),
+                state_topic: None,
             });
         }
     }
@@ -186,8 +248,14 @@ fn announce(client: &Client, cfg: &MqttConfig, ents: &[Entity]) -> bool {
         } else {
             format!(",{}", e.extra)
         };
+        // Entities on their own topic (the alert hook's `last_alert`) carry no
+        // availability binding: they must stay readable while the reader is down.
+        let (st, availability) = match &e.state_topic {
+            Some(t) => (t.as_str(), String::new()),
+            None => (state.as_str(), format!(",\"availability_topic\":\"{avail}\"")),
+        };
         let payload = format!(
-            "{{\"name\":{name:?},\"unique_id\":\"{node}_{key}\",\"state_topic\":\"{state}\",\"availability_topic\":\"{avail}\",\"value_template\":{vt:?}{extra},{dev}}}",
+            "{{\"name\":{name:?},\"unique_id\":\"{node}_{key}\",\"state_topic\":\"{st}\"{availability},\"value_template\":{vt:?}{extra},{dev}}}",
             name = e.name,
             key = e.key,
             vt = e.value_template,

@@ -215,7 +215,14 @@ the consolidated **Outage** tile (`outage`, `device_class: problem`), the two
 headline tiles **Capture healthy** (`system_healthy`) and **LiveATC healthy**
 (`liveatc_healthy`), plus `pluto_reachable`, `maia_httpd_up`, `data_flowing`, and
 the Pluto FPGA flags `dma_advancing` / `fpga_overflow` — auto-appear in HA with no
-manual YAML. A Last Will flips `pluto-airband/availability` to `offline` the instant
+manual YAML. On a Raspberry Pi the reader also publishes the host's cooling state:
+**Host thermal problem** (`thermal_problem`, `device_class: problem` — on when no fan
+is detected, the SoC is at the firmware's throttling temperature (80 °C), or a
+present fan reads 0 rpm above 70 °C), **Fan detected** (`fan_detected`; the Pi 5
+firmware only creates the fan device when one is plugged into the header),
+**CPU temperature** (`cpu_temp_c`) and **Fan speed** (`fan_rpm`). A **Last alert**
+text sensor (`last_alert`) carries the most recent line from the alert hooks (see
+*Failure alerting*). A Last Will flips `pluto-airband/availability` to `offline` the instant
 the feeder dies, so the whole dashboard greys out on a crash or Pi outage. Add
 `--mqtt-per-channel` for the (noisier) per-channel open/carrier entities.
 
@@ -260,9 +267,43 @@ after **every** stop. systemd hands the script `$SERVICE_RESULT` / `$EXIT_CODE` 
 `$EXIT_STATUS`: on `success` (a clean `systemctl stop`/`restart`, including the
 watchdog's own recovery restart) it exits silently; on anything else — crash
 (`exit-code`), `signal`, `watchdog` timeout, `oom-kill`, start `timeout` — it logs
-to the feeder's journal and POSTs one line to `AIRBAND_ALERT_URL`
-(`/etc/airband-feeds.env`; a webhook or ntfy topic). **Set that URL**: left unset,
-everything is log-only and a crash loop or a dead Pluto goes unnoticed.
+to the feeder's journal and delivers one line two ways:
+
+1. **MQTT → Home Assistant (default when the broker is configured).** With
+   `AIRBAND_MQTT_BROKER` set in `/etc/airband-feeds.env` the script (and the
+   watchdog's recovery actions) publish the line retained to
+   `pluto-airband/last_alert`. The reader announces a discovery entity for it,
+   `sensor.pluto_airband_last_alert`, deliberately **without** an availability
+   binding, so HA shows the text even while the reader itself is dead. Nothing to
+   configure beyond the MQTT credentials you already have. Trigger a notification
+   on it (and on the host thermal flag) with:
+
+   ```yaml
+   automation:
+     - alias: Pluto Airband alert
+       trigger:
+         - trigger: state
+           entity_id: sensor.pluto_airband_last_alert
+           not_to: ["unknown", "unavailable"]
+         - trigger: state
+           entity_id: binary_sensor.pluto_airband_host_thermal_problem
+           to: "on"
+           for: "00:05:00"          # fan unplugged / stalled, or SoC at the throttle point
+       action:
+         - action: notify.notify
+           data:
+             title: "Pluto Airband"
+             message: >-
+               {{ trigger.to_state.state if trigger.entity_id.startswith('sensor.')
+                  else 'Host thermal problem: no fan detected, fan stalled, or CPU at the throttling temperature' }}
+   ```
+
+2. **Webhook / ntfy (optional).** If `AIRBAND_ALERT_URL` is also set, the same
+   line is POSTed there (`curl -m 10`). Useful for a phone push via
+   [ntfy](https://ntfy.sh) without going through HA.
+
+With neither configured everything is log-only and a crash loop or a dead Pluto
+goes unnoticed.
 
 Why not `OnFailure=`: the unit used to declare `OnFailure=airband-alert@%n.service`,
 but with `Restart=always` + `StartLimitIntervalSec=0` a service never enters the

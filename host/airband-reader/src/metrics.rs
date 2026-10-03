@@ -243,7 +243,23 @@ pub struct Metrics {
     /// `start.elapsed()` in ms when the raw unhealthy condition was first seen
     /// (0 = currently healthy). Drives the [`Metrics::outage`] debounce.
     outage_since_ms: AtomicU64,
+    /// Host thermal/fan state from the Pi's sysfs, refreshed by the host probe
+    /// thread (`spawn_host_probe` in main). `host_probe_ok` is false on a host
+    /// with no thermal zone (not a Pi), in which case the rest is meaningless.
+    /// `cpu_temp_mc` is millidegrees C; `fan_rpm` only means anything when
+    /// `fan_detected` (the Pi 5 firmware creates the fan device only when a fan
+    /// is plugged into the header).
+    host_probe_ok: AtomicBool,
+    cpu_temp_mc: AtomicU32,
+    fan_detected: AtomicBool,
+    fan_rpm: AtomicU32,
 }
+
+/// The Pi 5 firmware starts throttling the CPU around this SoC temperature; the
+/// host probe reports a thermal problem at or above it.
+const HOST_HOT_C: f32 = 80.0;
+/// A detected fan that reports no rotation above this temperature is stalled.
+const HOST_FAN_STALL_C: f32 = 70.0;
 
 impl Metrics {
     pub fn new(channels: usize, feeds: Vec<Arc<FeedMetric>>) -> Arc<Metrics> {
@@ -259,7 +275,51 @@ impl Metrics {
             last_sample_ms: AtomicU64::new(0),
             heartbeat_ms: AtomicU64::new(0),
             outage_since_ms: AtomicU64::new(0),
+            host_probe_ok: AtomicBool::new(false),
+            cpu_temp_mc: AtomicU32::new(0),
+            fan_detected: AtomicBool::new(false),
+            fan_rpm: AtomicU32::new(0),
         })
+    }
+
+    /// Host probe: publish the latest sysfs reading (`fan` = RPM if a fan device
+    /// exists, `None` if the host has no fan at all).
+    pub fn set_host_thermal(&self, temp_mc: u32, fan: Option<u32>) {
+        self.host_probe_ok.store(true, Ordering::Relaxed);
+        self.cpu_temp_mc.store(temp_mc, Ordering::Relaxed);
+        self.fan_detected.store(fan.is_some(), Ordering::Relaxed);
+        self.fan_rpm.store(fan.unwrap_or(0), Ordering::Relaxed);
+    }
+
+    /// True once the host probe has read the thermal zone (i.e. this is a Pi).
+    pub fn host_probe_ok(&self) -> bool {
+        self.host_probe_ok.load(Ordering::Relaxed)
+    }
+
+    pub fn cpu_temp_c(&self) -> f32 {
+        self.cpu_temp_mc.load(Ordering::Relaxed) as f32 / 1000.0
+    }
+
+    pub fn fan_detected(&self) -> bool {
+        self.fan_detected.load(Ordering::Relaxed)
+    }
+
+    pub fn fan_rpm(&self) -> u32 {
+        self.fan_rpm.load(Ordering::Relaxed)
+    }
+
+    /// Host cooling is not doing its job: no fan device at all, the SoC at or
+    /// above the throttling temperature, or a present fan reporting zero RPM
+    /// while hot. Always false when the host exposes no thermal zone. Kept out
+    /// of `outage` on purpose (audio may still be fine) — it is its own Home
+    /// Assistant `problem` entity.
+    pub fn thermal_problem(&self) -> bool {
+        if !self.host_probe_ok() {
+            return false;
+        }
+        let t = self.cpu_temp_c();
+        let fan = self.fan_detected();
+        !fan || t >= HOST_HOT_C || (fan && self.fan_rpm() == 0 && t >= HOST_FAN_STALL_C)
     }
 
     fn now_ms(&self) -> u64 {
@@ -454,6 +514,10 @@ impl Metrics {
 \"total_transmissions\":{total_tx},\
 \"max_worker_lag_samples\":{max_lag},\
 \"total_dfn_errors\":{total_dfn_errors},\
+\"cpu_temp_c\":{cpu_temp:.1},\
+\"fan_detected\":{fan},\
+\"fan_rpm\":{fan_rpm},\
+\"thermal_problem\":{thermal},\
 \"feeds\":{feeds},\
 \"channels\":{channels}}}",
             data = self.data_flowing(),
@@ -464,6 +528,10 @@ impl Metrics {
             outage = self.outage(),
             since = self.seconds_since_last_sample(),
             up = self.uptime_secs(),
+            cpu_temp = self.cpu_temp_c(),
+            fan = self.fan_detected(),
+            fan_rpm = self.fan_rpm(),
+            thermal = self.thermal_problem(),
         )
     }
 
@@ -503,6 +571,22 @@ impl Metrics {
         s.push_str("# HELP airband_fpga_overflow Pluto FPGA airband channelizer overflow flag.\n");
         s.push_str("# TYPE airband_fpga_overflow gauge\n");
         s.push_str(&format!("airband_fpga_overflow {}\n", b(self.fpga_overflow.load(Ordering::Relaxed))));
+
+        // Host thermal/fan (only on a host with a thermal zone).
+        if self.host_probe_ok() {
+            s.push_str("# HELP airband_host_cpu_temp_celsius SoC temperature of the host running the reader.\n");
+            s.push_str("# TYPE airband_host_cpu_temp_celsius gauge\n");
+            s.push_str(&format!("airband_host_cpu_temp_celsius {:.1}\n", self.cpu_temp_c()));
+            s.push_str("# HELP airband_host_fan_detected A fan device is present (Pi 5: fan plugged into the header).\n");
+            s.push_str("# TYPE airband_host_fan_detected gauge\n");
+            s.push_str(&format!("airband_host_fan_detected {}\n", b(self.fan_detected())));
+            s.push_str("# HELP airband_host_fan_rpm Fan tachometer reading (0 when no fan or stalled).\n");
+            s.push_str("# TYPE airband_host_fan_rpm gauge\n");
+            s.push_str(&format!("airband_host_fan_rpm {}\n", self.fan_rpm()));
+            s.push_str("# HELP airband_host_thermal_problem No fan, SoC at the throttling temperature, or a stalled fan while hot.\n");
+            s.push_str("# TYPE airband_host_thermal_problem gauge\n");
+            s.push_str(&format!("airband_host_thermal_problem {}\n", b(self.thermal_problem())));
+        }
 
         // Per-feed health.
         s.push_str("# HELP airband_feed_connected Feed source connection is established.\n");

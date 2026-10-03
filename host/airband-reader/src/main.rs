@@ -656,6 +656,84 @@ fn spawn_watchdog_keeper(metrics: Arc<Metrics>) {
     });
 }
 
+/// Reads the host's SoC temperature (millidegrees C) and, if a fan device
+/// exists, its tachometer RPM, from Raspberry Pi sysfs. `None` when the host has
+/// no thermal zone (not a Pi). The Pi 5 firmware creates the `pwmfan` hwmon
+/// device only when a fan is plugged into the fan header, so "no device" is a
+/// reliable "no fan".
+fn read_host_thermal() -> Option<(u32, Option<u32>)> {
+    let temp: i64 = fs::read_to_string("/sys/class/thermal/thermal_zone0/temp")
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    let mut fan = None;
+    if let Ok(dir) = fs::read_dir("/sys/class/hwmon") {
+        for entry in dir.flatten() {
+            let p = entry.path();
+            let is_fan = fs::read_to_string(p.join("name"))
+                .map(|n| n.trim() == "pwmfan")
+                .unwrap_or(false);
+            if is_fan {
+                let rpm = fs::read_to_string(p.join("fan1_input"))
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u32>().ok())
+                    .unwrap_or(0);
+                fan = Some(rpm);
+                break;
+            }
+        }
+    }
+    Some((temp.max(0) as u32, fan))
+}
+
+/// Host thermal/fan probe: a synchronous first reading (so the MQTT discovery
+/// can include the host entities) and then a 10 s refresh thread that logs
+/// transitions of the consolidated `thermal_problem` flag, plus an hourly
+/// reminder while it persists. Until now the first sign of a cooking Pi was
+/// audio drops; this box has sat at the firmware's soft thermal limit with no
+/// fan detected. `vcgencmd get_throttled` is deliberately not used: it needs
+/// /dev/vcio, which the unit's sandbox hides, and the Pi 5 exposes no sysfs
+/// equivalent, so the temperature threshold stands in for the throttle bits.
+/// No-op on a host without a thermal zone.
+fn spawn_host_probe(metrics: Arc<Metrics>) {
+    let Some((temp, fan)) = read_host_thermal() else {
+        return;
+    };
+    metrics.set_host_thermal(temp, fan);
+    thread::spawn(move || {
+        let mut prev: Option<bool> = None;
+        let mut last_log = Instant::now();
+        loop {
+            let (temp, fan) = match read_host_thermal() {
+                Some(r) => r,
+                None => {
+                    thread::sleep(Duration::from_secs(10));
+                    continue;
+                }
+            };
+            metrics.set_host_thermal(temp, fan);
+            let problem = metrics.thermal_problem();
+            let changed = prev != Some(problem);
+            if changed || (problem && last_log.elapsed() >= Duration::from_secs(3600)) {
+                let fan_s = match fan {
+                    Some(rpm) => format!("fan {rpm} rpm"),
+                    None => "NO FAN DETECTED".to_string(),
+                };
+                let temp_c = temp as f32 / 1000.0;
+                if problem {
+                    eprintln!("host: THERMAL PROBLEM: cpu {temp_c:.1} C, {fan_s}");
+                } else {
+                    eprintln!("host: thermal ok: cpu {temp_c:.1} C, {fan_s}");
+                }
+                prev = Some(problem);
+                last_log = Instant::now();
+            }
+            thread::sleep(Duration::from_secs(10));
+        }
+    });
+}
+
 /// The fields of maia-httpd's `GET /api/health` this reader cares about; unknown
 /// fields are ignored and missing ones take the benign defaults.
 #[derive(serde::Deserialize)]
@@ -1503,6 +1581,10 @@ fn main() -> Result<()> {
     // gauge answers "is data flowing?".
     spawn_pluto_probe(Arc::clone(&metrics), &args.addr, args.pluto_web_port);
 
+    // Host thermal/fan probe (Pi sysfs; no-op elsewhere). Runs before the MQTT
+    // publisher so its first reading decides whether the host entities exist.
+    spawn_host_probe(Arc::clone(&metrics));
+
     // MQTT -> Home Assistant (optional). Reuses the metrics snapshot. An empty
     // broker (e.g. an unset `${AIRBAND_MQTT_BROKER}` expanded by systemd) means
     // "disabled", so the env-var ExecStart pattern is safe when MQTT is unused.
@@ -1520,6 +1602,7 @@ fn main() -> Result<()> {
                 interval: Duration::from_secs(args.mqtt_interval.max(1)),
                 per_channel: args.mqtt_per_channel,
                 n_channels: n,
+                host_thermal: metrics.host_probe_ok(),
             },
         );
     }

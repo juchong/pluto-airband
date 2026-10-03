@@ -108,9 +108,34 @@ pluto_run() {
     return "$rc"
 }
 
+# Home Assistant delivery (no webhook needed): when the shared env file configures
+# the MQTT broker the reader uses, publish the alert retained to <prefix>/last_alert.
+# The reader announces a `last_alert` discovery entity on that topic with no
+# availability binding, so HA shows (and can trigger on) the text even while the
+# reader is down. Credentials go through mosquitto_pub's config file, never argv.
+mqtt_alert() {
+    [ -n "${AIRBAND_MQTT_BROKER:-}" ] || return 0
+    if ! command -v mosquitto_pub >/dev/null 2>&1; then
+        log "mqtt alert skipped (mosquitto_pub not installed)"
+        return 0
+    fi
+    cfgdir=$(mktemp -d) || return 0
+    {
+        [ -n "${AIRBAND_MQTT_USER:-}" ] && printf -- '-u %s\n' "$AIRBAND_MQTT_USER"
+        [ -n "${AIRBAND_MQTT_PASS:-}" ] && printf -- '-P %s\n' "$AIRBAND_MQTT_PASS"
+        :
+    } > "$cfgdir/mosquitto_pub"
+    err=$(XDG_CONFIG_HOME="$cfgdir" mosquitto_pub -h "$AIRBAND_MQTT_BROKER" \
+            -p "${AIRBAND_MQTT_PORT:-1883}" -t "${AIRBAND_MQTT_PREFIX:-pluto-airband}/last_alert" \
+            -q 1 -r -m "$1" 2>&1) \
+        || log "mqtt alert publish failed: $err"
+    rm -rf "$cfgdir"
+}
+
 alert() {
     msg="[$(hostname)] airband-watchdog: $* @ $(date -u +%Y-%m-%dT%H:%M:%SZ)"
     log "$msg"
+    mqtt_alert "$msg"
     [ -n "${AIRBAND_ALERT_URL:-}" ] || return 0
     err=$(curl -fsS -m 10 -H "Title: pluto-airband watchdog" -d "$msg" "$AIRBAND_ALERT_URL" 2>&1 >/dev/null) \
         || log "alert POST to AIRBAND_ALERT_URL failed: $err"
