@@ -11,8 +11,8 @@
 use crate::metrics::FeedMetric;
 use mp3lame_encoder::{Bitrate, Builder, MonoPcm, Mode, Quality};
 use std::io::{Read, Write};
-use std::net::TcpStream;
-use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender};
+use std::net::{TcpStream, ToSocketAddrs};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TryRecvError};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
@@ -150,6 +150,17 @@ impl Resampler {
     }
 }
 
+/// The CBR bitrates LAME accepts for the mono MPEG-2/2.5 streams this encoder
+/// produces. Anything else used to be silently encoded at 16 kbps while
+/// `ice-audio-info` advertised the requested value; callers validate with
+/// [`supported_bitrate`] before building a feed.
+pub const SUPPORTED_BITRATES_KBPS: &[u32] = &[8, 16, 24, 32, 40, 48, 64, 96, 128];
+
+/// True if `kbps` is a bitrate [`bitrate_enum`] can encode exactly.
+pub fn supported_bitrate(kbps: u32) -> bool {
+    SUPPORTED_BITRATES_KBPS.contains(&kbps)
+}
+
 fn bitrate_enum(kbps: u32) -> Bitrate {
     match kbps {
         8 => Bitrate::Kbps8,
@@ -221,6 +232,34 @@ fn tls_wrap(cfg: &IcecastConfig, tcp: TcpStream) -> std::io::Result<Conn> {
     Ok(Conn::Tls(Box::new(tls)))
 }
 
+/// Bound on resolving + connecting to the Icecast server.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Per-socket read/write timeout for the whole life of a feed connection. Set on
+/// the TcpStream *before* any TLS wrap so TLS feeds are bounded too. Without it a
+/// peer that vanished without a RST (NAT state lost, server hung) blocked
+/// `write_all` for the kernel's ~15 min retransmit timeout while the feed still
+/// reported `connected` and the worker dropped samples uncounted.
+const IO_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Resolves and connects to the configured server with [`CONNECT_TIMEOUT`],
+/// trying each resolved address in turn, and applies [`IO_TIMEOUT`].
+fn tcp_connect(cfg: &IcecastConfig) -> std::io::Result<TcpStream> {
+    let mut last_err = None;
+    for sa in (cfg.host.as_str(), cfg.port).to_socket_addrs()? {
+        match TcpStream::connect_timeout(&sa, CONNECT_TIMEOUT) {
+            Ok(s) => {
+                s.set_read_timeout(Some(IO_TIMEOUT))?;
+                s.set_write_timeout(Some(IO_TIMEOUT))?;
+                return Ok(s);
+            }
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        std::io::Error::other(format!("{}:{} resolved to no addresses", cfg.host, cfg.port))
+    }))
+}
+
 /// Opens the transport per the configured TLS mode (no SOURCE request yet).
 fn open_conn(cfg: &IcecastConfig) -> std::io::Result<Conn> {
     match cfg.tls {
@@ -228,26 +267,26 @@ fn open_conn(cfg: &IcecastConfig) -> std::io::Result<Conn> {
             if cfg.tls_insecure {
                 eprintln!("icecast: tls_insecure ignored (tls is disabled)");
             }
-            Ok(Conn::Plain(TcpStream::connect((cfg.host.as_str(), cfg.port))?))
+            Ok(Conn::Plain(tcp_connect(cfg)?))
         }
         TlsMode::Transport | TlsMode::AutoNoPlain => {
-            let tcp = TcpStream::connect((cfg.host.as_str(), cfg.port))?;
+            let tcp = tcp_connect(cfg)?;
             tls_wrap(cfg, tcp)
         }
         TlsMode::Auto => {
-            let tcp = TcpStream::connect((cfg.host.as_str(), cfg.port))?;
+            let tcp = tcp_connect(cfg)?;
             match tls_wrap(cfg, tcp) {
                 Ok(c) => Ok(c),
                 Err(e) => {
                     eprintln!("icecast: TLS handshake failed ({e}); falling back to plain");
-                    Ok(Conn::Plain(TcpStream::connect((cfg.host.as_str(), cfg.port))?))
+                    Ok(Conn::Plain(tcp_connect(cfg)?))
                 }
             }
         }
         TlsMode::Upgrade => {
             // RFC 2817 in-band upgrade: ask the plain connection to switch to TLS,
             // expect "101 Switching Protocols", then handshake over the same socket.
-            let mut tcp = TcpStream::connect((cfg.host.as_str(), cfg.port))?;
+            let mut tcp = tcp_connect(cfg)?;
             let req = format!(
                 "GET / HTTP/1.1\r\nHost: {host}\r\nConnection: Upgrade\r\nUpgrade: TLS/1.0\r\n\r\n",
                 host = cfg.host,
@@ -255,7 +294,6 @@ fn open_conn(cfg: &IcecastConfig) -> std::io::Result<Conn> {
             tcp.write_all(req.as_bytes())?;
             tcp.flush()?;
             let mut buf = [0u8; 256];
-            tcp.set_read_timeout(Some(Duration::from_secs(5)))?;
             let n = tcp.read(&mut buf)?;
             let line = String::from_utf8_lossy(&buf[..n]);
             let first = line.lines().next().unwrap_or("");
@@ -265,7 +303,6 @@ fn open_conn(cfg: &IcecastConfig) -> std::io::Result<Conn> {
                     first.trim()
                 )));
             }
-            tcp.set_read_timeout(None)?;
             tls_wrap(cfg, tcp)
         }
     }
@@ -302,11 +339,9 @@ fn connect(cfg: &IcecastConfig) -> std::io::Result<Conn> {
 
     // Read and validate the handshake response. Icecast replies with an HTTP
     // status line on accept (200) or reject (401/403/...). Some servers send
-    // nothing until data flows, so a read timeout is treated as provisional-OK
-    // rather than a hard failure.
-    if let Conn::Plain(s) = &conn {
-        s.set_read_timeout(Some(Duration::from_secs(5)))?;
-    }
+    // nothing until data flows, so a read timeout (IO_TIMEOUT, set on the socket
+    // at connect for plain and TLS alike) is treated as provisional-OK rather
+    // than a hard failure.
     let mut buf = [0u8; 512];
     match conn.read(&mut buf) {
         Ok(0) => return Err(std::io::Error::other("server closed connection during SOURCE handshake")),
@@ -315,9 +350,6 @@ fn connect(cfg: &IcecastConfig) -> std::io::Result<Conn> {
             eprintln!("icecast: no handshake response yet (continuing)");
         }
         Err(e) => return Err(e),
-    }
-    if let Conn::Plain(s) = &conn {
-        s.set_read_timeout(None)?;
     }
     Ok(conn)
 }
@@ -393,7 +425,22 @@ pub fn spawn(cfg: IcecastConfig, metric: Arc<FeedMetric>) -> SyncSender<i16> {
             }
             metric.set_connected(false);
             // Drain stale samples queued during the outage so we resume near-live.
-            while rx.try_recv().is_ok() {}
+            // A disconnected channel means the worker thread is gone (the process
+            // aborts on panic, so this is belt-and-braces): stop instead of
+            // reconnecting to the mount every 2 s forever with nothing to send.
+            loop {
+                match rx.try_recv() {
+                    Ok(_) => {}
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        eprintln!(
+                            "icecast: feed {} channel worker is gone; feed thread exiting",
+                            cfg.mount
+                        );
+                        return;
+                    }
+                }
+            }
             thread::sleep(Duration::from_secs(2));
         }
     });
@@ -412,6 +459,16 @@ mod tests {
         assert_eq!(TlsMode::parse("auto_no_plain").unwrap(), TlsMode::AutoNoPlain);
         assert_eq!(TlsMode::parse("upgrade").unwrap(), TlsMode::Upgrade);
         assert!(TlsMode::parse("https").is_err());
+    }
+
+    #[test]
+    fn supported_bitrates_match_lame_table() {
+        for &k in SUPPORTED_BITRATES_KBPS {
+            assert!(supported_bitrate(k), "{k} kbps should be supported");
+        }
+        assert!(!supported_bitrate(0));
+        assert!(!supported_bitrate(20));
+        assert!(!supported_bitrate(320));
     }
 
     #[test]

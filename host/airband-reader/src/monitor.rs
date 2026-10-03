@@ -20,8 +20,20 @@
 use crate::{Msg, Tap};
 use std::io::{BufWriter, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Sender};
+use std::sync::Arc;
 use std::thread;
+use std::time::Duration;
+
+/// Time allowed for a client to send its request line.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+/// Per-write bound on the audio stream: a player that stops reading is dropped
+/// (and its sink pruned by the worker), not waited on forever.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Concurrent monitor clients; each costs a thread and a ~1 s sample queue in a
+/// worker, so an unbounded count could degrade the feeds this port debugs.
+const MAX_CLIENTS: usize = 8;
 
 /// Streaming WAV header (mono, 16-bit, `rate` Hz). The RIFF/data sizes are set
 /// to `0xFFFFFFFF` because the length is unbounded; `ffplay`/VLC/`sox` stream it
@@ -65,6 +77,11 @@ fn parse_request(req: &str) -> Option<(usize, Tap)> {
 /// streams WAV until the client disconnects, then returns (dropping the receiver
 /// so the worker prunes the dead sink on its next send).
 fn handle(mut stream: TcpStream, senders: &[Sender<Msg>], rate: u32) {
+    if stream.set_read_timeout(Some(REQUEST_TIMEOUT)).is_err()
+        || stream.set_write_timeout(Some(WRITE_TIMEOUT)).is_err()
+    {
+        return;
+    }
     let mut buf = [0u8; 1024];
     let n = stream.read(&mut buf).unwrap_or(0);
     let req = String::from_utf8_lossy(&buf[..n]);
@@ -121,10 +138,23 @@ pub fn serve(port: u16, senders: Vec<Sender<Msg>>, rate: u32) {
             }
         };
         eprintln!("monitor: serving /listen/<ch>.wav?tap=pre|post on :{port}");
+        let active = Arc::new(AtomicUsize::new(0));
         for stream in listener.incoming() {
-            let Ok(stream) = stream else { continue };
+            let Ok(mut stream) = stream else { continue };
+            if active.load(Ordering::Relaxed) >= MAX_CLIENTS {
+                let _ = stream.set_write_timeout(Some(REQUEST_TIMEOUT));
+                let _ = stream.write_all(
+                    b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\ntoo many monitor clients\n",
+                );
+                continue;
+            }
+            active.fetch_add(1, Ordering::Relaxed);
             let senders = senders.clone();
-            thread::spawn(move || handle(stream, &senders, rate));
+            let active = Arc::clone(&active);
+            thread::spawn(move || {
+                handle(stream, &senders, rate);
+                active.fetch_sub(1, Ordering::Relaxed);
+            });
         }
     });
 }

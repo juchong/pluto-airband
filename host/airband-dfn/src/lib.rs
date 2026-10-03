@@ -128,6 +128,8 @@ pub struct DfnEnhancer {
     cushion: usize,
     primed: bool,
     errored: bool,
+    /// Cumulative inference errors (each hop that failed and was passed through).
+    errors: u64,
 }
 
 impl DfnEnhancer {
@@ -159,6 +161,7 @@ impl DfnEnhancer {
             cushion,
             primed: false,
             errored: false,
+            errors: 0,
         })
     }
 
@@ -169,9 +172,14 @@ impl DfnEnhancer {
     }
 
     /// True if any model inference call returned an error.
-    #[cfg(test)]
     pub fn errored(&self) -> bool {
         self.errored
+    }
+
+    /// Number of hops whose inference failed (and were passed through
+    /// unenhanced). Exported per channel by the reader's metrics.
+    pub fn error_count(&self) -> u64 {
+        self.errors
     }
 
     /// Enhances one native-rate sample. Output is delayed by the model lookahead
@@ -206,9 +214,19 @@ impl DfnEnhancer {
             permit.enter();
             let res = self.df.process(self.noisy.view(), self.enh.view_mut());
             permit.leave();
-            // Ignore the returned LSNR; record (don't crash on) any inference error.
-            if res.is_err() {
-                self.errored = true;
+            // Ignore the returned LSNR. On an inference error, pass the hop through
+            // unenhanced instead of re-emitting whatever `enh` held from the last
+            // good hop (which replayed a stale 10 ms of audio for every failing hop,
+            // silently, for the rest of the process lifetime). Log the first one.
+            if let Err(e) = res {
+                self.enh.assign(&self.noisy);
+                self.errors += 1;
+                if !self.errored {
+                    self.errored = true;
+                    eprintln!(
+                        "dfn: inference error ({e}); passing audio through unenhanced (counted in airband_dfn_errors_total)"
+                    );
+                }
             }
             self.down_scratch.clear();
             for i in 0..self.hop {

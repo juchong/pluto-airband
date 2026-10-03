@@ -118,6 +118,13 @@ fn parse(json: &str, in_rate: u32, n_channels: usize) -> Result<Vec<IcecastConfi
             );
         }
         let tls = TlsMode::parse(&f.tls).map_err(|e| anyhow!("feeds[{i}]: {e}"))?;
+        if !crate::icecast::supported_bitrate(f.bitrate) {
+            bail!(
+                "feeds[{i}]: unsupported bitrate {} kbps (LAME supports {:?})",
+                f.bitrate,
+                crate::icecast::SUPPORTED_BITRATES_KBPS
+            );
+        }
         let ctx = format!("feeds[{i}]");
         let name = expand_env_opt(f.name, &ctx)?
             .unwrap_or_else(|| format!("Pluto airband ch{}", f.channel));
@@ -169,6 +176,15 @@ mod tests {
         assert_eq!(c.tls, TlsMode::Disabled);
         assert!(!c.tls_insecure);
         assert_eq!(c.name, "Pluto airband ch0");
+    }
+
+    #[test]
+    fn rejects_unsupported_bitrate() {
+        let json = r#"{ "feeds": [
+            { "channel": 0, "server": "h", "mountpoint": "/m.mp3", "bitrate": 20 }
+        ] }"#;
+        let err = parse(json, 15625, 1).unwrap_err().to_string();
+        assert!(err.contains("unsupported bitrate 20"), "{err}");
     }
 
     #[test]

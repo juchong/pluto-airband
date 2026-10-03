@@ -10,11 +10,11 @@
 
 use airband_dsp::level_to_dbfs;
 use std::io::{Read, Write};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// How stale the last received sample may be before `data_flowing` reads false.
 /// The Pluto streams continuously, so a multi-second gap means the stream
@@ -59,6 +59,12 @@ pub struct ChannelMetric {
     /// metric, like `airband-listen`. Independent of the demod audio level.
     pub carrier_bits: AtomicU32,
     pub open: AtomicBool,
+    /// Samples the channel worker has consumed from its queue. `samples -
+    /// processed` is the worker's backlog (see [`ChannelMetric::lag`]).
+    pub processed: AtomicU64,
+    /// DeepFilterNet inference errors seen by this channel's enhancer (the
+    /// enhancer passes audio through unenhanced on error).
+    pub dfn_errors: AtomicU64,
 }
 
 impl ChannelMetric {
@@ -72,7 +78,29 @@ impl ChannelMetric {
             peak_bits: AtomicU32::new(0),
             carrier_bits: AtomicU32::new(0),
             open: AtomicBool::new(false),
+            processed: AtomicU64::new(0),
+            dfn_errors: AtomicU64::new(0),
         }
+    }
+
+    /// Worker: count one sample consumed from the channel queue.
+    pub fn note_processed(&self) {
+        self.processed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Worker: publish the enhancer's cumulative inference-error count.
+    pub fn set_dfn_errors(&self, n: u64) {
+        self.dfn_errors.store(n, Ordering::Relaxed);
+    }
+
+    /// Samples queued for the worker but not yet processed. The queue is
+    /// unbounded by design (simultaneous transmissions buffer behind the DFN
+    /// permits instead of dropping), so this is the one place that backlog —
+    /// and the latency it adds — becomes visible.
+    pub fn lag(&self) -> u64 {
+        self.samples
+            .load(Ordering::Relaxed)
+            .saturating_sub(self.processed.load(Ordering::Relaxed))
     }
 
     /// Router: publish this channel's latest decoded FPGA carrier level (raw units).
@@ -129,7 +157,18 @@ pub struct FeedMetric {
     pub connected: AtomicBool,
     pub reconnects: AtomicU64,
     pub bytes: AtomicU64,
+    /// Samples the worker could not hand to this feed because its ~1 s queue was
+    /// full (a slow or stalled Icecast peer). Audible as a gap on that mount.
+    pub dropped: AtomicU64,
+    start: Instant,
+    /// `start.elapsed()` in ms at the last successful socket write (0 = never).
+    last_write_ms: AtomicU64,
 }
+
+/// How long a connected feed may go without shipping bytes before it stops
+/// counting as healthy. Feeds write every ~200 ms while audio flows and the
+/// socket write timeout is 10 s, so 30 s only catches a genuinely stuck sink.
+const FEED_WRITE_STALE_S: u64 = 30;
 
 impl FeedMetric {
     pub fn new(channel: usize, mount: String) -> Arc<FeedMetric> {
@@ -139,6 +178,9 @@ impl FeedMetric {
             connected: AtomicBool::new(false),
             reconnects: AtomicU64::new(0),
             bytes: AtomicU64::new(0),
+            dropped: AtomicU64::new(0),
+            start: Instant::now(),
+            last_write_ms: AtomicU64::new(0),
         })
     }
 
@@ -148,8 +190,26 @@ impl FeedMetric {
     pub fn note_reconnect(&self) {
         self.reconnects.fetch_add(1, Ordering::Relaxed);
     }
+    /// Feed thread: `n` MP3 bytes were written to the socket just now.
     pub fn add_bytes(&self, n: u64) {
         self.bytes.fetch_add(n, Ordering::Relaxed);
+        self.last_write_ms
+            .store(self.start.elapsed().as_millis() as u64, Ordering::Relaxed);
+    }
+    /// Worker: `n` samples were dropped because the feed queue was full.
+    pub fn add_dropped(&self, n: u64) {
+        self.dropped.fetch_add(n, Ordering::Relaxed);
+    }
+    /// True if bytes were shipped within the last `secs` seconds.
+    pub fn wrote_within(&self, secs: u64) -> bool {
+        let last = self.last_write_ms.load(Ordering::Relaxed);
+        let now = self.start.elapsed().as_millis() as u64;
+        last != 0 && now.saturating_sub(last) < secs * 1000
+    }
+    /// Connected *and* actually shipping bytes — a socket that stays established
+    /// while writes stall is not a healthy feed.
+    pub fn healthy(&self) -> bool {
+        self.connected.load(Ordering::Relaxed) && self.wrote_within(FEED_WRITE_STALE_S)
     }
 }
 
@@ -259,7 +319,8 @@ impl Metrics {
     }
 
     /// Headline tile: we are delivering real audio to LiveATC — every output feed
-    /// is connected **and** the capture side is actually flowing data. Gating on
+    /// is connected and shipping bytes (see [`FeedMetric::healthy`]) **and** the
+    /// capture side is actually flowing data. Gating on
     /// `data_flowing` closes the blind spot where a feed socket stays connected and
     /// ships dead air while the Pluto is down (a connected-but-silent outage).
     /// Vacuously true when no feeds are configured.
@@ -267,11 +328,7 @@ impl Metrics {
         if self.feeds.is_empty() {
             return true;
         }
-        self.data_flowing()
-            && self
-                .feeds
-                .iter()
-                .all(|f| f.connected.load(Ordering::Relaxed))
+        self.data_flowing() && self.feeds.iter().all(|f| f.healthy())
     }
 
     /// Single consolidated outage flag for a one-line Home Assistant trigger: true
@@ -329,12 +386,16 @@ impl Metrics {
         let mut active = 0u64;
         let mut total_drops = 0u64;
         let mut total_tx = 0u64;
+        let mut max_lag = 0u64;
+        let mut total_dfn_errors = 0u64;
         for m in &self.channels {
             if m.samples.load(Ordering::Relaxed) > 0 {
                 active += 1;
             }
             total_drops += m.drops.load(Ordering::Relaxed);
             total_tx += m.transmissions.load(Ordering::Relaxed);
+            max_lag = max_lag.max(m.lag());
+            total_dfn_errors += m.dfn_errors.load(Ordering::Relaxed);
         }
         let pluto_reachable = self.pluto_reachable.load(Ordering::Relaxed);
         let stream_up = self.stream_up.load(Ordering::Relaxed);
@@ -345,12 +406,14 @@ impl Metrics {
                 feeds.push(',');
             }
             feeds.push_str(&format!(
-                "{{\"channel\":{},\"mount\":{:?},\"connected\":{},\"reconnects\":{},\"bytes\":{}}}",
+                "{{\"channel\":{},\"mount\":{:?},\"connected\":{},\"healthy\":{},\"reconnects\":{},\"bytes\":{},\"dropped\":{}}}",
                 f.channel,
                 f.mount,
                 f.connected.load(Ordering::Relaxed),
+                f.healthy(),
                 f.reconnects.load(Ordering::Relaxed),
                 f.bytes.load(Ordering::Relaxed),
+                f.dropped.load(Ordering::Relaxed),
             ));
         }
         feeds.push(']');
@@ -389,6 +452,8 @@ impl Metrics {
 \"active_channels\":{active},\
 \"total_drops\":{total_drops},\
 \"total_transmissions\":{total_tx},\
+\"max_worker_lag_samples\":{max_lag},\
+\"total_dfn_errors\":{total_dfn_errors},\
 \"feeds\":{feeds},\
 \"channels\":{channels}}}",
             data = self.data_flowing(),
@@ -463,6 +528,36 @@ impl Metrics {
                 "airband_feed_bytes_total{{mount=\"{}\",channel=\"{}\"}} {}\n",
                 f.mount, f.channel, f.bytes.load(Ordering::Relaxed)
             ));
+        }
+
+        s.push_str("# HELP airband_feed_dropped_samples_total Samples dropped because the feed queue was full.\n");
+        s.push_str("# TYPE airband_feed_dropped_samples_total counter\n");
+        for f in &self.feeds {
+            s.push_str(&format!(
+                "airband_feed_dropped_samples_total{{mount=\"{}\",channel=\"{}\"}} {}\n",
+                f.mount, f.channel, f.dropped.load(Ordering::Relaxed)
+            ));
+        }
+        s.push_str("# HELP airband_feed_healthy Feed connected and shipping bytes recently.\n");
+        s.push_str("# TYPE airband_feed_healthy gauge\n");
+        for f in &self.feeds {
+            s.push_str(&format!(
+                "airband_feed_healthy{{mount=\"{}\",channel=\"{}\"}} {}\n",
+                f.mount, f.channel, b(f.healthy())
+            ));
+        }
+
+        // Per-channel worker backlog and enhancer errors.
+        s.push_str("# HELP airband_worker_lag_samples Samples queued for the channel worker but not yet processed.\n");
+        s.push_str("# TYPE airband_worker_lag_samples gauge\n");
+        for (c, m) in self.channels.iter().enumerate() {
+            s.push_str(&format!("airband_worker_lag_samples{{channel=\"{c}\"}} {}\n", m.lag()));
+        }
+        s.push_str("# HELP airband_dfn_errors_total DeepFilterNet inference errors per channel (audio passed through unenhanced).\n");
+        s.push_str("# TYPE airband_dfn_errors_total counter\n");
+        for (c, m) in self.channels.iter().enumerate() {
+            let v = m.dfn_errors.load(Ordering::Relaxed);
+            s.push_str(&format!("airband_dfn_errors_total{{channel=\"{c}\"}} {v}\n"));
         }
 
         // Per-channel counters/gauges (unchanged from the original exposition).
@@ -545,7 +640,12 @@ mod tests {
         m.note_active();
         assert!(m.data_flowing());
         assert!(m.system_healthy());
-        assert!(m.liveatc_healthy(), "connected feed + flowing data is healthy");
+        assert!(
+            !m.liveatc_healthy(),
+            "a connected feed that has never shipped bytes is not healthy"
+        );
+        m.feeds[0].add_bytes(1);
+        assert!(m.liveatc_healthy(), "connected feed + bytes + flowing data is healthy");
         assert!(
             !m.outage_at(onset + OUTAGE_DEBOUNCE_S * 1000 + 1),
             "no outage when both sides are healthy"
@@ -564,6 +664,8 @@ mod tests {
         m.set_stream_up(true);
         m.note_active();
         feed.set_connected(true);
+        feed.add_bytes(1);
+        assert!(m.liveatc_healthy(), "healthy baseline");
         assert!(!m.outage_at(0), "healthy baseline");
 
         // Feed drops for ~5 s (a routine reconnect), then comes back — well under
@@ -588,40 +690,57 @@ mod tests {
     }
 }
 
-/// Spawns a background thread serving `/metrics`, `/healthz`, and `/status` on `port`.
-pub fn serve(metrics: Arc<Metrics>, port: u16) {
-    thread::spawn(move || {
-        let listener = match TcpListener::bind(("0.0.0.0", port)) {
-            Ok(l) => l,
-            Err(e) => {
-                eprintln!("metrics: failed to bind port {port}: {e}");
-                return;
-            }
-        };
-        eprintln!("metrics: serving /metrics /healthz /status on :{port}");
-        for stream in listener.incoming() {
-            let Ok(mut stream) = stream else { continue };
-            // Read the request line to route by path; one short read is enough.
-            let mut buf = [0u8; 1024];
-            let n = stream.read(&mut buf).unwrap_or(0);
-            let req = String::from_utf8_lossy(&buf[..n]);
-            let path = req.split_whitespace().nth(1).unwrap_or("/");
+/// Per-connection socket timeouts for the metrics server. One idle or half-open
+/// client used to block the single accept loop indefinitely (the request read had
+/// no timeout), which the external watchdog read as "/status down" and escalated.
+const HTTP_IO_TIMEOUT: Duration = Duration::from_secs(2);
 
-            let (status, ctype, body) = if path.starts_with("/healthz") {
-                let ok = metrics.system_healthy() && metrics.liveatc_healthy();
-                let code = if ok { "200 OK" } else { "503 Service Unavailable" };
-                (code, "text/plain", if ok { "ok\n".to_string() } else { "unhealthy\n".to_string() })
-            } else if path.starts_with("/status") {
-                ("200 OK", "application/json", metrics.status_json())
-            } else {
-                ("200 OK", "text/plain; version=0.0.4", metrics.render())
-            };
-            let resp = format!(
-                "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            let _ = stream.write_all(resp.as_bytes());
+/// Binds `port` and serves `/metrics`, `/healthz`, and `/status` from a background
+/// thread, one short-lived thread per connection. Returns the bind error instead
+/// of logging it: a reader without `/status` would be restarted by the external
+/// watchdog every cooldown forever, so failing startup loudly is the safer outcome.
+pub fn serve(metrics: Arc<Metrics>, port: u16) -> std::io::Result<()> {
+    let listener = TcpListener::bind(("0.0.0.0", port))?;
+    eprintln!("metrics: serving /metrics /healthz /status on :{port}");
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { continue };
+            let metrics = Arc::clone(&metrics);
+            thread::spawn(move || handle(stream, &metrics));
         }
     });
+    Ok(())
+}
+
+/// Answers one HTTP request, bounded by [`HTTP_IO_TIMEOUT`] in both directions.
+fn handle(mut stream: TcpStream, metrics: &Metrics) {
+    if stream.set_read_timeout(Some(HTTP_IO_TIMEOUT)).is_err()
+        || stream.set_write_timeout(Some(HTTP_IO_TIMEOUT)).is_err()
+    {
+        return;
+    }
+    // Read the request line to route by path; one short read is enough.
+    let mut buf = [0u8; 1024];
+    let n = stream.read(&mut buf).unwrap_or(0);
+    if n == 0 {
+        return;
+    }
+    let req = String::from_utf8_lossy(&buf[..n]);
+    let path = req.split_whitespace().nth(1).unwrap_or("/");
+
+    let (status, ctype, body) = if path.starts_with("/healthz") {
+        let ok = metrics.system_healthy() && metrics.liveatc_healthy();
+        let code = if ok { "200 OK" } else { "503 Service Unavailable" };
+        (code, "text/plain", if ok { "ok\n".to_string() } else { "unhealthy\n".to_string() })
+    } else if path.starts_with("/status") {
+        ("200 OK", "application/json", metrics.status_json())
+    } else {
+        ("200 OK", "text/plain; version=0.0.4", metrics.render())
+    };
+    let resp = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    let _ = stream.write_all(resp.as_bytes());
 }

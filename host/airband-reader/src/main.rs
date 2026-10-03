@@ -103,10 +103,10 @@ struct Args {
     #[arg(default_value = "192.168.2.1:30000")]
     addr: String,
     /// Number of channels to demultiplex
-    #[arg(long, default_value_t = 21)]
+    #[arg(long, default_value_t = 21, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
     channels: usize,
     /// Audio sample rate in Hz (= AD9361 Fs / 160 / 5 = 20000 at the 16 MHz build)
-    #[arg(long, default_value_t = 20000)]
+    #[arg(long, default_value_t = 20000, value_parser = clap::builder::RangedU64ValueParser::<u32>::new().range(1..))]
     rate: u32,
     /// Output mode
     #[arg(long, value_enum, default_value_t = Mode::Stats)]
@@ -648,8 +648,26 @@ fn spawn_watchdog_keeper(metrics: Arc<Metrics>) {
         if metrics.seconds_since_heartbeat() < WATCHDOG_STALE_S {
             sd_notify("WATCHDOG=1");
         }
+        // Evaluate the debounced outage flag on a fixed cadence so its onset
+        // clock is stamped even when no MQTT/Prometheus/watchdog poller is
+        // asking (the stamp lives in the getter).
+        let _ = metrics.outage();
         thread::sleep(Duration::from_secs(5));
     });
+}
+
+/// The fields of maia-httpd's `GET /api/health` this reader cares about; unknown
+/// fields are ignored and missing ones take the benign defaults.
+#[derive(serde::Deserialize)]
+struct PlutoHealth {
+    #[serde(default = "default_true")]
+    dma_advancing: bool,
+    #[serde(default)]
+    overflow: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Spawns the Pluto reachability probe: a periodic lightweight TCP connect to
@@ -673,13 +691,13 @@ fn spawn_pluto_probe(metrics: Arc<Metrics>, addr: &str, web_port: u16) {
             let ok = body.is_some();
             metrics.set_pluto_reachable(ok);
             if let Some(b) = &body {
-                // ponytail: two known boolean fields, so substring-match instead of
-                // pulling in a JSON parser. Older firmware (no endpoint / 404) leaves
-                // the benign defaults (dma_advancing=true, overflow=false).
-                if b.contains("\"dma_advancing\"") || b.contains("\"overflow\"") {
-                    let dma = b.contains("\"dma_advancing\":true");
-                    let ovf = b.contains("\"overflow\":true");
-                    metrics.set_pluto_health(dma, ovf);
+                // Parse the health JSON properly (an exact-substring match on
+                // `"dma_advancing":true` false-alarmed on any whitespace or
+                // serializer change). Older firmware (no endpoint / 404) never gets
+                // here and keeps the benign defaults; a body without the fields
+                // reads the same defaults (dma_advancing=true, overflow=false).
+                if let Ok(h) = serde_json::from_str::<PlutoHealth>(b) {
+                    metrics.set_pluto_health(h.dma_advancing, h.overflow);
                 }
             }
             if prev != Some(ok) {
@@ -762,8 +780,11 @@ struct Worker {
     presence: Option<Presence>,
     recorder: Option<Recorder>,
     udp: Option<UdpOut>,
-    /// Icecast feeds for this channel (fan-out: one sender per destination).
-    icecast: Vec<SyncSender<i16>>,
+    /// Icecast feeds for this channel (fan-out: one sender per destination), each
+    /// with its health cell so queue-full drops are counted against the feed.
+    icecast: Vec<(SyncSender<i16>, Arc<FeedMetric>)>,
+    /// Last DFN inference-error count published to the channel metric.
+    dfn_errors_seen: u64,
     /// Runtime debug-monitor sinks: `pre` taps the raw demod (continuous),
     /// `post` taps the enhanced gated audio. Added via [`Msg::AddMonitor`] and
     /// pruned when their client disconnects.
@@ -773,7 +794,12 @@ struct Worker {
 }
 
 impl Worker {
-    fn new(index: usize, cfg: &Config, udp: Option<UdpOut>, icecast: Vec<SyncSender<i16>>) -> Worker {
+    fn new(
+        index: usize,
+        cfg: &Config,
+        udp: Option<UdpOut>,
+        icecast: Vec<(SyncSender<i16>, Arc<FeedMetric>)>,
+    ) -> Worker {
         let recorder = match cfg.mode {
             Mode::Stats => None,
             Mode::Wav => Some(Recorder::new(true)),
@@ -817,6 +843,7 @@ impl Worker {
             recorder,
             udp,
             icecast,
+            dfn_errors_seen: 0,
             pre_monitors: Vec::new(),
             post_monitors: Vec::new(),
             since_checkpoint: 0,
@@ -1009,7 +1036,9 @@ impl Worker {
             None => sq_mag >= self.squelch.threshold(),
         };
 
-        // Publish squelch-derived gauges for stats/metrics (every channel).
+        // Publish squelch-derived gauges for stats/metrics (every channel), and
+        // count the sample as consumed so the router->worker backlog is visible.
+        metric.note_processed();
         metric.set_squelch(
             self.squelch.open_count(),
             self.squelch.level(),
@@ -1046,6 +1075,13 @@ impl Worker {
         // the recorder gates it per the split policy.
         let mut n = self.audio_chain(sample, open, just_opened, above, cfg);
         n = self.apply_dfn(n, open, gated, sem);
+        if let Some(e) = self.dfn.as_ref() {
+            let errs = e.error_count();
+            if errs != self.dfn_errors_seen {
+                self.dfn_errors_seen = errs;
+                metric.set_dfn_errors(errs);
+            }
+        }
         n = self.apply_presence(n, open);
         let pcm = if cfg.agc_on {
             (n as f64 * 32767.0).round().clamp(i16::MIN as f64, i16::MAX as f64) as i16
@@ -1058,10 +1094,13 @@ impl Worker {
         if let Some(u) = self.udp.as_mut() {
             u.push(pcm);
         }
-        for tx in &self.icecast {
+        for (tx, fm) in &self.icecast {
             // Drop only under network back-pressure (slow/dead Icecast); the DFN
-            // path itself never drops or bypasses.
-            let _ = tx.try_send(pcm);
+            // path itself never drops or bypasses. Count the drop against the feed
+            // so a stalled sink is visible in /status and /metrics.
+            if let Err(TrySendError::Full(_)) = tx.try_send(pcm) {
+                fm.add_dropped(1);
+            }
         }
         // Post-DFN debug-monitor tap (byte-identical to what feeds ship).
         fanout_monitors(&mut self.post_monitors, pcm);
@@ -1222,6 +1261,7 @@ fn run_session(
     metrics: &Metrics,
     carrier_thr: &AtomicU32,
     stats: &mut StatsPrinter,
+    failed_attempts: u32,
 ) -> Result<()> {
     // Resolve, then connect with a bound. A plain `TcpStream::connect` to a
     // SYN-blackholed Pluto (board hung, link half-up) blocks for the kernel's
@@ -1235,7 +1275,11 @@ fn run_session(
     let stream = TcpStream::connect_timeout(&sa, Duration::from_secs(5))
         .with_context(|| format!("connecting to {addr}"))?;
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
-    eprintln!("connected to {addr}");
+    if failed_attempts > 0 {
+        eprintln!("connected to {addr} (stream recovered after {failed_attempts} failed attempts)");
+    } else {
+        eprintln!("connected to {addr}");
+    }
     metrics.set_stream_up(true);
     let mut reader = BufReader::with_capacity(1 << 16, stream);
     let mut frame = [0u8; FRAME_BYTES];
@@ -1304,6 +1348,15 @@ fn run_session(
 }
 
 fn main() -> Result<()> {
+    // Any panic — a worker thread's inference failure, a poisoned lock — aborts
+    // the whole process so systemd restarts it clean (Restart=always). The
+    // default behaviour silently killed one channel's worker while the router
+    // kept counting its samples as healthy and its feeds shipped dead air.
+    std::panic::set_hook(Box::new(|info| {
+        eprintln!("panic: {info}; aborting so systemd restarts the reader");
+        std::process::abort();
+    }));
+
     let args = Args::parse();
 
     let squelch_mode = match args.squelch {
@@ -1356,6 +1409,24 @@ fn main() -> Result<()> {
     }
 
     let n = args.channels;
+    for &c in &args.squelch_voice_gate_channels {
+        anyhow::ensure!(c < n, "--squelch-voice-gate-channels {c} out of range (0..{n})");
+    }
+    if args.icecast_channel.is_some() {
+        anyhow::ensure!(
+            icecast::supported_bitrate(args.icecast_bitrate),
+            "--icecast-bitrate {} kbps is not a LAME bitrate (supported: {:?})",
+            args.icecast_bitrate,
+            icecast::SUPPORTED_BITRATES_KBPS
+        );
+    }
+    if args.mqtt_user.as_deref().is_some_and(|u| !u.is_empty())
+        && args.mqtt_pass.as_deref().is_none_or(|p| p.is_empty())
+    {
+        eprintln!(
+            "mqtt: --mqtt-user given without a password (set AIRBAND_MQTT_PASS); connecting without credentials"
+        );
+    }
 
     // Per-channel output sinks, assembled before the workers are built so each
     // worker owns its own recorder/UDP/Icecast senders (a channel may fan out to
@@ -1374,7 +1445,8 @@ fn main() -> Result<()> {
     // Icecast feeds: a JSON feeds file (many channels / many servers) and/or the
     // single-stream --icecast-* flags. Both produce IcecastConfig entries that
     // are attached to their channel (a channel may have several = fan-out).
-    let mut icecast_sinks: Vec<Vec<SyncSender<i16>>> = (0..n).map(|_| Vec::new()).collect();
+    let mut icecast_sinks: Vec<Vec<(SyncSender<i16>, Arc<FeedMetric>)>> =
+        (0..n).map(|_| Vec::new()).collect();
     let mut feed_cfgs: Vec<IcecastConfig> = Vec::new();
     if let Some(path) = args.feeds.as_ref() {
         feed_cfgs.extend(feeds::load(path, cfg.rate, n)?);
@@ -1417,11 +1489,12 @@ fn main() -> Result<()> {
             "icecast: feed ch{ch} -> {scheme}://{}:{}{}",
             icfg.host, icfg.port, icfg.mount
         );
-        icecast_sinks[ch].push(icecast::spawn(icfg, fm));
+        icecast_sinks[ch].push((icecast::spawn(icfg, Arc::clone(&fm)), fm));
     }
 
     if args.metrics_port > 0 {
-        metrics::serve(Arc::clone(&metrics), args.metrics_port);
+        metrics::serve(Arc::clone(&metrics), args.metrics_port)
+            .with_context(|| format!("binding the metrics port {}", args.metrics_port))?;
     }
 
     // "Is the Pluto connected?" — periodic lightweight TCP probe of the maia-httpd
@@ -1502,22 +1575,53 @@ fn main() -> Result<()> {
     spawn_watchdog_keeper(Arc::clone(&metrics));
 
     let mut stats = StatsPrinter::new(args.stats_interval, n, cfg.mode, args.stats_table);
+    // Consecutive failed attempts in the current outage (0 = last session ran).
+    let mut failed: u32 = 0;
     loop {
-        if let Err(e) =
-            run_session(&args.addr, n, &cfg, &senders, &metrics, &carrier_thr, &mut stats)
-        {
-            metrics.set_stream_up(false);
-            eprintln!("stream error ({e:#}); reconnecting in 1s");
-            // Reconnect: tell workers to finalize recordings and clear state.
+        let started = Instant::now();
+        let res = run_session(
+            &args.addr,
+            n,
+            &cfg,
+            &senders,
+            &metrics,
+            &carrier_thr,
+            &mut stats,
+            failed,
+        );
+        let Err(e) = res else { continue };
+        metrics.set_stream_up(false);
+        // A session that ran for a while before failing starts a new outage; a
+        // quick failure (connect refused/timed out, no data) continues the
+        // current one.
+        if started.elapsed() > Duration::from_secs(30) {
+            failed = 0;
+        }
+        failed += 1;
+        // Log the first failure and then every 10th: an outage used to produce
+        // one identical line per second (~86k lines/day).
+        if failed == 1 {
+            eprintln!("stream error ({e:#}); reconnecting");
+            // Tell workers to finalize recordings and clear state, once per outage.
             for s in &senders {
                 let _ = s.send(Msg::Reset);
             }
-            // Count the attempt as router progress so the watchdog keeper keeps
-            // petting systemd across a Pluto/network outage: a reconnecting but
-            // healthy reader must not be killed by WatchdogSec.
-            metrics.note_heartbeat();
-            thread::sleep(Duration::from_secs(1));
+        } else if failed % 10 == 0 {
+            eprintln!("stream still down after {failed} attempts ({e:#}); retrying");
         }
+        // Count the attempt as router progress so the watchdog keeper keeps
+        // petting systemd across a Pluto/network outage: a reconnecting but
+        // healthy reader must not be killed by WatchdogSec.
+        metrics.note_heartbeat();
+        // Gentle back-off: 1 s for the first attempts (a Pluto blip), then 2 s,
+        // then 5 s for a long outage (each attempt also has a 5 s connect bound,
+        // so the keeper's 20 s heartbeat window is never approached).
+        let backoff = match failed {
+            0..=3 => 1,
+            4..=10 => 2,
+            _ => 5,
+        };
+        thread::sleep(Duration::from_secs(backoff));
     }
 }
 
