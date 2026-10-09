@@ -146,8 +146,9 @@ fn entities(cfg: &MqttConfig) -> Vec<Entity> {
         "\"state_class\":\"total_increasing\"",
     );
 
-    // Host cooling (Pi only). `thermal_problem` is the one to alert on: no fan
-    // detected, SoC at the throttling temperature, or a stalled fan while hot.
+    // Host cooling (Pi only). `thermal_problem` is the one to alert on: the
+    // firmware is throttling the SoC right now, or a header fan is stalled while
+    // hot. Fan presence is informational only (an external fan is fine).
     if cfg.host_thermal {
         v.push(Entity {
             component: "binary_sensor",
@@ -155,6 +156,30 @@ fn entities(cfg: &MqttConfig) -> Vec<Entity> {
             name: "Host thermal problem".to_string(),
             value_template: "{{ value_json.thermal_problem }}".to_string(),
             extra: "\"payload_on\":\"True\",\"payload_off\":\"False\",\"device_class\":\"problem\"".to_string(),
+            state_topic: None,
+        });
+        v.push(Entity {
+            component: "binary_sensor",
+            key: "throttled".to_string(),
+            name: "CPU throttled".to_string(),
+            value_template: "{{ value_json.throttled }}".to_string(),
+            extra: "\"payload_on\":\"True\",\"payload_off\":\"False\",\"icon\":\"mdi:speedometer-slow\"".to_string(),
+            state_topic: None,
+        });
+        v.push(Entity {
+            component: "binary_sensor",
+            key: "under_voltage".to_string(),
+            name: "Under-voltage".to_string(),
+            value_template: "{{ value_json.under_voltage }}".to_string(),
+            extra: "\"payload_on\":\"True\",\"payload_off\":\"False\",\"device_class\":\"problem\"".to_string(),
+            state_topic: None,
+        });
+        v.push(Entity {
+            component: "sensor",
+            key: "throttle_flags".to_string(),
+            name: "Throttle flags".to_string(),
+            value_template: "{{ value_json.throttle_flags }}".to_string(),
+            extra: "\"icon\":\"mdi:flag-outline\"".to_string(),
             state_topic: None,
         });
         v.push(Entity {

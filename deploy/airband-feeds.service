@@ -148,13 +148,17 @@ OOMScoreAdjust=-500
 # read-only. If you ever add --mode wav here, add
 # ReadWritePaths=<the --out-dir> too. SystemCallFilter and MemoryDenyWriteExecute
 # are deliberately NOT set (tract/DFN inference; not worth a silent SIGSYS).
-# PrivateDevices is fine for --feeds (no ALSA; that is airband-listen). An empty
-# CapabilityBoundingSet is a no-op for User=pi but documents the intent.
+# Devices: closed policy with exactly one allowance, /dev/vcio (the firmware
+# mailbox), so the host thermal probe can run `vcgencmd get_throttled` — the Pi 5
+# exposes the throttle bits nowhere in sysfs. The `pi` user is in `video`, which
+# owns the node. No ALSA (that is airband-listen). An empty CapabilityBoundingSet
+# is a no-op for User=pi but documents the intent.
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=read-only
 PrivateTmp=yes
-PrivateDevices=yes
+DevicePolicy=closed
+DeviceAllow=/dev/vcio r
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectKernelLogs=yes

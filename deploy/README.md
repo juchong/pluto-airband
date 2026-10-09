@@ -216,11 +216,16 @@ headline tiles **Capture healthy** (`system_healthy`) and **LiveATC healthy**
 (`liveatc_healthy`), plus `pluto_reachable`, `maia_httpd_up`, `data_flowing`, and
 the Pluto FPGA flags `dma_advancing` / `fpga_overflow` — auto-appear in HA with no
 manual YAML. On a Raspberry Pi the reader also publishes the host's cooling state:
-**Host thermal problem** (`thermal_problem`, `device_class: problem` — on when no fan
-is detected, the SoC is at the firmware's throttling temperature (80 °C), or a
-present fan reads 0 rpm above 70 °C), **Fan detected** (`fan_detected`; the Pi 5
-firmware only creates the fan device when one is plugged into the header),
-**CPU temperature** (`cpu_temp_c`) and **Fan speed** (`fan_rpm`). A **Last alert**
+**Host thermal problem** (`thermal_problem`, `device_class: problem` — on when the
+firmware is throttling the SoC right now, or a fan on the header reads 0 rpm above
+70 °C; a *missing* header fan is not a problem by itself, an external fan cools just
+as well), **CPU throttled** (`throttled`: the live `get_throttled` bits 0x2/0x4/0x8,
+or SoC ≥ 85 °C when the flags can't be read), **Under-voltage** (`under_voltage`,
+`problem`), **Throttle flags** (`throttle_flags`, the raw hex field for diagnosis),
+**Fan detected** (`fan_detected`; the Pi 5 firmware only creates the fan device when
+one is plugged into the header), **CPU temperature** (`cpu_temp_c`) and **Fan speed**
+(`fan_rpm`). Reading the firmware flags needs `vcgencmd` and `/dev/vcio`, which the
+unit allows with `DeviceAllow=/dev/vcio r`. A **Last alert**
 text sensor (`last_alert`) carries the most recent line from the alert hooks (see
 *Failure alerting*). A Last Will flips `pluto-airband/availability` to `offline` the instant
 the feeder dies, so the whole dashboard greys out on a crash or Pi outage. Add
@@ -288,14 +293,15 @@ to the feeder's journal and delivers one line two ways:
          - trigger: state
            entity_id: binary_sensor.pluto_airband_host_thermal_problem
            to: "on"
-           for: "00:05:00"          # fan unplugged / stalled, or SoC at the throttle point
+           for: "00:05:00"          # firmware throttling the SoC (or a stalled header fan)
        action:
          - action: notify.notify
            data:
              title: "Pluto Airband"
              message: >-
                {{ trigger.to_state.state if trigger.entity_id.startswith('sensor.')
-                  else 'Host thermal problem: no fan detected, fan stalled, or CPU at the throttling temperature' }}
+                  else 'Host thermal problem: CPU being throttled (check cooling), flags '
+                       ~ states('sensor.pluto_airband_throttle_flags') }}
    ```
 
 2. **Webhook / ntfy (optional).** If `AIRBAND_ALERT_URL` is also set, the same

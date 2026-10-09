@@ -687,20 +687,45 @@ fn read_host_thermal() -> Option<(u32, Option<u32>)> {
     Some((temp.max(0) as u32, fan))
 }
 
-/// Host thermal/fan probe: a synchronous first reading (so the MQTT discovery
-/// can include the host entities) and then a 10 s refresh thread that logs
+/// Reads the firmware's `get_throttled` bit field via `vcgencmd` (the Pi 5 has
+/// no sysfs equivalent; the mailbox device /dev/vcio must be allowed by the
+/// unit — `DeviceAllow=/dev/vcio r` — and the user must be in `video`). `None`
+/// when unavailable, in which case the probe falls back to a temperature
+/// threshold. Bits 0-3 are the live state (under-voltage, frequency capped,
+/// throttled, soft temperature limit); bits 16-19 the same events latched since
+/// boot.
+fn read_throttle_flags() -> Option<u32> {
+    let out = std::process::Command::new("vcgencmd")
+        .arg("get_throttled")
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let hex = text.trim().strip_prefix("throttled=0x")?;
+    u32::from_str_radix(hex.trim(), 16).ok()
+}
+
+/// Host thermal probe: a synchronous first reading (so the MQTT discovery can
+/// include the host entities) and then a 10 s refresh thread that logs
 /// transitions of the consolidated `thermal_problem` flag, plus an hourly
-/// reminder while it persists. Until now the first sign of a cooking Pi was
-/// audio drops; this box has sat at the firmware's soft thermal limit with no
-/// fan detected. `vcgencmd get_throttled` is deliberately not used: it needs
-/// /dev/vcio, which the unit's sandbox hides, and the Pi 5 exposes no sysfs
-/// equivalent, so the temperature threshold stands in for the throttle bits.
-/// No-op on a host without a thermal zone.
+/// reminder while it persists. The flag keys on the firmware's live throttle
+/// bits — the ground truth for "the SoC is being slowed down" — not on whether a
+/// fan sits on the header: an external fan cools just as well. Until now the
+/// first sign of a cooking Pi was audio drops. No-op on a host without a
+/// thermal zone.
 fn spawn_host_probe(metrics: Arc<Metrics>) {
     let Some((temp, fan)) = read_host_thermal() else {
         return;
     };
-    metrics.set_host_thermal(temp, fan);
+    let flags = read_throttle_flags();
+    if flags.is_none() {
+        eprintln!(
+            "host: get_throttled unreadable (vcgencmd/vcio); throttling inferred from temperature >= 85 C"
+        );
+    }
+    metrics.set_host_thermal(temp, fan, flags);
     thread::spawn(move || {
         let mut prev: Option<bool> = None;
         let mut last_log = Instant::now();
@@ -712,19 +737,24 @@ fn spawn_host_probe(metrics: Arc<Metrics>) {
                     continue;
                 }
             };
-            metrics.set_host_thermal(temp, fan);
+            let flags = read_throttle_flags();
+            metrics.set_host_thermal(temp, fan, flags);
             let problem = metrics.thermal_problem();
             let changed = prev != Some(problem);
             if changed || (problem && last_log.elapsed() >= Duration::from_secs(3600)) {
                 let fan_s = match fan {
-                    Some(rpm) => format!("fan {rpm} rpm"),
-                    None => "NO FAN DETECTED".to_string(),
+                    Some(rpm) => format!("header fan {rpm} rpm"),
+                    None => "no header fan".to_string(),
+                };
+                let flags_s = match flags {
+                    Some(f) => format!("throttled={f:#x}"),
+                    None => "throttled=unknown".to_string(),
                 };
                 let temp_c = temp as f32 / 1000.0;
                 if problem {
-                    eprintln!("host: THERMAL PROBLEM: cpu {temp_c:.1} C, {fan_s}");
+                    eprintln!("host: THERMAL PROBLEM: cpu {temp_c:.1} C, {flags_s}, {fan_s}");
                 } else {
-                    eprintln!("host: thermal ok: cpu {temp_c:.1} C, {fan_s}");
+                    eprintln!("host: thermal ok: cpu {temp_c:.1} C, {flags_s}, {fan_s}");
                 }
                 prev = Some(problem);
                 last_log = Instant::now();

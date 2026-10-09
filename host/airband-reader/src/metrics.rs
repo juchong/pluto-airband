@@ -253,11 +253,22 @@ pub struct Metrics {
     cpu_temp_mc: AtomicU32,
     fan_detected: AtomicBool,
     fan_rpm: AtomicU32,
+    /// The firmware's `get_throttled` bit field (see [`Metrics::throttled`]) and
+    /// whether it could be read at all (needs /dev/vcio; `DeviceAllow=` in the
+    /// unit). Unknown -> the temperature fallback decides.
+    throttle_known: AtomicBool,
+    throttle_flags: AtomicU32,
 }
 
-/// The Pi 5 firmware starts throttling the CPU around this SoC temperature; the
-/// host probe reports a thermal problem at or above it.
-const HOST_HOT_C: f32 = 80.0;
+/// `get_throttled` bits that mean the SoC is being slowed down *right now*:
+/// 0x2 ARM frequency capped, 0x4 throttled, 0x8 soft temperature limit active.
+/// (0x1 is under-voltage, reported separately; bits 16-19 are the same events
+/// latched since boot and are only informational.)
+const THROTTLE_NOW_MASK: u32 = 0x2 | 0x4 | 0x8;
+const UNDER_VOLTAGE_BIT: u32 = 0x1;
+/// Fallback when the firmware flags cannot be read: the Pi 5 hard-throttles at
+/// this SoC temperature, so at or above it the host is certainly throttling.
+const HOST_HOT_C: f32 = 85.0;
 /// A detected fan that reports no rotation above this temperature is stalled.
 const HOST_FAN_STALL_C: f32 = 70.0;
 
@@ -279,16 +290,48 @@ impl Metrics {
             cpu_temp_mc: AtomicU32::new(0),
             fan_detected: AtomicBool::new(false),
             fan_rpm: AtomicU32::new(0),
+            throttle_known: AtomicBool::new(false),
+            throttle_flags: AtomicU32::new(0),
         })
     }
 
-    /// Host probe: publish the latest sysfs reading (`fan` = RPM if a fan device
-    /// exists, `None` if the host has no fan at all).
-    pub fn set_host_thermal(&self, temp_mc: u32, fan: Option<u32>) {
+    /// Host probe: publish the latest reading. `fan` = RPM if a fan device exists
+    /// (`None` = no fan on the header); `throttle` = the firmware's
+    /// `get_throttled` bits, `None` when they could not be read.
+    pub fn set_host_thermal(&self, temp_mc: u32, fan: Option<u32>, throttle: Option<u32>) {
         self.host_probe_ok.store(true, Ordering::Relaxed);
         self.cpu_temp_mc.store(temp_mc, Ordering::Relaxed);
         self.fan_detected.store(fan.is_some(), Ordering::Relaxed);
         self.fan_rpm.store(fan.unwrap_or(0), Ordering::Relaxed);
+        self.throttle_known.store(throttle.is_some(), Ordering::Relaxed);
+        self.throttle_flags.store(throttle.unwrap_or(0), Ordering::Relaxed);
+    }
+
+    /// The firmware flags could be read this cycle.
+    pub fn throttle_known(&self) -> bool {
+        self.throttle_known.load(Ordering::Relaxed)
+    }
+
+    /// Raw `get_throttled` bit field (0 when unknown).
+    pub fn throttle_flags(&self) -> u32 {
+        self.throttle_flags.load(Ordering::Relaxed)
+    }
+
+    /// The SoC is being slowed down right now (frequency capped, throttled, or
+    /// at the soft temperature limit) per the firmware; with the flags unknown,
+    /// a SoC at or above the hard-throttle temperature.
+    pub fn throttled(&self) -> bool {
+        if self.throttle_known() {
+            self.throttle_flags() & THROTTLE_NOW_MASK != 0
+        } else {
+            self.host_probe_ok() && self.cpu_temp_c() >= HOST_HOT_C
+        }
+    }
+
+    /// The firmware reports under-voltage right now (a supply problem, not a
+    /// thermal one; it also triggers frequency capping).
+    pub fn under_voltage(&self) -> bool {
+        self.throttle_known() && self.throttle_flags() & UNDER_VOLTAGE_BIT != 0
     }
 
     /// True once the host probe has read the thermal zone (i.e. this is a Pi).
@@ -308,18 +351,20 @@ impl Metrics {
         self.fan_rpm.load(Ordering::Relaxed)
     }
 
-    /// Host cooling is not doing its job: no fan device at all, the SoC at or
-    /// above the throttling temperature, or a present fan reporting zero RPM
-    /// while hot. Always false when the host exposes no thermal zone. Kept out
-    /// of `outage` on purpose (audio may still be fine) — it is its own Home
-    /// Assistant `problem` entity.
+    /// Host cooling is not keeping up: the firmware is throttling the SoC right
+    /// now (see [`Metrics::throttled`]), or a fan that *is* on the header reads
+    /// zero RPM while hot. A missing header fan is deliberately NOT a problem by
+    /// itself — an external fan cools just as well and the throttle bits are
+    /// the ground truth. Always false when the host exposes no thermal zone.
+    /// Kept out of `outage` on purpose (audio may still be fine) — it is its
+    /// own Home Assistant `problem` entity.
     pub fn thermal_problem(&self) -> bool {
         if !self.host_probe_ok() {
             return false;
         }
-        let t = self.cpu_temp_c();
-        let fan = self.fan_detected();
-        !fan || t >= HOST_HOT_C || (fan && self.fan_rpm() == 0 && t >= HOST_FAN_STALL_C)
+        let stalled_fan =
+            self.fan_detected() && self.fan_rpm() == 0 && self.cpu_temp_c() >= HOST_FAN_STALL_C;
+        self.throttled() || stalled_fan
     }
 
     fn now_ms(&self) -> u64 {
@@ -517,6 +562,9 @@ impl Metrics {
 \"cpu_temp_c\":{cpu_temp:.1},\
 \"fan_detected\":{fan},\
 \"fan_rpm\":{fan_rpm},\
+\"throttled\":{throttled},\
+\"under_voltage\":{under_voltage},\
+\"throttle_flags\":\"{throttle_flags}\",\
 \"thermal_problem\":{thermal},\
 \"feeds\":{feeds},\
 \"channels\":{channels}}}",
@@ -531,6 +579,13 @@ impl Metrics {
             cpu_temp = self.cpu_temp_c(),
             fan = self.fan_detected(),
             fan_rpm = self.fan_rpm(),
+            throttled = self.throttled(),
+            under_voltage = self.under_voltage(),
+            throttle_flags = if self.throttle_known() {
+                format!("{:#x}", self.throttle_flags())
+            } else {
+                "unknown".to_string()
+            },
             thermal = self.thermal_problem(),
         )
     }
@@ -583,7 +638,20 @@ impl Metrics {
             s.push_str("# HELP airband_host_fan_rpm Fan tachometer reading (0 when no fan or stalled).\n");
             s.push_str("# TYPE airband_host_fan_rpm gauge\n");
             s.push_str(&format!("airband_host_fan_rpm {}\n", self.fan_rpm()));
-            s.push_str("# HELP airband_host_thermal_problem No fan, SoC at the throttling temperature, or a stalled fan while hot.\n");
+            s.push_str("# HELP airband_host_throttled Firmware is throttling or frequency-capping the SoC right now (temperature fallback when flags are unreadable).\n");
+            s.push_str("# TYPE airband_host_throttled gauge\n");
+            s.push_str(&format!("airband_host_throttled {}\n", b(self.throttled())));
+            s.push_str("# HELP airband_host_under_voltage Firmware reports under-voltage right now.\n");
+            s.push_str("# TYPE airband_host_under_voltage gauge\n");
+            s.push_str(&format!("airband_host_under_voltage {}\n", b(self.under_voltage())));
+            s.push_str("# HELP airband_host_throttle_flags Raw get_throttled bit field (bits 0-3 current, 16-19 latched since boot); -1 when unreadable.\n");
+            s.push_str("# TYPE airband_host_throttle_flags gauge\n");
+            if self.throttle_known() {
+                s.push_str(&format!("airband_host_throttle_flags {}\n", self.throttle_flags()));
+            } else {
+                s.push_str("airband_host_throttle_flags -1\n");
+            }
+            s.push_str("# HELP airband_host_thermal_problem SoC throttled right now, or a header fan stalled while hot.\n");
             s.push_str("# TYPE airband_host_thermal_problem gauge\n");
             s.push_str(&format!("airband_host_thermal_problem {}\n", b(self.thermal_problem())));
         }
